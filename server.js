@@ -80,5 +80,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`BrainChat running on http://localhost:${PORT}`);
+  console.log(`Dimle running on http://localhost:${PORT}`);
 });

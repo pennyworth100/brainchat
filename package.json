@@ -1,5 +1,5 @@
 {
-  "name": "brainchat",
+  "name": "dimle",
   "version": "1.0.0",
   "description": "Ephemeral chat rooms — no database, no accounts, pure real-time",
   "main": "server.js",
