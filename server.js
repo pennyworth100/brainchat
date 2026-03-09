@@ -12,6 +12,14 @@ const PORT = process.env.PORT || 3000;
 // Rooms: Map<roomId, Map<socketId, username>>
 const rooms = new Map();
 
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  next();
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 
 io.on("connection", (socket) => {
