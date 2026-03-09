@@ -8,8 +8,9 @@ const server = http.createServer(app);
 const io = new Server(server);
 
 const PORT = process.env.PORT || 3000;
+const MAX_HISTORY = 100; // max wiadomości przechowywanych na pokój
 
-// Rooms: Map<roomId, Map<socketId, username>>
+// Rooms: Map<roomId, { users: Map<socketId, username>, history: Array }>
 const rooms = new Map();
 
 // Security headers
@@ -22,6 +23,20 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, "public")));
 
+function getRoom(roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, { users: new Map(), history: [] });
+  }
+  return rooms.get(roomId);
+}
+
+function addToHistory(room, entry) {
+  room.history.push(entry);
+  if (room.history.length > MAX_HISTORY) {
+    room.history.shift();
+  }
+}
+
 io.on("connection", (socket) => {
   let currentRoom = null;
 
@@ -29,37 +44,43 @@ io.on("connection", (socket) => {
     if (!roomId || !username) return;
 
     currentRoom = roomId;
+    const room = getRoom(roomId);
 
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Map());
-    }
-
-    rooms.get(roomId).set(socket.id, username);
+    room.users.set(socket.id, username);
     socket.join(roomId);
 
-    const userCount = rooms.get(roomId).size;
+    // Wyślij historię nowemu uczestnikowi
+    if (room.history.length > 0) {
+      socket.emit("chat-history", room.history);
+    }
 
-    // Notify room
+    // Powiadom resztę
     socket.to(roomId).emit("system-message", `${username} joined`);
-    io.to(roomId).emit("user-count", userCount);
+    io.to(roomId).emit("user-count", room.users.size);
   });
 
   socket.on("send-message", ({ roomId, message }) => {
     if (!roomId || !message || !rooms.has(roomId)) return;
 
-    const username = rooms.get(roomId).get(socket.id);
+    const room = rooms.get(roomId);
+    const username = room.users.get(socket.id);
     if (!username) return;
 
+    const entry = { type: "message", username, message };
+    addToHistory(room, entry);
     io.to(roomId).emit("chat-message", { username, message });
   });
 
   socket.on("send-image", ({ roomId, dataUrl }) => {
     if (!roomId || !dataUrl || !rooms.has(roomId)) return;
-    if (!dataUrl.startsWith("data:image/")) return; // safety check
+    if (!dataUrl.startsWith("data:image/")) return;
 
-    const username = rooms.get(roomId).get(socket.id);
+    const room = rooms.get(roomId);
+    const username = room.users.get(socket.id);
     if (!username) return;
 
+    const entry = { type: "image", username, dataUrl };
+    addToHistory(room, entry);
     io.to(roomId).emit("chat-image", { username, dataUrl });
   });
 
@@ -67,14 +88,14 @@ io.on("connection", (socket) => {
     if (!currentRoom || !rooms.has(currentRoom)) return;
 
     const room = rooms.get(currentRoom);
-    const username = room.get(socket.id);
-    room.delete(socket.id);
+    const username = room.users.get(socket.id);
+    room.users.delete(socket.id);
 
-    if (room.size === 0) {
-      rooms.delete(currentRoom);
+    if (room.users.size === 0) {
+      rooms.delete(currentRoom); // pokój pusty - czyścimy razem z historią
     } else {
       io.to(currentRoom).emit("system-message", `${username} left`);
-      io.to(currentRoom).emit("user-count", room.size);
+      io.to(currentRoom).emit("user-count", room.users.size);
     }
   });
 });

@@ -240,6 +240,28 @@
       });
     }
 
+    socket.on("chat-history", (history) => {
+      const div = document.createElement("div");
+      div.className = "msg msg-system";
+      div.textContent = `— ${history.length} earlier message${history.length !== 1 ? "s" : ""} —`;
+      addMessage(div);
+      history.forEach(entry => {
+        if (entry.type === "message") {
+          const d = document.createElement("div");
+          const isSelf = entry.username === username;
+          d.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
+          d.innerHTML = `<div class="name">${esc(entry.username)}</div><div class="bubble">${linkify(entry.message)}</div>`;
+          addMessage(d);
+        } else if (entry.type === "image") {
+          const d = document.createElement("div");
+          const isSelf = entry.username === username;
+          d.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
+          d.innerHTML = `<div class="name">${esc(entry.username)}</div><div class="bubble"><img src="${entry.dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
+          addMessage(d);
+        }
+      });
+    });
+
     socket.on("chat-message", ({ username: sender, message }) => {
       const div = document.createElement("div");
       const isSelf = sender === username;
