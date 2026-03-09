@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BrainChat Room</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.25rem;
+      background: #14141f;
+      border-bottom: 1px solid #1e1e2e;
+    }
+    .logo {
+      font-weight: 700;
+      font-size: 1.1rem;
+      background: linear-gradient(135deg, #7c5cff, #00c6ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-decoration: none;
+    }
+    .room-info {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: 0.85rem;
+      color: #888;
+    }
+    .room-code {
+      background: #1e1e2e;
+      padding: 0.3rem 0.7rem;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 0.95rem;
+      color: #aaa;
+    }
+    #userCount { color: #7c5cff; }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .msg {
+      max-width: 85%;
+      word-wrap: break-word;
+      line-height: 1.5;
+    }
+    .msg-user { align-self: flex-start; }
+    .msg-user .name { color: #7c5cff; font-weight: 600; font-size: 0.8rem; margin-bottom: 0.15rem; }
+    .msg-user .bubble {
+      background: #14141f;
+      border: 1px solid #1e1e2e;
+      padding: 0.5rem 0.85rem;
+      border-radius: 0 10px 10px 10px;
+    }
+    .msg-self { align-self: flex-end; }
+    .msg-self .name { text-align: right; color: #00c6ff; font-weight: 600; font-size: 0.8rem; margin-bottom: 0.15rem; }
+    .msg-self .bubble {
+      background: #1a1a3a;
+      border: 1px solid #2a2a5a;
+      padding: 0.5rem 0.85rem;
+      border-radius: 10px 0 10px 10px;
+    }
+    .msg-system {
+      align-self: center;
+      color: #555;
+      font-size: 0.8rem;
+      padding: 0.25rem 0;
+    }
+    .input-bar {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 1.25rem;
+      background: #14141f;
+      border-top: 1px solid #1e1e2e;
+    }
+    .input-bar input {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    .input-bar input:focus { border-color: #7c5cff; }
+    .input-bar button {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #7c5cff, #5a3de8);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 0.95rem;
+    }
+    .input-bar button:hover { opacity: 0.85; }
+    #attachBtn {
+      padding: 0.75rem 1rem;
+      background: #2a2a3d;
+      font-size: 1.3rem;
+      font-weight: 400;
+      border: 1px solid #3a3a55;
+      flex-shrink: 0;
+    }
+    #attachBtn:hover { background: #3a3a55; opacity: 1; }
+
+    /* Username modal */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100;
+    }
+    .modal {
+      background: #14141f;
+      border: 1px solid #1e1e2e;
+      border-radius: 12px;
+      padding: 2rem;
+      width: 90%;
+      max-width: 340px;
+      text-align: center;
+    }
+    .modal h2 { margin-bottom: 0.5rem; font-size: 1.2rem; }
+    .modal p { color: #666; font-size: 0.85rem; margin-bottom: 1.25rem; }
+    .modal input {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-size: 1rem;
+      text-align: center;
+      margin-bottom: 0.75rem;
+      outline: none;
+    }
+    .modal input:focus { border-color: #7c5cff; }
+    .modal button {
+      width: 100%;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #7c5cff, #5a3de8);
+      color: #fff;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    .modal button:hover { opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <!-- Username modal -->
+  <div class="modal-overlay" id="usernameModal">
+    <div class="modal">
+      <h2>Pick a username</h2>
+      <p>This is how others will see you</p>
+      <input type="text" id="usernameInput" maxlength="20">
+      <button id="usernameBtn">Join Chat</button>
+    </div>
+  </div>
+
+  <header>
+    <a href="/" class="logo">BrainChat</a>
+    <div class="room-info">
+      <span>Room <span class="room-code" id="roomCode"></span></span>
+      <span><span id="userCount">0</span> online</span>
+    </div>
+  </header>
+
+  <div id="messages"></div>
+
+  <div class="input-bar">
+    <input type="file" id="fileInput" accept="image/*" style="display:none;">
+    <button id="attachBtn" title="Attach image">+</button>
+    <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off">
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const roomId = params.get("id");
+
+    if (!roomId || !/^\d{4}$/.test(roomId)) {
+      window.location.href = "/";
+    }
+
+    document.getElementById("roomCode").textContent = roomId;
+
+    const defaultName = "User_" + Math.floor(10 + Math.random() * 90);
+    const usernameInput = document.getElementById("usernameInput");
+    usernameInput.value = defaultName;
+    usernameInput.select();
+
+    let username = null;
+    const socket = io();
+    const messages = document.getElementById("messages");
+    const msgInput = document.getElementById("msgInput");
+
+    function joinRoom() {
+      username = usernameInput.value.trim() || defaultName;
+      document.getElementById("usernameModal").style.display = "none";
+      socket.emit("join-room", { roomId, username });
+      msgInput.focus();
+    }
+
+    document.getElementById("usernameBtn").addEventListener("click", joinRoom);
+    usernameInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") joinRoom();
+    });
+
+    function addMessage(el) {
+      messages.appendChild(el);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function linkify(text) {
+      const escaped = esc(text);
+      // Match: https://, http://, www., or bare domain (e.g. fox.com)
+      return escaped.replace(/(?<![="'\/\w])((?:https?:\/\/|www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s<]*)?)/g, (match) => {
+        const href = /^https?:\/\//i.test(match) ? match : 'https://' + match;
+        return `<a href="${href}" target="_blank" rel="noopener" style="color:#818cf8;text-decoration:underline;">${match}</a>`;
+      });
+    }
+
+    socket.on("chat-message", ({ username: sender, message }) => {
+      const div = document.createElement("div");
+      const isSelf = sender === username;
+      div.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
+      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${linkify(message)}</div>`;
+      addMessage(div);
+    });
+
+    socket.on("system-message", (text) => {
+      const div = document.createElement("div");
+      div.className = "msg msg-system";
+      div.textContent = text;
+      addMessage(div);
+    });
+
+    socket.on("user-count", (count) => {
+      document.getElementById("userCount").textContent = count;
+    });
+
+    function sendMessage() {
+      const message = msgInput.value.trim();
+      if (!message) return;
+      socket.emit("send-message", { roomId, message });
+      msgInput.value = "";
+    }
+
+    document.getElementById("sendBtn").addEventListener("click", sendMessage);
+    msgInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+
+    // File picker button
+    document.getElementById("attachBtn").addEventListener("click", () => {
+      document.getElementById("fileInput").click();
+    });
+    document.getElementById("fileInput").addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file || !file.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const dataUrl = ev.target.result;
+        const preview = document.createElement("div");
+        preview.className = "msg msg-self";
+        preview.innerHTML = `<div class="name">${esc(username)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
+        addMessage(preview);
+        socket.emit("send-image", { roomId, dataUrl });
+      };
+      reader.readAsDataURL(file);
+      e.target.value = ""; // reset so same file can be sent again
+    });
+
+    // Image paste handler
+    document.addEventListener("paste", (e) => {
+      const items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            const dataUrl = ev.target.result;
+            // Show preview indicator
+            const preview = document.createElement("div");
+            preview.className = "msg msg-self";
+            preview.innerHTML = `<div class="name">${esc(username)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
+            addMessage(preview);
+            socket.emit("send-image", { roomId, dataUrl });
+          };
+          reader.readAsDataURL(file);
+          break;
+        }
+      }
+    });
+
+    // Receive images from others
+    socket.on("chat-image", ({ username: sender, dataUrl }) => {
+      if (sender === username) return; // already shown locally
+      const div = document.createElement("div");
+      div.className = "msg msg-user";
+      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
+      addMessage(div);
+    });
+
+    function esc(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BrainChat</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .container {
+      text-align: center;
+      max-width: 400px;
+      width: 90%;
+    }
+    h1 {
+      font-size: 2.5rem;
+      margin-bottom: 0.25rem;
+      background: linear-gradient(135deg, #7c5cff, #00c6ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .tagline {
+      color: #666;
+      margin-bottom: 2.5rem;
+      font-size: 0.95rem;
+    }
+    .card {
+      background: #14141f;
+      border: 1px solid #1e1e2e;
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 1rem;
+    }
+    button {
+      width: 100%;
+      padding: 0.85rem;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.85; }
+    .btn-primary {
+      background: linear-gradient(135deg, #7c5cff, #5a3de8);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: #1e1e2e;
+      color: #e0e0e0;
+      border: 1px solid #2a2a3a;
+    }
+    .divider {
+      color: #444;
+      margin: 1.5rem 0;
+      font-size: 0.85rem;
+    }
+    input {
+      width: 100%;
+      padding: 0.85rem;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-size: 1.1rem;
+      text-align: center;
+      letter-spacing: 0.5rem;
+      margin-bottom: 0.75rem;
+      outline: none;
+    }
+    input::placeholder { letter-spacing: normal; color: #444; }
+    input:focus { border-color: #7c5cff; }
+    .error { color: #ff5c5c; font-size: 0.85rem; margin-top: 0.5rem; display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>BrainChat</h1>
+    <p class="tagline">Ephemeral rooms. No accounts. No history.</p>
+    <div class="card">
+      <button class="btn-primary" id="createBtn">Create Room</button>
+      <div class="divider">— or join an existing room —</div>
+      <input type="text" id="codeInput" placeholder="4-digit code" maxlength="4" inputmode="numeric">
+      <button class="btn-secondary" id="joinBtn">Join Room</button>
+      <p class="error" id="error"></p>
+    </div>
+  </div>
+  <script>
+    const codeInput = document.getElementById("codeInput");
+    const error = document.getElementById("error");
+
+    document.getElementById("createBtn").addEventListener("click", () => {
+      const code = String(Math.floor(1000 + Math.random() * 9000));
+      window.location.href = `/room.html?id=${code}`;
+    });
+
+    document.getElementById("joinBtn").addEventListener("click", () => {
+      const code = codeInput.value.trim();
+      if (!/^\d{4}$/.test(code)) {
+        error.textContent = "Enter a valid 4-digit code";
+        error.style.display = "block";
+        return;
+      }
+      window.location.href = `/room.html?id=${code}`;
+    });
+
+    codeInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("joinBtn").click();
+    });
+
+    codeInput.addEventListener("input", () => { error.style.display = "none"; });
+  </script>
+</body>
+</html>

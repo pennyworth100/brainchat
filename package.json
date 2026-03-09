@@ -1,0 +1,13 @@
+{
+  "name": "brainchat",
+  "version": "1.0.0",
+  "description": "Ephemeral chat rooms — no database, no accounts, pure real-time",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "socket.io": "^4.7.5"
+  }
+}
