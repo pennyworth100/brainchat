@@ -9,6 +9,7 @@ const io = new Server(server);
 
 const PORT = process.env.PORT || 3000;
 const MAX_HISTORY = 100;
+const ALFRED_API_KEY = process.env.ALFRED_API_KEY || "alfred-secret";
 
 // Rooms: Map<roomId, { users, history, password }>
 const rooms = new Map();
@@ -22,6 +23,44 @@ app.use((req, res, next) => {
 });
 
 app.use(express.static(path.join(__dirname, "public")));
+app.use(express.json());
+
+// API key middleware
+function requireApiKey(req, res, next) {
+  const key = req.headers["x-api-key"];
+  if (!key || key !== ALFRED_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// GET /api/messages/:roomId?since=<unixTimestampMs>
+app.get("/api/messages/:roomId", requireApiKey, (req, res) => {
+  const { roomId } = req.params;
+  const since = parseInt(req.query.since) || 0;
+  if (!rooms.has(roomId)) {
+    return res.status(404).json({ error: "Room not found" });
+  }
+  const room = rooms.get(roomId);
+  const messages = room.history.filter(m => (m.ts || 0) > since);
+  res.json({ messages });
+});
+
+// POST /api/send
+app.post("/api/send", requireApiKey, (req, res) => {
+  const { roomId, username, message } = req.body;
+  if (!roomId || !username || !message) {
+    return res.status(400).json({ error: "Missing roomId, username or message" });
+  }
+  if (!rooms.has(roomId)) {
+    return res.status(404).json({ error: "Room not found" });
+  }
+  const room = rooms.get(roomId);
+  const entry = { type: "message", username, message, ts: Date.now() };
+  addToHistory(room, entry);
+  io.to(roomId).emit("chat-message", { username, message });
+  res.json({ ok: true });
+});
 
 function addToHistory(room, entry) {
   room.history.push(entry);
@@ -75,7 +114,7 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     const username = room.users.get(socket.id);
     if (!username) return;
-    const entry = { type: "message", username, message };
+    const entry = { type: "message", username, message, ts: Date.now() };
     addToHistory(room, entry);
     io.to(roomId).emit("chat-message", { username, message });
   });
@@ -86,7 +125,7 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     const username = room.users.get(socket.id);
     if (!username) return;
-    const entry = { type: "image", username, dataUrl };
+    const entry = { type: "image", username, dataUrl, ts: Date.now() };
     addToHistory(room, entry);
     io.to(roomId).emit("chat-image", { username, dataUrl });
   });
