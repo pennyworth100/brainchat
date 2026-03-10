@@ -57,6 +57,7 @@ io.on("connection", (socket) => {
     // Powiadom resztę
     socket.to(roomId).emit("system-message", `${username} joined`);
     io.to(roomId).emit("user-count", room.users.size);
+    io.to(roomId).emit("user-list", Array.from(room.users.values()));
   });
 
   socket.on("send-message", ({ roomId, message }) => {
@@ -96,6 +97,7 @@ io.on("connection", (socket) => {
     } else {
       io.to(currentRoom).emit("system-message", `${username} left`);
       io.to(currentRoom).emit("user-count", room.users.size);
+      io.to(currentRoom).emit("user-list", Array.from(room.users.values()));
     }
   });
 });

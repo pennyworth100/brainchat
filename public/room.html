@@ -46,6 +46,52 @@
       color: #aaa;
     }
     #userCount { color: #7c5cff; }
+    .participants-btn {
+      cursor: pointer;
+      user-select: none;
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
+      transition: background 0.15s;
+      position: relative;
+    }
+    .participants-btn:hover { background: #1e1e2e; }
+    .participants-panel {
+      display: none;
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      background: #14141f;
+      border: 1px solid #2a2a3a;
+      border-radius: 10px;
+      padding: 0.75rem;
+      min-width: 160px;
+      max-width: 220px;
+      z-index: 50;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    .participants-panel.open { display: block; }
+    .participants-panel h4 {
+      font-size: 0.75rem;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+    .participant-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.3rem 0;
+      font-size: 0.9rem;
+      color: #ccc;
+    }
+    .participant-item .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #22c55e;
+      flex-shrink: 0;
+    }
+    .participant-item.is-self { color: #7c5cff; font-weight: 600; }
     #messages {
       flex: 1;
       overflow-y: auto;
@@ -180,7 +226,13 @@
     <a href="/" class="logo">Dimle</a>
     <div class="room-info">
       <span>Room <span class="room-code" id="roomCode"></span></span>
-      <span><span id="userCount">0</span> online</span>
+      <span class="participants-btn" id="participantsBtn" title="View participants">
+        <span id="userCount">0</span> online
+        <div class="participants-panel" id="participantsPanel">
+          <h4>Participants</h4>
+          <div id="participantsList"></div>
+        </div>
+      </span>
     </div>
   </header>
 
@@ -279,6 +331,28 @@
 
     socket.on("user-count", (count) => {
       document.getElementById("userCount").textContent = count;
+    });
+
+    socket.on("user-list", (users) => {
+      const list = document.getElementById("participantsList");
+      list.innerHTML = users.map(name => {
+        const isSelf = name === username;
+        return `<div class="participant-item${isSelf ? " is-self" : ""}">
+          <span class="dot"></span>
+          <span>${esc(name)}${isSelf ? " (you)" : ""}</span>
+        </div>`;
+      }).join("");
+    });
+
+    // Toggle participants panel
+    const participantsBtn = document.getElementById("participantsBtn");
+    const participantsPanel = document.getElementById("participantsPanel");
+    participantsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      participantsPanel.classList.toggle("open");
+    });
+    document.addEventListener("click", () => {
+      participantsPanel.classList.remove("open");
     });
 
     function sendMessage() {
