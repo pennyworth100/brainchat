@@ -218,7 +218,9 @@
       <h2>Pick a username</h2>
       <p>This is how others will see you</p>
       <input type="text" id="usernameInput" maxlength="20">
+      <input type="password" id="passwordInput" placeholder="Room password (if any)" style="margin-bottom:0.75rem;">
       <button id="usernameBtn">Join Chat</button>
+      <p class="error" id="joinError"></p>
     </div>
   </div>
 
@@ -268,10 +270,21 @@
 
     function joinRoom() {
       username = usernameInput.value.trim() || defaultName;
-      document.getElementById("usernameModal").style.display = "none";
-      socket.emit("join-room", { roomId, username });
-      msgInput.focus();
+      const password = document.getElementById("passwordInput").value;
+      socket.emit("join-room", { roomId, username, password });
     }
+
+    socket.on("room-info", () => {
+      document.getElementById("usernameModal").style.display = "none";
+      msgInput.focus();
+    });
+
+    socket.on("join-error", (msg) => {
+      const err = document.getElementById("joinError");
+      err.textContent = msg;
+      err.style.display = "block";
+      username = null;
+    });
 
     document.getElementById("usernameBtn").addEventListener("click", joinRoom);
     usernameInput.addEventListener("keydown", (e) => {
