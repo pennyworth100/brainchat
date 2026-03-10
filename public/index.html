@@ -80,6 +80,21 @@
     input::placeholder { letter-spacing: normal; color: #444; }
     input:focus { border-color: #7c5cff; }
     .error { color: #ff5c5c; font-size: 0.85rem; margin-top: 0.5rem; display: none; }
+    .btn-permanent {
+      display: block;
+      width: 100%;
+      padding: 0.85rem;
+      border-radius: 8px;
+      background: #1e1e2e;
+      color: #7c5cff;
+      font-weight: 600;
+      font-size: 1rem;
+      text-decoration: none;
+      border: 1px solid #3a2a6a;
+      transition: opacity 0.2s;
+      box-sizing: border-box;
+    }
+    .btn-permanent:hover { opacity: 0.85; }
   </style>
 </head>
 <body>
@@ -91,6 +106,8 @@
       <div class="divider">— or join an existing room —</div>
       <input type="text" id="codeInput" placeholder="4-digit code" maxlength="4" inputmode="numeric">
       <button class="btn-secondary" id="joinBtn">Join Room</button>
+      <div class="divider">— or go to the permanent room —</div>
+      <a href="/room.html?id=0000" class="btn-permanent">Room 0000 🔒</a>
       <p class="error" id="error"></p>
     </div>
   </div>
