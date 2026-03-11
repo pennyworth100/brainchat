@@ -85,13 +85,10 @@
       font-size: 0.9rem;
       color: #ccc;
     }
-    .participant-item .dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: #22c55e;
-      flex-shrink: 0;
-    }
+    .participant-item .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
     .participant-item.is-self { color: #7c5cff; font-weight: 600; }
+
+    /* Messages */
     #messages {
       flex: 1;
       overflow-y: auto;
@@ -99,6 +96,23 @@
       display: flex;
       flex-direction: column;
       gap: 0.35rem;
+    }
+    /* Drag-over overlay */
+    #messages.drag-over::after {
+      content: "Drop to send";
+      position: fixed;
+      inset: 0;
+      background: rgba(124, 92, 255, 0.18);
+      border: 3px dashed #7c5cff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      font-weight: 600;
+      color: #a78bfa;
+      pointer-events: none;
+      z-index: 200;
+      border-radius: 4px;
     }
     .msg {
       max-width: 85%;
@@ -127,14 +141,58 @@
       font-size: 0.8rem;
       padding: 0.25rem 0;
     }
+    /* Image bubbles */
+    .bubble img {
+      max-width: 280px;
+      max-height: 300px;
+      border-radius: 8px;
+      display: block;
+      cursor: pointer;
+    }
+    /* File card */
+    .file-card {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      min-width: 200px;
+      max-width: 280px;
+    }
+    .file-card .file-icon { font-size: 2rem; flex-shrink: 0; line-height: 1; }
+    .file-card .file-meta { flex: 1; min-width: 0; }
+    .file-card .file-name {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #e0e0e0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-card .file-size { font-size: 0.78rem; color: #888; margin-top: 0.1rem; }
+    .file-card .file-dl {
+      flex-shrink: 0;
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      background: #2a2a4a;
+      display: flex; align-items: center; justify-content: center;
+      color: #a78bfa;
+      text-decoration: none;
+      font-size: 1rem;
+      transition: background 0.15s;
+    }
+    .file-card .file-dl:hover { background: #3a3a6a; }
+    /* Uploading state */
+    .uploading-indicator { color: #888; font-size: 0.88rem; font-style: italic; }
+
+    /* Input bar */
     .input-bar {
       display: flex;
+      align-items: center;
       gap: 0.5rem;
       padding: 0.75rem 1.25rem;
       background: #14141f;
       border-top: 1px solid #1e1e2e;
     }
-    .input-bar input {
+    #msgInput {
       flex: 1;
       padding: 0.75rem 1rem;
       border: 1px solid #2a2a3a;
@@ -144,8 +202,8 @@
       font-size: 0.95rem;
       outline: none;
     }
-    .input-bar input:focus { border-color: #7c5cff; }
-    .input-bar button {
+    #msgInput:focus { border-color: #7c5cff; }
+    #sendBtn {
       padding: 0.75rem 1.5rem;
       border: none;
       border-radius: 8px;
@@ -155,18 +213,22 @@
       cursor: pointer;
       font-size: 0.95rem;
     }
-    .input-bar button:hover { opacity: 0.85; }
+    #sendBtn:hover { opacity: 0.85; }
     #attachBtn {
-      padding: 0.75rem 1rem;
-      background: #2a2a3d;
-      font-size: 1.3rem;
-      font-weight: 400;
-      border: 1px solid #3a3a55;
       flex-shrink: 0;
+      width: 42px; height: 42px;
+      border: 1px solid #3a3a55;
+      border-radius: 8px;
+      background: #2a2a3d;
+      color: #a78bfa;
+      font-size: 1.3rem;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s;
     }
-    #attachBtn:hover { background: #3a3a55; opacity: 1; }
+    #attachBtn:hover { background: #3a3a55; }
 
-    /* Username modal */
+    /* Modal */
     .modal-overlay {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.7);
@@ -209,20 +271,38 @@
       cursor: pointer;
     }
     .modal button:hover { opacity: 0.85; }
+    #joinError { color: #f87171; font-size: 0.85rem; margin-top: 0.5rem; min-height: 1.2em; }
+
+    /* Lightbox */
+    #lightbox {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.88);
+      z-index: 300;
+      align-items: center;
+      justify-content: center;
+      cursor: zoom-out;
+    }
+    #lightbox.open { display: flex; }
+    #lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
   </style>
 </head>
 <body>
+
   <!-- Username modal -->
   <div class="modal-overlay" id="usernameModal">
     <div class="modal">
       <h2>Pick a username</h2>
       <p>This is how others will see you</p>
       <input type="text" id="usernameInput" maxlength="20">
-      <input type="password" id="passwordInput" placeholder="Room password (if any)" style="margin-bottom:0.75rem;">
+      <input type="password" id="passwordInput" placeholder="Room password (if any)">
       <button id="usernameBtn">Join Chat</button>
-      <p class="error" id="joinError"></p>
+      <p id="joinError"></p>
     </div>
   </div>
+
+  <!-- Lightbox -->
+  <div id="lightbox"><img id="lightboxImg" src="" alt=""></div>
 
   <header>
     <a href="/" class="logo">Dimle</a>
@@ -241,33 +321,119 @@
   <div id="messages"></div>
 
   <div class="input-bar">
-    <input type="file" id="fileInput" accept="image/*" style="display:none;">
-    <button id="attachBtn" title="Attach image">+</button>
-    <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off">
+    <input type="file" id="fileInput" accept="*/*" style="display:none;">
+    <button id="attachBtn" title="Attach file">📎</button>
+    <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off">
     <button id="sendBtn">Send</button>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
+    // ── Init ──────────────────────────────────────────────────────────────────
     const params = new URLSearchParams(window.location.search);
     const roomId = params.get("id");
-
-    if (!roomId || !/^\d{4}$/.test(roomId)) {
-      window.location.href = "/";
-    }
+    if (!roomId || !/^\d{4}$/.test(roomId)) window.location.href = "/";
 
     document.getElementById("roomCode").textContent = roomId;
 
-    const defaultName = "User_" + Math.floor(10 + Math.random() * 90);
-    const usernameInput = document.getElementById("usernameInput");
-    usernameInput.value = defaultName;
+    const defaultName    = "User_" + Math.floor(10 + Math.random() * 90);
+    const usernameInput  = document.getElementById("usernameInput");
+    usernameInput.value  = defaultName;
     usernameInput.select();
 
     let username = null;
-    const socket = io();
+    const socket   = io();
     const messages = document.getElementById("messages");
     const msgInput = document.getElementById("msgInput");
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function esc(s = "") {
+      const d = document.createElement("div");
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    function fmtSize(bytes) {
+      if (!bytes) return "";
+      return bytes >= 1_048_576
+        ? `${(bytes / 1_048_576).toFixed(1)} MB`
+        : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    }
+
+    function fileIcon(mime = "", name = "") {
+      if (mime.startsWith("image/"))       return "🖼️";
+      if (mime.startsWith("video/"))       return "🎬";
+      if (mime.startsWith("audio/"))       return "🎵";
+      if (mime === "application/pdf")      return "📕";
+      if (/zip|rar|7z|tar|gz/.test(mime)) return "📦";
+      if (mime.startsWith("text/"))        return "📄";
+      const ext = name.split(".").pop().toLowerCase();
+      if (["doc","docx"].includes(ext))    return "📝";
+      if (["xls","xlsx"].includes(ext))    return "📊";
+      if (["ppt","pptx"].includes(ext))    return "📊";
+      return "📎";
+    }
+
+    function linkify(text) {
+      const escaped = esc(text);
+      return escaped.replace(
+        /(?<![="'\/\w])((?:https?:\/\/|www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s<]*)?)/g,
+        (match) => {
+          const href = /^https?:\/\//i.test(match) ? match : "https://" + match;
+          return `<a href="${href}" target="_blank" rel="noopener" style="color:#818cf8;text-decoration:underline;">${match}</a>`;
+        }
+      );
+    }
+
+    function addMessage(el) {
+      messages.appendChild(el);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function makeMsg(sender, bubbleHtml) {
+      const isSelf = sender === username;
+      const div = document.createElement("div");
+      div.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
+      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${bubbleHtml}</div>`;
+      return div;
+    }
+
+    // Render a file bubble (image = inline, other = card)
+    function renderFile(sender, { url, name, size, mime }) {
+      let bubble;
+      if (mime && mime.startsWith("image/")) {
+        bubble = `<img src="${esc(url)}" alt="${esc(name)}" data-lightbox>`;
+      } else {
+        bubble = `<div class="file-card">
+          <div class="file-icon">${fileIcon(mime, name)}</div>
+          <div class="file-meta">
+            <div class="file-name">${esc(name)}</div>
+            <div class="file-size">${fmtSize(size)}</div>
+          </div>
+          <a class="file-dl" href="${esc(url)}" download="${esc(name)}" title="Download">⬇</a>
+        </div>`;
+      }
+      return makeMsg(sender, bubble);
+    }
+
+    // Render legacy base64 image
+    function renderLegacyImage(sender, dataUrl) {
+      return makeMsg(sender, `<img src="${dataUrl}" alt="image" data-lightbox>`);
+    }
+
+    // ── Lightbox ──────────────────────────────────────────────────────────────
+    const lightbox    = document.getElementById("lightbox");
+    const lightboxImg = document.getElementById("lightboxImg");
+
+    messages.addEventListener("click", (e) => {
+      const img = e.target.closest("[data-lightbox]");
+      if (!img) return;
+      lightboxImg.src = img.src;
+      lightbox.classList.add("open");
+    });
+    lightbox.addEventListener("click", () => lightbox.classList.remove("open"));
+
+    // ── Join ──────────────────────────────────────────────────────────────────
     function joinRoom() {
       username = usernameInput.value.trim() || defaultName;
       const password = document.getElementById("passwordInput").value;
@@ -280,59 +446,43 @@
     });
 
     socket.on("join-error", (msg) => {
-      const err = document.getElementById("joinError");
-      err.textContent = msg;
-      err.style.display = "block";
+      document.getElementById("joinError").textContent = msg;
       username = null;
     });
 
     document.getElementById("usernameBtn").addEventListener("click", joinRoom);
-    usernameInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") joinRoom();
-    });
+    usernameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
 
-    function addMessage(el) {
-      messages.appendChild(el);
-      messages.scrollTop = messages.scrollHeight;
-    }
-
-    function linkify(text) {
-      const escaped = esc(text);
-      // Match: https://, http://, www., or bare domain (e.g. fox.com)
-      return escaped.replace(/(?<![="'\/\w])((?:https?:\/\/|www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s<]*)?)/g, (match) => {
-        const href = /^https?:\/\//i.test(match) ? match : 'https://' + match;
-        return `<a href="${href}" target="_blank" rel="noopener" style="color:#818cf8;text-decoration:underline;">${match}</a>`;
-      });
-    }
-
+    // ── History ───────────────────────────────────────────────────────────────
     socket.on("chat-history", (history) => {
-      const div = document.createElement("div");
-      div.className = "msg msg-system";
-      div.textContent = `— ${history.length} earlier message${history.length !== 1 ? "s" : ""} —`;
-      addMessage(div);
+      const sep = document.createElement("div");
+      sep.className = "msg msg-system";
+      sep.textContent = `— ${history.length} earlier message${history.length !== 1 ? "s" : ""} —`;
+      addMessage(sep);
       history.forEach(entry => {
         if (entry.type === "message") {
-          const d = document.createElement("div");
-          const isSelf = entry.username === username;
-          d.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
-          d.innerHTML = `<div class="name">${esc(entry.username)}</div><div class="bubble">${linkify(entry.message)}</div>`;
-          addMessage(d);
+          addMessage(makeMsg(entry.username, linkify(entry.message)));
+        } else if (entry.type === "file") {
+          addMessage(renderFile(entry.username, entry));
         } else if (entry.type === "image") {
-          const d = document.createElement("div");
-          const isSelf = entry.username === username;
-          d.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
-          d.innerHTML = `<div class="name">${esc(entry.username)}</div><div class="bubble"><img src="${entry.dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
-          addMessage(d);
+          addMessage(renderLegacyImage(entry.username, entry.dataUrl));
         }
       });
     });
 
+    // ── Incoming messages ─────────────────────────────────────────────────────
     socket.on("chat-message", ({ username: sender, message }) => {
-      const div = document.createElement("div");
-      const isSelf = sender === username;
-      div.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
-      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${linkify(message)}</div>`;
-      addMessage(div);
+      addMessage(makeMsg(sender, linkify(message)));
+    });
+
+    socket.on("chat-file", ({ username: sender, url, name, size, mime }) => {
+      if (sender === username) return; // already shown optimistically
+      addMessage(renderFile(sender, { url, name, size, mime }));
+    });
+
+    socket.on("chat-image", ({ username: sender, dataUrl }) => {
+      if (sender === username) return;
+      addMessage(renderLegacyImage(sender, dataUrl));
     });
 
     socket.on("system-message", (text) => {
@@ -347,38 +497,63 @@
     });
 
     socket.on("user-list", (users) => {
-      const list = document.getElementById("participantsList");
-      list.innerHTML = users.map(name => {
+      document.getElementById("participantsList").innerHTML = users.map(name => {
         const isSelf = name === username;
         return `<div class="participant-item${isSelf ? " is-self" : ""}">
-          <span class="dot"></span>
-          <span>${esc(name)}${isSelf ? " (you)" : ""}</span>
+          <span class="dot"></span><span>${esc(name)}${isSelf ? " (you)" : ""}</span>
         </div>`;
       }).join("");
     });
 
-    // Toggle participants panel
-    const participantsBtn = document.getElementById("participantsBtn");
+    // ── Participants panel ────────────────────────────────────────────────────
+    const participantsBtn   = document.getElementById("participantsBtn");
     const participantsPanel = document.getElementById("participantsPanel");
     participantsBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       participantsPanel.classList.toggle("open");
     });
-    document.addEventListener("click", () => {
-      participantsPanel.classList.remove("open");
-    });
+    document.addEventListener("click", () => participantsPanel.classList.remove("open"));
 
+    // ── Send text ─────────────────────────────────────────────────────────────
     function sendMessage() {
       const message = msgInput.value.trim();
-      if (!message) return;
+      if (!message || !username) return;
       socket.emit("send-message", { roomId, message });
       msgInput.value = "";
     }
 
     document.getElementById("sendBtn").addEventListener("click", sendMessage);
-    msgInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") sendMessage();
-    });
+    msgInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+
+    // ── Upload file ───────────────────────────────────────────────────────────
+    async function uploadFile(file) {
+      if (!username || !file) return;
+
+      // Optimistic: show uploading indicator
+      const tempDiv = document.createElement("div");
+      tempDiv.className = "msg msg-self";
+      tempDiv.innerHTML = `<div class="name">${esc(username)}</div>
+        <div class="bubble"><span class="uploading-indicator">📎 Uploading ${esc(file.name)}…</span></div>`;
+      addMessage(tempDiv);
+
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const resp = await fetch("/api/upload", { method: "POST", body: form });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        // Remove uploading indicator, show real bubble
+        tempDiv.remove();
+        addMessage(renderFile(username, data));
+
+        // Tell everyone else
+        socket.emit("send-file", { roomId, url: data.url, name: data.name, size: data.size, mime: data.mime });
+      } catch (err) {
+        tempDiv.querySelector(".bubble").innerHTML = `<span style="color:#f87171">❌ Upload failed: ${esc(file.name)}</span>`;
+        console.error("Upload error:", err);
+      }
+    }
 
     // File picker button
     document.getElementById("attachBtn").addEventListener("click", () => {
@@ -386,58 +561,38 @@
     });
     document.getElementById("fileInput").addEventListener("change", (e) => {
       const file = e.target.files[0];
-      if (!file || !file.type.startsWith("image/")) return;
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const dataUrl = ev.target.result;
-        const preview = document.createElement("div");
-        preview.className = "msg msg-self";
-        preview.innerHTML = `<div class="name">${esc(username)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
-        addMessage(preview);
-        socket.emit("send-image", { roomId, dataUrl });
-      };
-      reader.readAsDataURL(file);
-      e.target.value = ""; // reset so same file can be sent again
+      if (file) uploadFile(file);
+      e.target.value = "";
     });
 
-    // Image paste handler
+    // Drag & drop onto the message area
+    messages.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      messages.classList.add("drag-over");
+    });
+    messages.addEventListener("dragleave", (e) => {
+      if (!messages.contains(e.relatedTarget)) messages.classList.remove("drag-over");
+    });
+    messages.addEventListener("drop", (e) => {
+      e.preventDefault();
+      messages.classList.remove("drag-over");
+      const file = e.dataTransfer.files[0];
+      if (file) uploadFile(file);
+    });
+
+    // Paste (images from clipboard)
     document.addEventListener("paste", (e) => {
+      if (!username) return;
       const items = e.clipboardData && e.clipboardData.items;
       if (!items) return;
       for (const item of items) {
-        if (item.type.startsWith("image/")) {
+        if (item.kind === "file") {
           e.preventDefault();
-          const file = item.getAsFile();
-          const reader = new FileReader();
-          reader.onload = (ev) => {
-            const dataUrl = ev.target.result;
-            // Show preview indicator
-            const preview = document.createElement("div");
-            preview.className = "msg msg-self";
-            preview.innerHTML = `<div class="name">${esc(username)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
-            addMessage(preview);
-            socket.emit("send-image", { roomId, dataUrl });
-          };
-          reader.readAsDataURL(file);
+          uploadFile(item.getAsFile());
           break;
         }
       }
     });
-
-    // Receive images from others
-    socket.on("chat-image", ({ username: sender, dataUrl }) => {
-      if (sender === username) return; // already shown locally
-      const div = document.createElement("div");
-      div.className = "msg msg-user";
-      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble"><img src="${dataUrl}" style="max-width:280px;max-height:300px;border-radius:8px;display:block;"></div>`;
-      addMessage(div);
-    });
-
-    function esc(s) {
-      const d = document.createElement("div");
-      d.textContent = s;
-      return d.innerHTML;
-    }
   </script>
 </body>
 </html>
