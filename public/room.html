@@ -124,7 +124,7 @@
     .msg-user .bubble {
       background: #14141f;
       border: 1px solid #1e1e2e;
-      padding: 0.5rem 0.85rem;
+      padding: 0.5rem 0.85rem 0.35rem;
       border-radius: 0 10px 10px 10px;
     }
     .msg-self { align-self: flex-end; }
@@ -132,8 +132,16 @@
     .msg-self .bubble {
       background: #1a1a3a;
       border: 1px solid #2a2a5a;
-      padding: 0.5rem 0.85rem;
+      padding: 0.5rem 0.85rem 0.35rem;
       border-radius: 10px 0 10px 10px;
+    }
+    .ts {
+      display: block;
+      text-align: right;
+      font-size: 0.7rem;
+      color: #555;
+      margin-top: 0.25rem;
+      user-select: none;
     }
     .msg-system {
       align-self: center;
@@ -390,16 +398,21 @@
       messages.scrollTop = messages.scrollHeight;
     }
 
-    function makeMsg(sender, bubbleHtml) {
+    function fmtTs(ts) {
+      const d = ts ? new Date(ts) : new Date();
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function makeMsg(sender, bubbleHtml, ts) {
       const isSelf = sender === username;
       const div = document.createElement("div");
       div.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
-      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${bubbleHtml}</div>`;
+      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${bubbleHtml}<span class="ts">${fmtTs(ts)}</span></div>`;
       return div;
     }
 
     // Render a file bubble (image = inline, other = card)
-    function renderFile(sender, { url, name, size, mime }) {
+    function renderFile(sender, { url, name, size, mime }, ts) {
       let bubble;
       if (mime && mime.startsWith("image/")) {
         bubble = `<img src="${esc(url)}" alt="${esc(name)}" data-lightbox>`;
@@ -413,12 +426,12 @@
           <a class="file-dl" href="${esc(url)}" download="${esc(name)}" title="Download">⬇</a>
         </div>`;
       }
-      return makeMsg(sender, bubble);
+      return makeMsg(sender, bubble, ts);
     }
 
     // Render legacy base64 image
-    function renderLegacyImage(sender, dataUrl) {
-      return makeMsg(sender, `<img src="${dataUrl}" alt="image" data-lightbox>`);
+    function renderLegacyImage(sender, dataUrl, ts) {
+      return makeMsg(sender, `<img src="${dataUrl}" alt="image" data-lightbox>`, ts);
     }
 
     // ── Lightbox ──────────────────────────────────────────────────────────────
@@ -461,28 +474,28 @@
       addMessage(sep);
       history.forEach(entry => {
         if (entry.type === "message") {
-          addMessage(makeMsg(entry.username, linkify(entry.message)));
+          addMessage(makeMsg(entry.username, linkify(entry.message), entry.ts));
         } else if (entry.type === "file") {
-          addMessage(renderFile(entry.username, entry));
+          addMessage(renderFile(entry.username, entry, entry.ts));
         } else if (entry.type === "image") {
-          addMessage(renderLegacyImage(entry.username, entry.dataUrl));
+          addMessage(renderLegacyImage(entry.username, entry.dataUrl, entry.ts));
         }
       });
     });
 
     // ── Incoming messages ─────────────────────────────────────────────────────
     socket.on("chat-message", ({ username: sender, message }) => {
-      addMessage(makeMsg(sender, linkify(message)));
+      addMessage(makeMsg(sender, linkify(message), Date.now()));
     });
 
     socket.on("chat-file", ({ username: sender, url, name, size, mime }) => {
       if (sender === username) return; // already shown optimistically
-      addMessage(renderFile(sender, { url, name, size, mime }));
+      addMessage(renderFile(sender, { url, name, size, mime }, Date.now()));
     });
 
     socket.on("chat-image", ({ username: sender, dataUrl }) => {
       if (sender === username) return;
-      addMessage(renderLegacyImage(sender, dataUrl));
+      addMessage(renderLegacyImage(sender, dataUrl, Date.now()));
     });
 
     socket.on("system-message", (text) => {
