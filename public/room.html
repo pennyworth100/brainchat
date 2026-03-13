@@ -405,16 +405,6 @@
     <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off">
     <button id="sendBtn">Send</button>
   </div>
-
-  
-
-    <!-- Private DM panel (hidden by default) -->
-    <div class="dm-panel" id="dmPanel" style="display:none;">
-      <div class="dm-panel-header">
-        <span>🔒 <span id="dmPeerName"></span></span>
-        <span class="dm-close" id="dmClose">✕</span>
-      </div>
-
   <script src="/socket.io/socket.io.js"></script>
   <script>
     // ── Init ──────────────────────────────────────────────────────────────────
@@ -688,17 +678,19 @@
       }
     });
 
-    // ── Private DM ───────────────────────────────────────────────────────────
+    // ── Private DM ──────────────────────────────────────────────────────────
+    document.addEventListener("DOMContentLoaded", function() {
+
     let dmPeer = null;
 
-    function openDM(peerName) {
+    window.openDM = function(peerName) {
       dmPeer = peerName;
       document.getElementById("dmPeerName").textContent = peerName;
       document.getElementById("dmPanel").style.display = "flex";
       document.getElementById("dmMessages").innerHTML = "";
       document.getElementById("dmInput").focus();
       document.getElementById("participantsPanel").classList.remove("open");
-    }
+    };
 
     document.getElementById("dmClose").addEventListener("click", () => {
       document.getElementById("dmPanel").style.display = "none";
@@ -715,7 +707,7 @@
 
     document.getElementById("dmSend").addEventListener("click", sendDM);
     document.getElementById("dmInput").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") sendDM();
+      if (e.key === "Enter") { e.preventDefault(); sendDM(); }
     });
 
     socket.on("private-message-sent", ({ toUsername, message, ts }) => {
@@ -742,13 +734,22 @@
       alert(`Cannot send DM to ${toUsername}: ${error}`);
     });
 
-  </script>
-      <div class="dm-messages" id="dmMessages"></div>
-      <div class="dm-input-row">
-        <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
-        <button id="dmSend">Send</button>
-      </div>
-    </div>
+    }); // end DOMContentLoaded
 
+  </script>
+
+
+  <!-- Private DM panel (hidden by default) -->
+  <div class="dm-panel" id="dmPanel" style="display:none;">
+    <div class="dm-panel-header">
+      <span>🔒 <span id="dmPeerName"></span></span>
+      <span class="dm-close" id="dmClose">✕</span>
+    </div>
+    <div class="dm-messages" id="dmMessages"></div>
+    <div class="dm-input-row">
+      <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
+      <button id="dmSend">Send</button>
+    </div>
+  </div>
 </body>
 </html>
