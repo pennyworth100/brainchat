@@ -811,9 +811,7 @@
         if (open) window.openDM(peerName); else return;
       }
       const w = dmWindows.get(peerName);
-      const div = document.createElement("div");
-      div.innerHTML = html;
-      w.msgEl.appendChild(div.firstChild);
+      w.msgEl.insertAdjacentHTML("beforeend", html);
       w.msgEl.scrollTop = w.msgEl.scrollHeight;
       if (w.minimized) {
         const cur = parseInt(w.unreadEl.textContent) || 0;
