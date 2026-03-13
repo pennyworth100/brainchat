@@ -99,54 +99,83 @@
     .participant-item .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
     .participant-item.is-self { color: #7c5cff; font-weight: 600; }
 
-    /* ── Private DM panel ─────────────────────────────────────────── */
+    /* ── Private DM panels (multi-window, Slack-style) ──────────────── */
     .participant-item:not(.is-self) { cursor: pointer; }
     .participant-item:not(.is-self):hover { color: #fff; background: #1e1e2e; border-radius: 6px; padding-left: 4px; }
-    .dm-panel {
+
+    #dm-container {
       position: fixed;
-      bottom: 80px;
-      right: 20px;
-      width: 300px;
+      bottom: 0;
+      right: 12px;
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      z-index: 200;
+      pointer-events: none;
+    }
+    .dm-panel {
+      width: 280px;
       background: #14141f;
       border: 1px solid #7c5cff;
-      border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-      z-index: 100;
+      border-bottom: none;
+      border-radius: 12px 12px 0 0;
+      box-shadow: 0 -4px 24px rgba(0,0,0,0.5);
       display: flex;
       flex-direction: column;
-      max-height: 400px;
+      max-height: 380px;
+      pointer-events: all;
+      transition: max-height 0.2s ease;
     }
+    .dm-panel.minimized { max-height: 40px; overflow: hidden; }
     .dm-panel-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0.6rem 0.9rem;
+      padding: 0.5rem 0.8rem;
       border-bottom: 1px solid #2a2a3a;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       font-weight: 600;
-      color: #7c5cff;
+      color: #a78bfa;
+      cursor: pointer;
+      user-select: none;
+      flex-shrink: 0;
     }
-    .dm-panel-header span { display: flex; align-items: center; gap: 0.4rem; }
-    .dm-close { cursor: pointer; color: #555; font-size: 1rem; line-height: 1; }
-    .dm-close:hover { color: #fff; }
+    .dm-panel-header:hover { background: #1a1a2e; border-radius: 12px 12px 0 0; }
+    .dm-panel-title { display: flex; align-items: center; gap: 0.4rem; flex: 1; overflow: hidden; }
+    .dm-panel-title span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .dm-panel-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+    .dm-btn { cursor: pointer; color: #555; font-size: 0.9rem; line-height: 1; padding: 2px 4px; border-radius: 3px; }
+    .dm-btn:hover { color: #fff; background: #2a2a3e; }
+    .dm-unread {
+      background: #7c5cff;
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 1px 6px;
+      min-width: 18px;
+      text-align: center;
+      display: none;
+    }
     .dm-messages {
       flex: 1;
       overflow-y: auto;
-      padding: 0.6rem 0.9rem;
+      padding: 0.6rem 0.8rem;
       display: flex;
       flex-direction: column;
-      gap: 0.4rem;
-      font-size: 0.85rem;
+      gap: 0.35rem;
+      font-size: 0.82rem;
     }
-    .dm-msg { padding: 0.3rem 0.5rem; border-radius: 6px; max-width: 90%; }
+    .dm-msg { padding: 0.25rem 0.5rem; border-radius: 6px; max-width: 92%; word-break: break-word; }
     .dm-msg.sent { background: #2a1f4a; color: #c4b5fd; align-self: flex-end; }
     .dm-msg.received { background: #1e1e2e; color: #ccc; align-self: flex-start; }
-    .dm-msg .dm-who { font-size: 0.7rem; color: #666; margin-bottom: 2px; }
+    .dm-msg .dm-who { font-size: 0.65rem; color: #666; margin-bottom: 2px; }
     .dm-input-row {
       display: flex;
       gap: 0.4rem;
-      padding: 0.5rem 0.7rem;
+      padding: 0.45rem 0.6rem;
       border-top: 1px solid #2a2a3a;
+      flex-shrink: 0;
     }
     .dm-input-row input {
       flex: 1;
@@ -154,18 +183,19 @@
       border: 1px solid #2a2a3a;
       border-radius: 8px;
       color: #fff;
-      padding: 0.4rem 0.6rem;
-      font-size: 0.85rem;
+      padding: 0.35rem 0.55rem;
+      font-size: 0.82rem;
       outline: none;
     }
+    .dm-input-row input:focus { border-color: #7c5cff; }
     .dm-input-row button {
       background: #7c5cff;
       color: #fff;
       border: none;
       border-radius: 8px;
-      padding: 0.4rem 0.7rem;
+      padding: 0.35rem 0.65rem;
       cursor: pointer;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
     }
     .dm-input-row button:hover { background: #6548e8; }
 
@@ -417,18 +447,8 @@
     <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off">
     <button id="sendBtn">Send</button>
   </div>
-<!-- Private DM panel (hidden by default) -->
-  <div class="dm-panel" id="dmPanel" style="display:none;">
-    <div class="dm-panel-header">
-      <span>🔒 <span id="dmPeerName"></span></span>
-      <span class="dm-close" id="dmClose">✕</span>
-    </div>
-    <div class="dm-messages" id="dmMessages"></div>
-    <div class="dm-input-row">
-      <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
-      <button id="dmSend">Send</button>
-    </div>
-  </div>
+<!-- DM panels container (multi-window, Slack-style) -->
+  <div id="dm-container"></div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
@@ -704,54 +724,115 @@
       }
     });
 
-    // ── Private DM ──────────────────────────────────────────────────────────
-    let dmPeer = null;
+    // ── Private DM (multi-window, Slack-style) ─────────────────────────────
+    const dmWindows = new Map(); // peerName -> { panel, msgEl, unreadEl, minimized }
 
-    window.openDM = function(peerName) {
-      dmPeer = peerName;
-      document.getElementById("dmPeerName").textContent = peerName;
-      document.getElementById("dmPanel").style.display = "flex";
-      document.getElementById("dmMessages").innerHTML = "";
-      document.getElementById("dmInput").focus();
-      document.getElementById("participantsPanel").classList.remove("open");
-    };
-
-    document.getElementById("dmClose").addEventListener("click", () => {
-      document.getElementById("dmPanel").style.display = "none";
-      dmPeer = null;
-    });
-
-    function sendDM() {
-      const input = document.getElementById("dmInput");
-      const msg = input.value.trim();
-      if (!msg || !dmPeer) return;
-      socket.emit("private-message", { roomId, toUsername: dmPeer, message: msg });
-      input.value = "";
+    function repositionPanels() {
+      // panels are laid out by flex in #dm-container — nothing to do manually
     }
 
-    document.getElementById("dmSend").addEventListener("click", sendDM);
-    document.getElementById("dmInput").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); sendDM(); }
+    window.openDM = function(peerName) {
+      document.getElementById("participantsPanel").classList.remove("open");
+      if (dmWindows.has(peerName)) {
+        const w = dmWindows.get(peerName);
+        if (w.minimized) toggleMinimizeDM(peerName);
+        w.panel.querySelector(".dm-input").focus();
+        return;
+      }
+      const container = document.getElementById("dm-container");
+      const panel = document.createElement("div");
+      panel.className = "dm-panel";
+      panel.innerHTML =
+        `<div class="dm-panel-header">` +
+          `<div class="dm-panel-title"><span>🔒 ${esc(peerName)}</span></div>` +
+          `<div class="dm-panel-actions">` +
+            `<span class="dm-unread" data-peer="${esc(peerName)}"></span>` +
+            `<span class="dm-btn dm-minimize-btn" title="Minimise">−</span>` +
+            `<span class="dm-btn dm-close-btn" title="Close">✕</span>` +
+          `</div>` +
+        `</div>` +
+        `<div class="dm-messages"></div>` +
+        `<div class="dm-input-row">` +
+          `<input type="text" class="dm-input" placeholder="Message ${esc(peerName)}…" maxlength="500">` +
+          `<button class="dm-send-btn">Send</button>` +
+        `</div>`;
+      container.appendChild(panel);
+
+      const msgEl   = panel.querySelector(".dm-messages");
+      const input   = panel.querySelector(".dm-input");
+      const sendBtn = panel.querySelector(".dm-send-btn");
+      const unreadEl = panel.querySelector(".dm-unread");
+
+      dmWindows.set(peerName, { panel, msgEl, unreadEl, minimized: false });
+
+      // header click → toggle minimize
+      panel.querySelector(".dm-panel-header").addEventListener("click", (e) => {
+        if (e.target.classList.contains("dm-btn")) return;
+        toggleMinimizeDM(peerName);
+      });
+      panel.querySelector(".dm-minimize-btn").addEventListener("click", () => toggleMinimizeDM(peerName));
+      panel.querySelector(".dm-close-btn").addEventListener("click", () => closeDMPanel(peerName));
+
+      function doSend() {
+        const msg = input.value.trim();
+        if (!msg) return;
+        socket.emit("private-message", { roomId, toUsername: peerName, message: msg });
+        input.value = "";
+      }
+      sendBtn.addEventListener("click", doSend);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSend(); } });
+      input.focus();
+    };
+
+    function toggleMinimizeDM(peerName) {
+      if (!dmWindows.has(peerName)) return;
+      const w = dmWindows.get(peerName);
+      w.minimized = !w.minimized;
+      w.panel.classList.toggle("minimized", w.minimized);
+      const btn = w.panel.querySelector(".dm-minimize-btn");
+      btn.textContent = w.minimized ? "+" : "−";
+      if (!w.minimized) {
+        w.unreadEl.style.display = "none";
+        w.unreadEl.textContent = "";
+        w.panel.querySelector(".dm-input").focus();
+      }
+    }
+
+    function closeDMPanel(peerName) {
+      if (!dmWindows.has(peerName)) return;
+      const w = dmWindows.get(peerName);
+      w.panel.remove();
+      dmWindows.delete(peerName);
+    }
+
+    function appendDMMsg(peerName, html, open) {
+      if (!dmWindows.has(peerName)) {
+        if (open) window.openDM(peerName); else return;
+      }
+      const w = dmWindows.get(peerName);
+      const div = document.createElement("div");
+      div.innerHTML = html;
+      w.msgEl.appendChild(div.firstChild);
+      w.msgEl.scrollTop = w.msgEl.scrollHeight;
+      if (w.minimized) {
+        const cur = parseInt(w.unreadEl.textContent) || 0;
+        w.unreadEl.textContent = cur + 1;
+        w.unreadEl.style.display = "inline-block";
+      }
+    }
+
+    socket.on("private-message-sent", ({ toUsername, message }) => {
+      if (!dmWindows.has(toUsername)) window.openDM(toUsername);
+      appendDMMsg(toUsername,
+        `<div class="dm-msg sent"><div class="dm-who">You → ${esc(toUsername)}</div>${esc(message)}</div>`,
+        false);
     });
 
-    socket.on("private-message-sent", ({ toUsername, message, ts }) => {
-      if (dmPeer !== toUsername) openDM(toUsername);
-      const msgs = document.getElementById("dmMessages");
-      const div = document.createElement("div");
-      div.className = "dm-msg sent";
-      div.innerHTML = `<div class="dm-who">You → ${esc(toUsername)}</div>${esc(message)}`;
-      msgs.appendChild(div);
-      msgs.scrollTop = msgs.scrollHeight;
-    });
-
-    socket.on("private-message", ({ fromUsername, message, ts }) => {
-      if (!dmPeer || dmPeer !== fromUsername) openDM(fromUsername);
-      const msgs = document.getElementById("dmMessages");
-      const div = document.createElement("div");
-      div.className = "dm-msg received";
-      div.innerHTML = `<div class="dm-who">${esc(fromUsername)}</div>${esc(message)}`;
-      msgs.appendChild(div);
-      msgs.scrollTop = msgs.scrollHeight;
+    socket.on("private-message", ({ fromUsername, message }) => {
+      if (!dmWindows.has(fromUsername)) window.openDM(fromUsername);
+      appendDMMsg(fromUsername,
+        `<div class="dm-msg received"><div class="dm-who">${esc(fromUsername)}</div>${esc(message)}</div>`,
+        true);
     });
 
     socket.on("private-error", ({ toUsername, error }) => {
