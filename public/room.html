@@ -489,7 +489,8 @@
       const isSelf = sender === username;
       const div = document.createElement("div");
       div.className = `msg ${isSelf ? "msg-self" : "msg-user"}`;
-      div.innerHTML = `<div class="name">${esc(sender)}</div><div class="bubble">${bubbleHtml}<span class="ts">${fmtTs(ts)}</span></div>`;
+      const nameAttr = isSelf ? "" : ` onclick="openDM('${esc(sender)}')" title="Private message" style="cursor:pointer"`;
+      div.innerHTML = `<div class="name"${nameAttr}>${esc(sender)}</div><div class="bubble">${bubbleHtml}<span class="ts">${fmtTs(ts)}</span></div>`;
       return div;
     }
 
