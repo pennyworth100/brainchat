@@ -417,6 +417,21 @@
     <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off">
     <button id="sendBtn">Send</button>
   </div>
+<!-- Private DM panel (hidden by default) -->
+  <div class="dm-panel" id="dmPanel" style="display:none;">
+    <div class="dm-panel-header">
+      <span>🔒 <span id="dmPeerName"></span></span>
+      <span class="dm-close" id="dmClose">✕</span>
+    </div>
+    <div class="dm-messages" id="dmMessages"></div>
+    <div class="dm-input-row">
+      <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
+      <button id="dmSend">Send</button>
+    </div>
+  </div>
+</body>
+</html>
+
   <script src="/socket.io/socket.io.js"></script>
   <script>
     // ── Init ──────────────────────────────────────────────────────────────────
@@ -749,18 +764,5 @@
 
   </script>
 
-
-  <!-- Private DM panel (hidden by default) -->
-  <div class="dm-panel" id="dmPanel" style="display:none;">
-    <div class="dm-panel-header">
-      <span>🔒 <span id="dmPeerName"></span></span>
-      <span class="dm-close" id="dmClose">✕</span>
-    </div>
-    <div class="dm-messages" id="dmMessages"></div>
-    <div class="dm-input-row">
-      <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
-      <button id="dmSend">Send</button>
-    </div>
-  </div>
 </body>
 </html>
