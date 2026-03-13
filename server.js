@@ -173,6 +173,29 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("chat-image", { username, dataUrl });
   });
 
+
+  // ── Private messages ──────────────────────────────────────────────────────
+  socket.on("private-message", ({ roomId, toUsername, message }) => {
+    if (!roomId || !toUsername || !message || !rooms.has(roomId)) return;
+    const room         = rooms.get(roomId);
+    const fromUsername = room.users.get(socket.id);
+    if (!fromUsername) return;
+
+    let toSocketId = null;
+    for (const [sid, uname] of room.users.entries()) {
+      if (uname === toUsername) { toSocketId = sid; break; }
+    }
+
+    if (!toSocketId) {
+      socket.emit("private-error", { toUsername, error: "User not found or offline" });
+      return;
+    }
+
+    const ts = Date.now();
+    io.to(toSocketId).emit("private-message", { fromUsername, message, ts });
+    socket.emit("private-message-sent", { toUsername, message, ts });
+  });
+
   socket.on("disconnect", () => {
     if (!currentRoom || !rooms.has(currentRoom)) return;
     const room     = rooms.get(currentRoom);

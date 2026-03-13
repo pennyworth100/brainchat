@@ -88,6 +88,77 @@
     .participant-item .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
     .participant-item.is-self { color: #7c5cff; font-weight: 600; }
 
+    /* ── Private DM panel ─────────────────────────────────────────── */
+    .participant-item:not(.is-self) { cursor: pointer; }
+    .participant-item:not(.is-self):hover { color: #fff; background: #1e1e2e; border-radius: 6px; padding-left: 4px; }
+    .dm-panel {
+      position: fixed;
+      bottom: 80px;
+      right: 20px;
+      width: 300px;
+      background: #14141f;
+      border: 1px solid #7c5cff;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      max-height: 400px;
+    }
+    .dm-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.6rem 0.9rem;
+      border-bottom: 1px solid #2a2a3a;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #7c5cff;
+    }
+    .dm-panel-header span { display: flex; align-items: center; gap: 0.4rem; }
+    .dm-close { cursor: pointer; color: #555; font-size: 1rem; line-height: 1; }
+    .dm-close:hover { color: #fff; }
+    .dm-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.6rem 0.9rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      font-size: 0.85rem;
+    }
+    .dm-msg { padding: 0.3rem 0.5rem; border-radius: 6px; max-width: 90%; }
+    .dm-msg.sent { background: #2a1f4a; color: #c4b5fd; align-self: flex-end; }
+    .dm-msg.received { background: #1e1e2e; color: #ccc; align-self: flex-start; }
+    .dm-msg .dm-who { font-size: 0.7rem; color: #666; margin-bottom: 2px; }
+    .dm-input-row {
+      display: flex;
+      gap: 0.4rem;
+      padding: 0.5rem 0.7rem;
+      border-top: 1px solid #2a2a3a;
+    }
+    .dm-input-row input {
+      flex: 1;
+      background: #1e1e2e;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      color: #fff;
+      padding: 0.4rem 0.6rem;
+      font-size: 0.85rem;
+      outline: none;
+    }
+    .dm-input-row button {
+      background: #7c5cff;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+      font-size: 0.8rem;
+    }
+    .dm-input-row button:hover { background: #6548e8; }
+
+
     /* Messages */
     #messages {
       flex: 1;
@@ -512,7 +583,8 @@
     socket.on("user-list", (users) => {
       document.getElementById("participantsList").innerHTML = users.map(name => {
         const isSelf = name === username;
-        return `<div class="participant-item${isSelf ? " is-self" : ""}">
+        const clickAttr = isSelf ? "" : ` onclick="openDM('${esc(name)}')" title="Private message"`;
+        return `<div class="participant-item${isSelf ? " is-self" : ""}" ${clickAttr}>
           <span class="dot"></span><span>${esc(name)}${isSelf ? " (you)" : ""}</span>
         </div>`;
       }).join("");
@@ -606,6 +678,75 @@
         }
       }
     });
+
+    // ── Private DM ───────────────────────────────────────────────────────────
+    let dmPeer = null;
+
+    function openDM(peerName) {
+      dmPeer = peerName;
+      document.getElementById("dmPeerName").textContent = peerName;
+      document.getElementById("dmPanel").style.display = "flex";
+      document.getElementById("dmMessages").innerHTML = "";
+      document.getElementById("dmInput").focus();
+      document.getElementById("participantsPanel").classList.remove("open");
+    }
+
+    document.getElementById("dmClose").addEventListener("click", () => {
+      document.getElementById("dmPanel").style.display = "none";
+      dmPeer = null;
+    });
+
+    function sendDM() {
+      const input = document.getElementById("dmInput");
+      const msg = input.value.trim();
+      if (!msg || !dmPeer) return;
+      socket.emit("private-message", { roomId, toUsername: dmPeer, message: msg });
+      input.value = "";
+    }
+
+    document.getElementById("dmSend").addEventListener("click", sendDM);
+    document.getElementById("dmInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendDM();
+    });
+
+    socket.on("private-message-sent", ({ toUsername, message, ts }) => {
+      if (dmPeer !== toUsername) openDM(toUsername);
+      const msgs = document.getElementById("dmMessages");
+      const div = document.createElement("div");
+      div.className = "dm-msg sent";
+      div.innerHTML = `<div class="dm-who">You → ${esc(toUsername)}</div>${esc(message)}`;
+      msgs.appendChild(div);
+      msgs.scrollTop = msgs.scrollHeight;
+    });
+
+    socket.on("private-message", ({ fromUsername, message, ts }) => {
+      if (!dmPeer || dmPeer !== fromUsername) openDM(fromUsername);
+      const msgs = document.getElementById("dmMessages");
+      const div = document.createElement("div");
+      div.className = "dm-msg received";
+      div.innerHTML = `<div class="dm-who">${esc(fromUsername)}</div>${esc(message)}`;
+      msgs.appendChild(div);
+      msgs.scrollTop = msgs.scrollHeight;
+    });
+
+    socket.on("private-error", ({ toUsername, error }) => {
+      alert(`Cannot send DM to ${toUsername}: ${error}`);
+    });
+
   </script>
+
+    <!-- Private DM panel (hidden by default) -->
+    <div class="dm-panel" id="dmPanel" style="display:none;">
+      <div class="dm-panel-header">
+        <span>🔒 <span id="dmPeerName"></span></span>
+        <span class="dm-close" id="dmClose">✕</span>
+      </div>
+      <div class="dm-messages" id="dmMessages"></div>
+      <div class="dm-input-row">
+        <input type="text" id="dmInput" placeholder="Private message…" maxlength="500">
+        <button id="dmSend">Send</button>
+      </div>
+    </div>
+
 </body>
 </html>
