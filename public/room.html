@@ -436,7 +436,7 @@
           <div id="participantsList"></div>
         </div>
       </span>
-      <span class="version-badge">v2026.3.15</span>
+      <span class="version-badge">v2026.3.16</span>
     </div>
   </header>
 
@@ -732,6 +732,7 @@
       // panels are laid out by flex in #dm-container — nothing to do manually
     }
 
+    // User-initiated: create or restore (unminimize + focus)
     window.openDM = function(peerName) {
       document.getElementById("participantsPanel").classList.remove("open");
       if (dmWindows.has(peerName)) {
@@ -785,6 +786,48 @@
       input.focus();
     };
 
+    // Silent create: creates panel if not exists, respects minimized state
+    function ensureDMPanel(peerName) {
+      if (dmWindows.has(peerName)) return;
+      const container = document.getElementById("dm-container");
+      const panel = document.createElement("div");
+      panel.className = "dm-panel minimized"; // start minimized for incoming
+      panel.innerHTML =
+        `<div class="dm-panel-header">` +
+          `<div class="dm-panel-title"><span>🔒 ${esc(peerName)}</span></div>` +
+          `<div class="dm-panel-actions">` +
+            `<span class="dm-unread" data-peer="${esc(peerName)}"></span>` +
+            `<span class="dm-btn dm-minimize-btn" title="Minimise">+</span>` +
+            `<span class="dm-btn dm-close-btn" title="Close">✕</span>` +
+          `</div>` +
+        `</div>` +
+        `<div class="dm-messages"></div>` +
+        `<div class="dm-input-row">` +
+          `<input type="text" class="dm-input" placeholder="Message ${esc(peerName)}…" maxlength="500">` +
+          `<button class="dm-send-btn">Send</button>` +
+        `</div>`;
+      container.appendChild(panel);
+      const msgEl    = panel.querySelector(".dm-messages");
+      const input    = panel.querySelector(".dm-input");
+      const sendBtn  = panel.querySelector(".dm-send-btn");
+      const unreadEl = panel.querySelector(".dm-unread");
+      dmWindows.set(peerName, { panel, msgEl, unreadEl, minimized: true });
+      panel.querySelector(".dm-panel-header").addEventListener("click", (e) => {
+        if (e.target.classList.contains("dm-btn")) return;
+        toggleMinimizeDM(peerName);
+      });
+      panel.querySelector(".dm-minimize-btn").addEventListener("click", () => toggleMinimizeDM(peerName));
+      panel.querySelector(".dm-close-btn").addEventListener("click", () => closeDMPanel(peerName));
+      function doSend() {
+        const msg = input.value.trim();
+        if (!msg) return;
+        socket.emit("private-message", { roomId, toUsername: peerName, message: msg });
+        input.value = "";
+      }
+      sendBtn.addEventListener("click", doSend);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSend(); } });
+    }
+
     function toggleMinimizeDM(peerName) {
       if (!dmWindows.has(peerName)) return;
       const w = dmWindows.get(peerName);
@@ -828,10 +871,11 @@
     });
 
     socket.on("private-message", ({ fromUsername, message }) => {
-      if (!dmWindows.has(fromUsername)) window.openDM(fromUsername);
+      // Silently create panel if it doesn't exist — don't force-unminimize
+      if (!dmWindows.has(fromUsername)) ensureDMPanel(fromUsername);
       appendDMMsg(fromUsername,
         `<div class="dm-msg received"><div class="dm-who">${esc(fromUsername)}</div>${esc(message)}</div>`,
-        true);
+        false);
     });
 
     socket.on("private-error", ({ toUsername, error }) => {
