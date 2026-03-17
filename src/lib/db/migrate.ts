@@ -1,5 +1,5 @@
-const { migrate } = require("drizzle-orm/node-postgres/migrator");
-const { db, pool } = require("./index");
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { db, pool } from "./index";
 
 async function runMigrations() {
   console.log("Running database migrations...");
