@@ -5,6 +5,9 @@ const path    = require("path");
 const multer  = require("multer");
 const crypto  = require("crypto");
 const fs      = require("fs");
+const { eq, desc, gt } = require("drizzle-orm");
+const { db }  = require("./db");
+const { rooms: roomsTable, messages: messagesTable } = require("./db/schema");
 
 const app    = express();
 const server = http.createServer(app);
@@ -18,8 +21,99 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Rooms: Map<roomId, { users, history, password }>
-const rooms = new Map();
+// In-memory: online users per room (transient socket state only)
+// Map<roomId, Map<socketId, username>>
+const onlineUsers = new Map();
+
+function getOrCreateOnlineRoom(roomId) {
+  if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Map());
+  return onlineUsers.get(roomId);
+}
+
+// ── DB helpers ──────────────────────────────────────────────────────────────
+
+async function ensureRoom(roomId, password) {
+  const existing = await db.select().from(roomsTable).where(eq(roomsTable.id, roomId)).limit(1);
+  if (existing.length > 0) return existing[0];
+  const [created] = await db.insert(roomsTable).values({
+    id: roomId,
+    passwordHash: password || null,
+  }).returning();
+  return created;
+}
+
+async function getRoomPassword(roomId) {
+  const rows = await db.select({ passwordHash: roomsTable.passwordHash })
+    .from(roomsTable).where(eq(roomsTable.id, roomId)).limit(1);
+  return rows.length > 0 ? rows[0].passwordHash : null;
+}
+
+async function roomExists(roomId) {
+  const rows = await db.select({ id: roomsTable.id })
+    .from(roomsTable).where(eq(roomsTable.id, roomId)).limit(1);
+  return rows.length > 0;
+}
+
+async function touchRoom(roomId) {
+  await db.update(roomsTable).set({ lastActiveAt: new Date() }).where(eq(roomsTable.id, roomId));
+}
+
+async function saveMessage(roomId, username, type, content) {
+  await db.insert(messagesTable).values({
+    roomId,
+    username,
+    type,
+    content,
+    ts: new Date(),
+  });
+  touchRoom(roomId).catch(() => {}); // fire and forget
+}
+
+async function loadHistory(roomId) {
+  const rows = await db.select()
+    .from(messagesTable)
+    .where(eq(messagesTable.roomId, roomId))
+    .orderBy(desc(messagesTable.ts))
+    .limit(MAX_HISTORY);
+
+  // Reverse so oldest first, then convert to client format
+  return rows.reverse().map(deserializeMessage);
+}
+
+async function loadMessagesSince(roomId, sinceMs) {
+  const sinceDate = new Date(sinceMs);
+  const rows = await db.select()
+    .from(messagesTable)
+    .where(eq(messagesTable.roomId, roomId))
+    .orderBy(desc(messagesTable.ts))
+    .limit(MAX_HISTORY);
+
+  return rows
+    .reverse()
+    .map(deserializeMessage)
+    .filter((m) => (m.ts || 0) > sinceMs);
+}
+
+// Serialize message entry to DB content string
+function serializeMessage(entry) {
+  if (entry.type === "message") return entry.message;
+  return JSON.stringify(entry); // file, image — store full payload
+}
+
+// Deserialize DB row to client-facing message object
+function deserializeMessage(row) {
+  const ts = row.ts instanceof Date ? row.ts.getTime() : row.ts;
+  if (row.type === "message") {
+    return { type: "message", username: row.username, message: row.content, ts };
+  }
+  // file / image types — content is JSON
+  try {
+    const parsed = JSON.parse(row.content);
+    return { ...parsed, type: row.type, username: row.username, ts };
+  } catch {
+    return { type: row.type, username: row.username, message: row.content, ts };
+  }
+}
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -42,7 +136,6 @@ const storage = multer.diskStorage({
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    // Sanitise: keep alphanumeric, dot, dash, underscore, space
     const safe = file.originalname
       .replace(/[^\w.\- ]/g, "_")
       .slice(0, 128)
@@ -58,7 +151,6 @@ const upload = multer({
 
 // Serve uploaded files
 app.use("/uploads", (req, res, next) => {
-  // Prevent path traversal
   const rel = decodeURIComponent(req.path);
   if (rel.includes("..")) return res.status(403).end();
   next();
@@ -84,105 +176,136 @@ function requireApiKey(req, res, next) {
 }
 
 // GET /api/messages/:roomId?since=<ms>
-app.get("/api/messages/:roomId", requireApiKey, (req, res) => {
-  const { roomId } = req.params;
-  const since = parseInt(req.query.since) || 0;
-  if (!rooms.has(roomId)) return res.status(404).json({ error: "Room not found" });
-  const messages = rooms.get(roomId).history.filter(m => (m.ts || 0) > since);
-  res.json({ messages });
+app.get("/api/messages/:roomId", requireApiKey, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const since = parseInt(req.query.since) || 0;
+    if (!(await roomExists(roomId))) return res.status(404).json({ error: "Room not found" });
+    const messages = since > 0
+      ? await loadMessagesSince(roomId, since)
+      : await loadHistory(roomId);
+    res.json({ messages });
+  } catch (err) {
+    console.error("GET /api/messages error:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // POST /api/send
-app.post("/api/send", requireApiKey, (req, res) => {
-  const { roomId, username, message } = req.body;
-  if (!roomId || !username || !message)
-    return res.status(400).json({ error: "Missing roomId, username or message" });
-  if (!rooms.has(roomId)) return res.status(404).json({ error: "Room not found" });
-  const room  = rooms.get(roomId);
-  const entry = { type: "message", username, message, ts: Date.now() };
-  addToHistory(room, entry);
-  io.to(roomId).emit("chat-message", { username, message });
-  res.json({ ok: true });
-});
+app.post("/api/send", requireApiKey, async (req, res) => {
+  try {
+    const { roomId, username, message } = req.body;
+    if (!roomId || !username || !message)
+      return res.status(400).json({ error: "Missing roomId, username or message" });
 
-function addToHistory(room, entry) {
-  room.history.push(entry);
-  if (room.history.length > MAX_HISTORY) room.history.shift();
-}
+    // Auto-create room if it doesn't exist (bot may send before anyone joins via UI)
+    await ensureRoom(roomId, null);
+
+    await saveMessage(roomId, username, "message", message);
+    io.to(roomId).emit("chat-message", { username, message });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/send error:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
   let currentRoom = null;
 
-  socket.on("join-room", ({ roomId, username, password }) => {
+  socket.on("join-room", async ({ roomId, username, password }) => {
     if (!roomId || !username) return;
 
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, { users: new Map(), history: [], password: password || null });
+    try {
+      const room = await ensureRoom(roomId, password);
+
+      // Check password
+      if (room.passwordHash && room.passwordHash !== password) {
+        socket.emit("join-error", "Wrong password");
+        return;
+      }
+
+      currentRoom = roomId;
+      const users = getOrCreateOnlineRoom(roomId);
+      users.set(socket.id, username);
+      socket.join(roomId);
+
+      socket.emit("room-info", { hasPassword: !!room.passwordHash });
+
+      // Load history from DB
+      const history = await loadHistory(roomId);
+      if (history.length > 0) socket.emit("chat-history", history);
+
+      socket.to(roomId).emit("system-message", `${username} joined`);
+      io.to(roomId).emit("user-count", users.size);
+      io.to(roomId).emit("user-list", Array.from(users.values()));
+    } catch (err) {
+      console.error("join-room error:", err);
+      socket.emit("join-error", "Server error");
     }
-
-    const room = rooms.get(roomId);
-    if (room.password && room.password !== password) {
-      socket.emit("join-error", "Wrong password");
-      return;
-    }
-
-    currentRoom = roomId;
-    room.users.set(socket.id, username);
-    socket.join(roomId);
-
-    socket.emit("room-info", { hasPassword: !!room.password });
-    if (room.history.length > 0) socket.emit("chat-history", room.history);
-
-    socket.to(roomId).emit("system-message", `${username} joined`);
-    io.to(roomId).emit("user-count", room.users.size);
-    io.to(roomId).emit("user-list", Array.from(room.users.values()));
   });
 
-  socket.on("send-message", ({ roomId, message }) => {
-    if (!roomId || !message || !rooms.has(roomId)) return;
-    const room     = rooms.get(roomId);
-    const username = room.users.get(socket.id);
+  socket.on("send-message", async ({ roomId, message }) => {
+    if (!roomId || !message) return;
+    const users = onlineUsers.get(roomId);
+    if (!users) return;
+    const username = users.get(socket.id);
     if (!username) return;
-    const entry = { type: "message", username, message, ts: Date.now() };
-    addToHistory(room, entry);
-    io.to(roomId).emit("chat-message", { username, message });
+
+    try {
+      await saveMessage(roomId, username, "message", message);
+      io.to(roomId).emit("chat-message", { username, message });
+    } catch (err) {
+      console.error("send-message error:", err);
+    }
   });
 
-  // New unified file event (replaces old send-image)
-  socket.on("send-file", ({ roomId, url, name, size, mime }) => {
-    if (!roomId || !url || !rooms.has(roomId)) return;
-    if (!url.startsWith("/uploads/")) return; // security
-    const room     = rooms.get(roomId);
-    const username = room.users.get(socket.id);
+  socket.on("send-file", async ({ roomId, url, name, size, mime }) => {
+    if (!roomId || !url) return;
+    if (!url.startsWith("/uploads/")) return;
+    const users = onlineUsers.get(roomId);
+    if (!users) return;
+    const username = users.get(socket.id);
     if (!username) return;
-    const entry = { type: "file", username, url, name, size, mime, ts: Date.now() };
-    addToHistory(room, entry);
-    io.to(roomId).emit("chat-file", { username, url, name, size, mime });
+
+    try {
+      const content = JSON.stringify({ url, name, size, mime });
+      await saveMessage(roomId, username, "file", content);
+      io.to(roomId).emit("chat-file", { username, url, name, size, mime });
+    } catch (err) {
+      console.error("send-file error:", err);
+    }
   });
 
   // Keep legacy send-image for backward compat (old clients / dimle_bot)
-  socket.on("send-image", ({ roomId, dataUrl }) => {
-    if (!roomId || !dataUrl || !rooms.has(roomId)) return;
+  socket.on("send-image", async ({ roomId, dataUrl }) => {
+    if (!roomId || !dataUrl) return;
     if (!dataUrl.startsWith("data:image/")) return;
-    const room     = rooms.get(roomId);
-    const username = room.users.get(socket.id);
+    const users = onlineUsers.get(roomId);
+    if (!users) return;
+    const username = users.get(socket.id);
     if (!username) return;
-    const entry = { type: "image", username, dataUrl, ts: Date.now() };
-    addToHistory(room, entry);
-    io.to(roomId).emit("chat-image", { username, dataUrl });
-  });
 
+    try {
+      const content = JSON.stringify({ dataUrl });
+      await saveMessage(roomId, username, "image", content);
+      io.to(roomId).emit("chat-image", { username, dataUrl });
+    } catch (err) {
+      console.error("send-image error:", err);
+    }
+  });
 
   // ── Private messages ──────────────────────────────────────────────────────
   socket.on("private-message", ({ roomId, toUsername, message }) => {
-    if (!roomId || !toUsername || !message || !rooms.has(roomId)) return;
-    const room         = rooms.get(roomId);
-    const fromUsername = room.users.get(socket.id);
+    if (!roomId || !toUsername || !message) return;
+    const users = onlineUsers.get(roomId);
+    if (!users) return;
+    const fromUsername = users.get(socket.id);
     if (!fromUsername) return;
 
     let toSocketId = null;
-    for (const [sid, uname] of room.users.entries()) {
+    for (const [sid, uname] of users.entries()) {
       if (uname === toUsername) { toSocketId = sid; break; }
     }
 
@@ -197,16 +320,18 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    if (!currentRoom || !rooms.has(currentRoom)) return;
-    const room     = rooms.get(currentRoom);
-    const username = room.users.get(socket.id);
-    room.users.delete(socket.id);
-    if (room.users.size === 0) {
-      rooms.delete(currentRoom);
+    if (!currentRoom) return;
+    const users = onlineUsers.get(currentRoom);
+    if (!users) return;
+    const username = users.get(socket.id);
+    users.delete(socket.id);
+    if (users.size === 0) {
+      onlineUsers.delete(currentRoom);
+      // Room persists in DB — no deletion
     } else {
       io.to(currentRoom).emit("system-message", `${username} left`);
-      io.to(currentRoom).emit("user-count", room.users.size);
-      io.to(currentRoom).emit("user-list", Array.from(room.users.values()));
+      io.to(currentRoom).emit("user-count", users.size);
+      io.to(currentRoom).emit("user-list", Array.from(users.values()));
     }
   });
 });
