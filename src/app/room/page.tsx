@@ -69,7 +69,7 @@ function linkify(text: string) {
     /(?<![="'\/\w])((?:https?:\/\/|www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s<]*)?)/g,
     (match) => {
       const href = /^https?:\/\//i.test(match) ? match : "https://" + match;
-      return `<a href="${href}" target="_blank" rel="noopener" class="text-indigo-400 underline">${match}</a>`;
+      return `<a href="${href}" target="_blank" rel="noopener" class="text-dimle-accent underline hover:text-dimle-accent-dark">${match}</a>`;
     }
   );
 }
@@ -98,8 +98,8 @@ function MessageBubble({
     return (
       <div className={`max-w-[85%] ${isSelf ? "self-end" : "self-start"}`}>
         <div
-          className={`font-semibold text-xs mb-0.5 ${
-            isSelf ? "text-right text-dimle-cyan" : "text-dimle-purple cursor-pointer"
+          className={`font-medium text-xs mb-0.5 ${
+            isSelf ? "text-right text-dimle-accent" : "text-dimle-text-secondary cursor-pointer hover:text-dimle-accent"
           }`}
           onClick={() => !isSelf && onOpenDM(msg.username)}
           title={isSelf ? undefined : "Private message"}
@@ -109,15 +109,15 @@ function MessageBubble({
         <div
           className={`px-3.5 pt-2 pb-1.5 ${
             isSelf
-              ? "bg-[#1a1a3a] border border-[#2a2a5a] rounded-[10px_0_10px_10px]"
-              : "bg-dimle-card border border-dimle-border rounded-[0_10px_10px_10px]"
+              ? "bg-dimle-self-bg border border-dimle-border rounded-[14px_4px_14px_14px]"
+              : "bg-dimle-card border border-dimle-border rounded-[4px_14px_14px_14px] shadow-[0_1px_2px_rgba(0,0,0,0.04)]"
           }`}
         >
           <span
-            className="leading-relaxed break-words"
+            className="leading-relaxed break-words text-dimle-text-primary"
             dangerouslySetInnerHTML={{ __html: linkify(msg.message || "") }}
           />
-          <span className="block text-right text-[0.7rem] text-gray-600 mt-1 select-none">
+          <span className="block text-right text-[0.7rem] text-dimle-text-muted mt-1 select-none">
             {fmtTs(msg.ts)}
           </span>
         </div>
@@ -130,8 +130,8 @@ function MessageBubble({
     return (
       <div className={`max-w-[85%] ${isSelf ? "self-end" : "self-start"}`}>
         <div
-          className={`font-semibold text-xs mb-0.5 ${
-            isSelf ? "text-right text-dimle-cyan" : "text-dimle-purple cursor-pointer"
+          className={`font-medium text-xs mb-0.5 ${
+            isSelf ? "text-right text-dimle-accent" : "text-dimle-text-secondary cursor-pointer hover:text-dimle-accent"
           }`}
           onClick={() => !isSelf && onOpenDM(msg.username)}
         >
@@ -140,15 +140,15 @@ function MessageBubble({
         <div
           className={`px-3.5 pt-2 pb-1.5 ${
             isSelf
-              ? "bg-[#1a1a3a] border border-[#2a2a5a] rounded-[10px_0_10px_10px]"
-              : "bg-dimle-card border border-dimle-border rounded-[0_10px_10px_10px]"
+              ? "bg-dimle-self-bg border border-dimle-border rounded-[14px_4px_14px_14px]"
+              : "bg-dimle-card border border-dimle-border rounded-[4px_14px_14px_14px] shadow-[0_1px_2px_rgba(0,0,0,0.04)]"
           }`}
         >
           {isImage ? (
             <img
               src={msg.url}
               alt={msg.name || "image"}
-              className="max-w-[280px] max-h-[300px] rounded-lg cursor-pointer block"
+              className="max-w-[280px] max-h-[300px] rounded-xl cursor-pointer block"
               onClick={() => msg.url && onImageClick(msg.url)}
             />
           ) : (
@@ -157,10 +157,10 @@ function MessageBubble({
                 {fileIcon(msg.mime, msg.name)}
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-sm font-semibold text-gray-200 truncate">
+                <div className="text-sm font-semibold text-dimle-text-primary truncate">
                   {msg.name}
                 </div>
-                <div className="text-xs text-gray-500 mt-0.5">
+                <div className="text-xs text-dimle-text-muted mt-0.5">
                   {fmtSize(msg.size)}
                 </div>
               </div>
@@ -168,13 +168,13 @@ function MessageBubble({
                 href={msg.url}
                 download={msg.name}
                 title="Download"
-                className="flex-shrink-0 w-8 h-8 rounded-full bg-[#2a2a4a] flex items-center justify-center text-dimle-lavender hover:bg-[#3a3a6a] transition-colors"
+                className="flex-shrink-0 w-8 h-8 rounded-full bg-dimle-surface flex items-center justify-center text-dimle-accent hover:bg-dimle-accent-light transition-colors"
               >
                 ⬇
               </a>
             </div>
           )}
-          <span className="block text-right text-[0.7rem] text-gray-600 mt-1 select-none">
+          <span className="block text-right text-[0.7rem] text-dimle-text-muted mt-1 select-none">
             {fmtTs(msg.ts)}
           </span>
         </div>
@@ -186,8 +186,8 @@ function MessageBubble({
     return (
       <div className={`max-w-[85%] ${isSelf ? "self-end" : "self-start"}`}>
         <div
-          className={`font-semibold text-xs mb-0.5 ${
-            isSelf ? "text-right text-dimle-cyan" : "text-dimle-purple"
+          className={`font-medium text-xs mb-0.5 ${
+            isSelf ? "text-right text-dimle-accent" : "text-dimle-text-secondary"
           }`}
         >
           {msg.username}
@@ -195,17 +195,17 @@ function MessageBubble({
         <div
           className={`px-3.5 pt-2 pb-1.5 ${
             isSelf
-              ? "bg-[#1a1a3a] border border-[#2a2a5a] rounded-[10px_0_10px_10px]"
-              : "bg-dimle-card border border-dimle-border rounded-[0_10px_10px_10px]"
+              ? "bg-dimle-self-bg border border-dimle-border rounded-[14px_4px_14px_14px]"
+              : "bg-dimle-card border border-dimle-border rounded-[4px_14px_14px_14px] shadow-[0_1px_2px_rgba(0,0,0,0.04)]"
           }`}
         >
           <img
             src={msg.dataUrl}
             alt="image"
-            className="max-w-[280px] max-h-[300px] rounded-lg cursor-pointer block"
+            className="max-w-[280px] max-h-[300px] rounded-xl cursor-pointer block"
             onClick={() => msg.dataUrl && onImageClick(msg.dataUrl)}
           />
-          <span className="block text-right text-[0.7rem] text-gray-600 mt-1 select-none">
+          <span className="block text-right text-[0.7rem] text-dimle-text-muted mt-1 select-none">
             {fmtTs(msg.ts)}
           </span>
         </div>
@@ -252,26 +252,26 @@ function DMPanel({
 
   return (
     <div
-      className={`w-[280px] bg-dimle-card border border-dimle-purple border-b-0 rounded-t-xl shadow-[0_-4px_24px_rgba(0,0,0,0.5)] flex flex-col pointer-events-auto transition-[max-height] duration-200 ${
+      className={`w-[280px] bg-dimle-card border border-dimle-accent border-b-0 rounded-t-2xl shadow-[0_-4px_24px_rgba(0,0,0,0.08)] flex flex-col pointer-events-auto transition-[max-height] duration-200 ${
         dm.minimized ? "max-h-[40px] overflow-hidden" : "max-h-[380px]"
       }`}
     >
       {/* Header */}
       <div
-        className="flex items-center justify-between px-3 py-2 border-b border-dimle-border-hover text-sm font-semibold text-dimle-lavender cursor-pointer select-none shrink-0 hover:bg-[#1a1a2e] rounded-t-xl"
+        className="flex items-center justify-between px-3 py-2 border-b border-dimle-border text-sm font-semibold text-dimle-accent cursor-pointer select-none shrink-0 hover:bg-dimle-surface rounded-t-2xl transition-colors"
         onClick={() => onToggleMinimize(dm.peerName)}
       >
         <div className="flex items-center gap-1.5 flex-1 overflow-hidden">
-          <span className="truncate">🔒 {dm.peerName}</span>
+          <span className="truncate">{dm.peerName}</span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {dm.unread > 0 && (
-            <span className="bg-dimle-purple text-white text-[0.65rem] font-bold rounded-full px-1.5 min-w-[18px] text-center">
+            <span className="bg-dimle-accent text-white text-[0.65rem] font-bold rounded-full px-1.5 min-w-[18px] text-center">
               {dm.unread}
             </span>
           )}
           <span
-            className="text-gray-600 hover:text-white hover:bg-[#2a2a3e] rounded px-1"
+            className="text-dimle-text-muted hover:text-dimle-text-primary hover:bg-dimle-border rounded px-1 transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               onToggleMinimize(dm.peerName);
@@ -280,7 +280,7 @@ function DMPanel({
             {dm.minimized ? "+" : "−"}
           </span>
           <span
-            className="text-gray-600 hover:text-white hover:bg-[#2a2a3e] rounded px-1"
+            className="text-dimle-text-muted hover:text-dimle-text-primary hover:bg-dimle-border rounded px-1 transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               onClose(dm.peerName);
@@ -299,13 +299,13 @@ function DMPanel({
         {dm.messages.map((m, i) => (
           <div
             key={i}
-            className={`px-2 py-1 rounded-md max-w-[92%] break-words ${
+            className={`px-2 py-1 rounded-lg max-w-[92%] break-words ${
               m.isSelf
-                ? "bg-[#2a1f4a] text-[#c4b5fd] self-end"
-                : "bg-dimle-border text-gray-300 self-start"
+                ? "bg-dimle-accent-light text-dimle-accent-dark self-end"
+                : "bg-dimle-surface text-dimle-text-primary self-start"
             }`}
           >
-            <div className="text-[0.65rem] text-gray-500 mb-0.5">
+            <div className="text-[0.65rem] text-dimle-text-muted mb-0.5">
               {m.isSelf ? `You → ${dm.peerName}` : m.from}
             </div>
             {m.text}
@@ -314,7 +314,7 @@ function DMPanel({
       </div>
 
       {/* Input */}
-      <div className="flex gap-1.5 px-2 py-1.5 border-t border-dimle-border-hover shrink-0">
+      <div className="flex gap-1.5 px-2 py-1.5 border-t border-dimle-border shrink-0">
         <input
           ref={inputRef}
           type="text"
@@ -323,11 +323,11 @@ function DMPanel({
           onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), doSend())}
           placeholder={`Message ${dm.peerName}…`}
           maxLength={500}
-          className="flex-1 bg-dimle-border border border-dimle-border-hover rounded-lg text-white px-2 py-1.5 text-sm outline-none focus:border-dimle-purple"
+          className="flex-1 bg-dimle-surface border border-dimle-border rounded-xl text-dimle-text-primary px-2 py-1.5 text-sm outline-none focus:border-dimle-accent transition-colors"
         />
         <button
           onClick={doSend}
-          className="bg-dimle-purple text-white rounded-lg px-2.5 py-1.5 text-xs hover:bg-dimle-purple-dark"
+          className="bg-dimle-accent text-white rounded-xl px-2.5 py-1.5 text-xs hover:bg-dimle-accent-dark transition-colors"
         >
           Send
         </button>
@@ -726,10 +726,10 @@ function RoomInner() {
     <div className="flex flex-col h-screen" onPaste={handlePaste}>
       {/* Username Modal */}
       {!username && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[100]">
-          <div className="bg-dimle-card border border-dimle-border rounded-xl p-8 w-[90%] max-w-[340px] text-center">
-            <h2 className="text-xl font-bold mb-2">Pick a username</h2>
-            <p className="text-gray-500 text-sm mb-5">
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-[100]">
+          <div className="bg-dimle-card border border-dimle-border rounded-2xl p-8 w-[90%] max-w-[340px] text-center shadow-[0_8px_30px_rgba(0,0,0,0.08)]">
+            <h2 className="text-xl font-bold mb-2 text-dimle-text-primary">Pick a username</h2>
+            <p className="text-dimle-text-muted text-sm mb-5">
               This is how others will see you
             </p>
             <input
@@ -739,7 +739,7 @@ function RoomInner() {
               onKeyDown={(e) => e.key === "Enter" && joinRoom()}
               maxLength={20}
               autoFocus
-              className="w-full py-3 px-4 border border-dimle-border-hover rounded-lg bg-dimle-bg text-gray-200 text-center mb-3 outline-none focus:border-dimle-purple"
+              className="w-full py-3 px-4 border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-primary text-center mb-3 outline-none focus:border-dimle-accent focus:ring-2 focus:ring-dimle-accent-light transition-colors"
             />
             <input
               type="password"
@@ -747,16 +747,16 @@ function RoomInner() {
               onChange={(e) => setPasswordInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && joinRoom()}
               placeholder="Room password (if any)"
-              className="w-full py-3 px-4 border border-dimle-border-hover rounded-lg bg-dimle-bg text-gray-200 text-center mb-3 outline-none focus:border-dimle-purple"
+              className="w-full py-3 px-4 border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-primary text-center mb-3 outline-none focus:border-dimle-accent focus:ring-2 focus:ring-dimle-accent-light placeholder:text-dimle-text-muted transition-colors"
             />
             <button
               onClick={joinRoom}
-              className="w-full py-3 rounded-lg font-semibold text-white bg-gradient-to-br from-dimle-purple to-dimle-purple-dark hover:opacity-85 transition-opacity"
+              className="w-full py-3 rounded-xl font-semibold text-white bg-dimle-accent hover:bg-dimle-accent-dark transition-colors"
             >
               Join Chat
             </button>
             {joinError && (
-              <p className="text-red-400 text-sm mt-2">{joinError}</p>
+              <p className="text-red-500 text-sm mt-2">{joinError}</p>
             )}
           </div>
         </div>
@@ -765,13 +765,13 @@ function RoomInner() {
       {/* Lightbox */}
       {lightboxSrc && (
         <div
-          className="fixed inset-0 bg-black/[0.88] z-[300] flex items-center justify-center cursor-zoom-out"
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[300] flex items-center justify-center cursor-zoom-out"
           onClick={() => setLightboxSrc(null)}
         >
           <img
             src={lightboxSrc}
             alt=""
-            className="max-w-[90vw] max-h-[90vh] rounded-lg"
+            className="max-w-[90vw] max-h-[90vh] rounded-2xl shadow-2xl"
           />
         </div>
       )}
@@ -780,31 +780,31 @@ function RoomInner() {
       <header className="flex items-center justify-between px-5 py-3 bg-dimle-card border-b border-dimle-border">
         <a
           href="/"
-          className="font-bold text-lg bg-gradient-to-br from-dimle-purple to-dimle-cyan bg-clip-text text-transparent no-underline"
+          className="font-bold text-lg text-dimle-accent no-underline"
         >
           Dimle
         </a>
-        <div className="flex items-center gap-4 text-sm text-gray-500">
+        <div className="flex items-center gap-4 text-sm text-dimle-text-secondary">
           <span>
             Room{" "}
-            <span className="bg-dimle-border px-2 py-1 rounded-md font-mono text-gray-400">
+            <span className="bg-dimle-surface px-2 py-1 rounded-lg font-mono text-dimle-text-primary">
               {roomId}
             </span>
           </span>
           <span
-            className="relative cursor-pointer select-none px-2 py-1 rounded-md hover:bg-dimle-border transition-colors"
+            className="relative cursor-pointer select-none px-2 py-1 rounded-lg hover:bg-dimle-surface transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               setShowParticipants((v) => !v);
             }}
           >
-            <span className="text-dimle-purple">{userCount}</span> online
+            <span className="text-dimle-accent font-medium">{userCount}</span> online
             {showParticipants && (
               <div
-                className="absolute top-[calc(100%+8px)] right-0 bg-dimle-card border border-dimle-border-hover rounded-xl p-3 min-w-[160px] max-w-[220px] z-50 shadow-[0_8px_24px_rgba(0,0,0,0.5)]"
+                className="absolute top-[calc(100%+8px)] right-0 bg-dimle-card border border-dimle-border rounded-2xl p-3 min-w-[160px] max-w-[220px] z-50 shadow-[0_8px_24px_rgba(0,0,0,0.08)]"
                 onClick={(e) => e.stopPropagation()}
               >
-                <h4 className="text-xs text-gray-600 uppercase tracking-wide mb-2">
+                <h4 className="text-xs text-dimle-text-muted uppercase tracking-wide mb-2">
                   Participants
                 </h4>
                 {userList.map((name) => {
@@ -814,9 +814,9 @@ function RoomInner() {
                       key={name}
                       className={`flex items-center gap-2 py-1 text-sm ${
                         isSelf
-                          ? "text-dimle-purple font-semibold"
-                          : "text-gray-300 cursor-pointer hover:text-white hover:bg-dimle-border hover:rounded-md hover:pl-1"
-                      }`}
+                          ? "text-dimle-accent font-semibold"
+                          : "text-dimle-text-primary cursor-pointer hover:text-dimle-accent hover:bg-dimle-surface hover:rounded-lg hover:pl-1"
+                      } transition-colors`}
                       onClick={() => !isSelf && openDM(name)}
                     >
                       <span className="w-[7px] h-[7px] rounded-full bg-green-500 shrink-0" />
@@ -830,7 +830,7 @@ function RoomInner() {
               </div>
             )}
           </span>
-          <span className="text-xs text-gray-600 bg-[#1a1a2a] border border-[#2a2a3e] px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
+          <span className="text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
             v2.0.0
           </span>
         </div>
@@ -841,7 +841,7 @@ function RoomInner() {
         ref={messagesRef}
         className={`flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-1.5 relative ${
           dragOver
-            ? "after:content-['Drop_to_send'] after:fixed after:inset-0 after:bg-dimle-purple/20 after:border-[3px] after:border-dashed after:border-dimle-purple after:flex after:items-center after:justify-center after:text-xl after:font-semibold after:text-dimle-lavender after:pointer-events-none after:z-[200] after:rounded"
+            ? "after:content-['Drop_to_send'] after:fixed after:inset-0 after:bg-dimle-accent/10 after:border-[3px] after:border-dashed after:border-dimle-accent after:flex after:items-center after:justify-center after:text-xl after:font-semibold after:text-dimle-accent after:pointer-events-none after:z-[200] after:rounded-2xl"
             : ""
         }`}
         onDragOver={(e) => {
@@ -861,7 +861,7 @@ function RoomInner() {
             return (
               <div
                 key={item.id}
-                className="self-center text-gray-600 text-sm py-1"
+                className="self-center text-dimle-text-muted text-sm py-1"
               >
                 — {item.count} earlier message{item.count !== 1 ? "s" : ""} —
               </div>
@@ -871,7 +871,7 @@ function RoomInner() {
             return (
               <div
                 key={item.id}
-                className="self-center text-gray-600 text-sm py-1"
+                className="self-center text-dimle-text-muted text-sm py-1"
               >
                 {item.text}
               </div>
@@ -880,12 +880,12 @@ function RoomInner() {
           if (item.kind === "uploading") {
             return (
               <div key={item.id} className="max-w-[85%] self-end">
-                <div className="text-right text-dimle-cyan font-semibold text-xs mb-0.5">
+                <div className="text-right text-dimle-accent font-medium text-xs mb-0.5">
                   {username}
                 </div>
-                <div className="bg-[#1a1a3a] border border-[#2a2a5a] rounded-[10px_0_10px_10px] px-3.5 pt-2 pb-1.5">
-                  <span className="text-gray-500 text-sm italic">
-                    📎 Uploading {item.name}…
+                <div className="bg-dimle-self-bg border border-dimle-border rounded-[14px_4px_14px_14px] px-3.5 pt-2 pb-1.5">
+                  <span className="text-dimle-text-muted text-sm italic">
+                    Uploading {item.name}…
                   </span>
                 </div>
               </div>
@@ -921,7 +921,7 @@ function RoomInner() {
         <button
           onClick={() => fileInputRef.current?.click()}
           title="Attach file"
-          className="shrink-0 w-[42px] h-[42px] border border-[#3a3a55] rounded-lg bg-[#2a2a3d] text-dimle-lavender text-xl flex items-center justify-center hover:bg-[#3a3a55] transition-colors"
+          className="shrink-0 w-[42px] h-[42px] border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-secondary text-xl flex items-center justify-center hover:bg-dimle-border transition-colors"
         >
           📎
         </button>
@@ -933,11 +933,11 @@ function RoomInner() {
           onKeyDown={(e) => e.key === "Enter" && sendMessage()}
           placeholder="Type a message…"
           autoComplete="off"
-          className="flex-1 py-3 px-4 border border-dimle-border-hover rounded-lg bg-dimle-bg text-gray-200 outline-none focus:border-dimle-purple"
+          className="flex-1 py-3 px-4 border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-primary outline-none focus:border-dimle-accent focus:ring-2 focus:ring-dimle-accent-light placeholder:text-dimle-text-muted transition-colors"
         />
         <button
           onClick={sendMessage}
-          className="py-3 px-6 rounded-lg font-semibold text-white bg-gradient-to-br from-dimle-purple to-dimle-purple-dark hover:opacity-85 transition-opacity"
+          className="py-3 px-6 rounded-xl font-semibold text-white bg-dimle-accent hover:bg-dimle-accent-dark transition-colors"
         >
           Send
         </button>
@@ -963,7 +963,7 @@ export default function RoomPage() {
   return (
     <Suspense
       fallback={
-        <div className="flex items-center justify-center h-screen text-gray-500">
+        <div className="flex items-center justify-center h-screen text-dimle-text-muted">
           Loading…
         </div>
       }
