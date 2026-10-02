@@ -37,5 +37,12 @@
     "postcss": "^8.5.3",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.8.0"
+  },
+  "overrides": {
+    "esbuild": ">=0.25.12",
+    "express": {
+      "qs": "^6.16.0"
+    },
+    "postcss": "$postcss"
   }
 }
