@@ -8,6 +8,20 @@
       "when": 1773719287776,
       "tag": "0000_thin_stardust",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790964448488,
+      "tag": "0001_white_zarda",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790964590623,
+      "tag": "0002_sweet_jack_power",
+      "breakpoints": true
     }
   ]
 }

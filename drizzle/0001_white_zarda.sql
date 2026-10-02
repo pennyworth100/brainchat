@@ -1,0 +1,1 @@
+ALTER TABLE "rooms" ADD COLUMN "creation_token_hash" text;

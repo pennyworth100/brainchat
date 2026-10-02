@@ -1,22 +1,33 @@
 import express from "express";
 import http from "http";
-import { Server } from "socket.io";
+import { Server, type Socket } from "socket.io";
 import next from "next";
 import path from "path";
 import multer from "multer";
 import crypto from "crypto";
 import fs from "fs";
-import { eq, desc } from "drizzle-orm";
+import { and, eq, desc } from "drizzle-orm";
+import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { db } from "./src/lib/db";
+import { db, pool } from "./src/lib/db";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
+import {
+  generateCreationToken,
+  generateRoomId,
+  hashCreationToken,
+  hashPassword,
+  isValidRoomId,
+  safeEqual,
+  verifyPassword,
+} from "./src/lib/security";
 
 const dev = process.env.NODE_ENV !== "production";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const MAX_HISTORY = 100;
-const ALFRED_API_KEY = process.env.ALFRED_API_KEY || "alfred-secret";
+const ALFRED_API_KEY = process.env.ALFRED_API_KEY;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "/tmp/dimle-uploads";
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const MAX_PASSWORD_LENGTH = 256;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -28,29 +39,33 @@ function getOrCreateOnlineRoom(roomId: string) {
   return onlineUsers.get(roomId)!;
 }
 
+function getSocketClientIp(
+  socket: Socket,
+  trustProxyHops: number
+) {
+  const remoteAddress = socket.handshake.address || "unknown";
+  if (trustProxyHops <= 0) return remoteAddress;
+
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const forwardedValue = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  if (!forwardedValue) return remoteAddress;
+
+  const addresses = forwardedValue
+    .split(",")
+    .map((address) => address.trim())
+    .filter(Boolean);
+  return addresses[Math.max(0, addresses.length - trustProxyHops)] || remoteAddress;
+}
+
 // ── DB helpers ──────────────────────────────────────────────────────────────
 
-async function ensureRoom(roomId: string, password: string | null) {
-  const existing = await db
+async function getRoom(roomId: string) {
+  const rows = await db
     .select()
     .from(roomsTable)
     .where(eq(roomsTable.id, roomId))
     .limit(1);
-  if (existing.length > 0) return existing[0];
-  const [created] = await db
-    .insert(roomsTable)
-    .values({ id: roomId, passwordHash: password })
-    .returning();
-  return created;
-}
-
-async function getRoomPassword(roomId: string) {
-  const rows = await db
-    .select({ passwordHash: roomsTable.passwordHash })
-    .from(roomsTable)
-    .where(eq(roomsTable.id, roomId))
-    .limit(1);
-  return rows.length > 0 ? rows[0].passwordHash : null;
+  return rows[0] ?? null;
 }
 
 async function roomExists(roomId: string) {
@@ -139,8 +154,35 @@ async function main() {
   await app.prepare();
 
   const expressApp = express();
+  const trustProxyHops = parseInt(process.env.TRUST_PROXY_HOPS || "0", 10);
+  if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);
   const io = new Server(server);
+
+  const rateLimiterStore = {
+    storeClient: pool,
+    storeType: "pool" as const,
+    tableName: "rate_limits",
+    tableCreated: true,
+  };
+  const createRoomLimiter = new RateLimiterPostgres({
+    ...rateLimiterStore,
+    keyPrefix: "create-room",
+    points: 10,
+    duration: 60 * 60,
+  });
+  const joinIpLimiter = new RateLimiterPostgres({
+    ...rateLimiterStore,
+    keyPrefix: "join-ip",
+    points: 20,
+    duration: 60,
+  });
+  const joinRoomLimiter = new RateLimiterPostgres({
+    ...rateLimiterStore,
+    keyPrefix: "join-room",
+    points: 8,
+    duration: 60,
+  });
 
   // Security headers
   expressApp.use((_req, res, nxt) => {
@@ -154,6 +196,43 @@ async function main() {
   });
 
   expressApp.use(express.json());
+
+  // ── Room creation ─────────────────────────────────────────────────────────
+  expressApp.post("/api/rooms", async (req, res) => {
+    try {
+      await createRoomLimiter.consume(req.ip || req.socket.remoteAddress || "unknown");
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const roomId = generateRoomId();
+        const creationToken = generateCreationToken();
+        const [created] = await db
+          .insert(roomsTable)
+          .values({
+            id: roomId,
+            creationTokenHash: hashCreationToken(creationToken),
+          })
+          .onConflictDoNothing()
+          .returning({ id: roomsTable.id });
+
+        if (created) {
+          return res.status(201).json({ roomId, creationToken });
+        }
+      }
+
+      return res.status(503).json({ error: "Could not create room" });
+    } catch (err) {
+      if (typeof err === "object" && err && "msBeforeNext" in err) {
+        res.setHeader(
+          "Retry-After",
+          Math.ceil(Number(err.msBeforeNext) / 1000).toString()
+        );
+        return res
+          .status(429)
+          .json({ error: "Too many rooms created. Try again later." });
+      }
+      console.error("POST /api/rooms error:", err);
+      return res.status(500).json({ error: "Internal error" });
+    }
+  });
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
   expressApp.use(
@@ -211,7 +290,9 @@ async function main() {
     nxt: express.NextFunction
   ) {
     const key = req.headers["x-api-key"];
-    if (!key || key !== ALFRED_API_KEY)
+    if (!ALFRED_API_KEY)
+      return res.status(503).json({ error: "API integration is not configured" });
+    if (typeof key !== "string" || !safeEqual(key, ALFRED_API_KEY))
       return res.status(401).json({ error: "Unauthorized" });
     nxt();
   }
@@ -246,7 +327,9 @@ async function main() {
         return res
           .status(400)
           .json({ error: "Missing roomId, username or message" });
-      await ensureRoom(roomId, null);
+      const room = await getRoom(roomId);
+      if (!room || room.creationTokenHash)
+        return res.status(404).json({ error: "Room not found" });
       await saveMessage(roomId, username, "message", message);
       io.to(roomId).emit("chat-message", { username, message });
       res.json({ ok: true });
@@ -266,15 +349,64 @@ async function main() {
         roomId,
         username,
         password,
+        creationToken,
       }: {
         roomId: string;
         username: string;
         password?: string;
+        creationToken?: string;
       }) => {
         if (!roomId || !username) return;
+        if (!isValidRoomId(roomId)) {
+          socket.emit("join-error", "Invalid room ID");
+          return;
+        }
+        if ((password?.length ?? 0) > MAX_PASSWORD_LENGTH) {
+          socket.emit("join-error", "Password is too long");
+          return;
+        }
         try {
-          const room = await ensureRoom(roomId, password || null);
-          if (room.passwordHash && room.passwordHash !== password) {
+          const clientIp = getSocketClientIp(socket, trustProxyHops);
+          await Promise.all([
+            joinIpLimiter.consume(clientIp),
+            joinRoomLimiter.consume(`${clientIp}:${roomId}`),
+          ]);
+
+          let room = await getRoom(roomId);
+          if (!room) {
+            socket.emit("join-error", "Room not found");
+            return;
+          }
+
+          if (room.creationTokenHash) {
+            const providedTokenHash = creationToken
+              ? hashCreationToken(creationToken)
+              : "";
+            if (!safeEqual(room.creationTokenHash, providedTokenHash)) {
+              socket.emit("join-error", "Room is not ready yet");
+              return;
+            }
+
+            const passwordHash = password ? await hashPassword(password) : null;
+            const [claimed] = await db
+              .update(roomsTable)
+              .set({ passwordHash, creationTokenHash: null })
+              .where(
+                and(
+                  eq(roomsTable.id, roomId),
+                  eq(roomsTable.creationTokenHash, room.creationTokenHash)
+                )
+              )
+              .returning();
+            if (!claimed) {
+              socket.emit("join-error", "Room was already claimed");
+              return;
+            }
+            room = claimed;
+          } else if (
+            room.passwordHash &&
+            !(await verifyPassword(room.passwordHash, password || ""))
+          ) {
             socket.emit("join-error", "Wrong password");
             return;
           }
@@ -289,6 +421,10 @@ async function main() {
           io.to(roomId).emit("user-count", users.size);
           io.to(roomId).emit("user-list", Array.from(users.values()));
         } catch (err) {
+          if (typeof err === "object" && err && "msBeforeNext" in err) {
+            socket.emit("join-error", "Too many attempts. Try again later.");
+            return;
+          }
           console.error("join-room error:", err);
           socket.emit("join-error", "Server error");
         }

@@ -12,6 +12,7 @@ import {
 } from "react";
 import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
+import { isValidRoomId } from "@/lib/room-id";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -390,7 +391,7 @@ function RoomInner() {
 
   // Redirect if no valid room ID
   useEffect(() => {
-    if (!roomId || !/^\d{4}$/.test(roomId)) {
+    if (!roomId || !isValidRoomId(roomId)) {
       window.location.href = "/";
     }
   }, [roomId]);
@@ -410,6 +411,7 @@ function RoomInner() {
 
     socket.on("room-info", () => {
       setJoinError("");
+      if (roomId) sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
     });
 
     socket.on("join-error", (msg: string) => {
@@ -571,6 +573,9 @@ function RoomInner() {
       roomId,
       username: name,
       password: passwordInput,
+      creationToken: roomId
+        ? sessionStorage.getItem(`dimle:creation-token:${roomId}`) || undefined
+        : undefined,
     });
   }, [usernameInput, passwordInput, roomId]);
 
@@ -745,6 +750,7 @@ function RoomInner() {
               type="password"
               value={passwordInput}
               onChange={(e) => setPasswordInput(e.target.value)}
+              maxLength={256}
               onKeyDown={(e) => e.key === "Enter" && joinRoom()}
               placeholder="Room password (if any)"
               className="w-full py-3 px-4 border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-primary text-center mb-3 outline-none focus:border-dimle-accent focus:ring-2 focus:ring-dimle-accent-light placeholder:text-dimle-text-muted transition-colors"
