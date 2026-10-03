@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Dimle",
-  description: "Ephemeral rooms. No accounts. No history.",
+  description: "Chat rooms. No accounts. Room messages are saved.",
 };
 
 export default function RootLayout({

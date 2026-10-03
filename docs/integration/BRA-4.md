@@ -8,7 +8,7 @@
 - Konflikt `src/app/page.tsx` rozwiązano, zachowując tworzenie pokoju przez `POST /api/rooms`, token w sessionStorage, walidację 16-znakowych ID i istniejących 4-cyfrowych pokojów oraz stan oczekiwania/wyłączony przycisk.
 - Nowy formularz zachowuje etykietę, `aria-invalid`, komunikat `role="alert"` i obsługę Enter. Pole przyjmuje do 16 znaków, bez wymuszania klawiatury numerycznej ani automatycznej kapitalizacji.
 - W pokoju zachowano walidację ID, wysyłanie tokenu przy join, usunięcie tokenu po `room-info` i limit długości hasła.
-- Backend, migracje, helpery/testy security i zależności są niezmienione względem bazy `d97c436`.
+- Backend, migracje, helpery/testy security i zależności są niezmienione względem bazy `d97c436`. Późniejsza korekta copy zmienia wyłącznie opis produktu w package.json, bez zmian zależności.
 - BRA-3 pozostaje historycznym werdyktem QA wariantu czterocyfrowego, nie akceptacją tego nowego połączenia.
 
 ## Weryfikacja lokalna — 2026-10-02 America/New_York
@@ -24,6 +24,8 @@
 | `git diff --cached --check` | EXIT 0 |
 
 Istniejące pięć testów sprawdza helpery ID, tokenów i haseł. Nie stanowią dowodu end-to-end dla HTTP, Socket.IO, migracji ani interfejsu.
+
+Pełne testy, typecheck i build wykonano dla drzewa integracyjnego zatwierdzonego jako `f37e0ba29171630f5a68d4bbcb0a7da866a28047`. Kolejny commit wyłącznie koryguje copy: „Chat rooms. No accounts. Room messages are saved.” w hero i metadanych, „Chat rooms” w etykiecie, opis package.json oraz wordmark „Dimle” bez ozdobnej kropki. Powód: istniejący backend zapisuje wiadomości do PostgreSQL i odczytuje historię; `MAX_HISTORY` jest limitem odczytu, nie polityką retencji. Dla tej korekty wykonano kontrolę diff i poprawności package.json, bez powtarzania pełnego builda lub testów. Historyczne opisy i zrzuty BRA-2 pozostają materiałem źródłowym.
 
 ## Następny odcinek QA
 

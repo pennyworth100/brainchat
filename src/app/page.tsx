@@ -39,12 +39,12 @@ export default function Home() {
 
   return (
     <div className="home-shell">
-      <header className="site-header"><a className="wordmark" href="/">Dimle<span aria-hidden="true">.</span></a><span className="eyebrow">Ephemeral rooms</span></header>
+      <header className="site-header"><a className="wordmark" href="/">Dimle</a><span className="eyebrow">Chat rooms</span></header>
       <main id="main" className="home-main">
         <section className="hero-copy" aria-labelledby="hero-title">
           <p className="eyebrow hero-kicker">A little space to connect</p>
           <h1 id="hero-title">Just a room.<br />Just us.</h1>
-          <p className="hero-description">Ephemeral rooms. No accounts. No history.</p>
+          <p className="hero-description">Chat rooms. No accounts. Room messages are saved.</p>
           <div className="hero-rule" aria-hidden="true"><span>Dimle</span><span>Come together. Keep it simple.</span></div>
         </section>
         <section className="entry-panel" aria-labelledby="entry-title">

@@ -1,7 +1,7 @@
 {
   "name": "dimle",
   "version": "2.0.0",
-  "description": "Dimle — ephemeral chat rooms, now on Next.js",
+  "description": "Dimle — chat rooms, now on Next.js",
   "private": true,
   "scripts": {
     "dev": "tsx server.ts",
