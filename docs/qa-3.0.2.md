@@ -43,10 +43,13 @@ The original PDF and physical device have not been independently reproduced here
 
 - Unit/regression suite: **11/11 PASS**.
 - TypeScript: **PASS**. Production build: **PASS**.
-- Actual HTTP/Socket.IO/PostgreSQL integration: **6 grouped scenarios PASS**:
+- Actual HTTP/Socket.IO/PostgreSQL integration: **6 grouped scenarios PASS locally**:
   rejoin/backfill/dedup/presence; unauthorized history/upload and stale-ID rejection;
   synthetic 2 MiB PDF byte-for-byte round trip; rejected upload followed by text;
   socket loss during accepted multipart upload; v3.0.1 wire-protocol compatibility.
+  The CI gate additionally verifies room creation/claim, correct and wrong
+  passwords, private-message isolation from a third session, message-size limits,
+  and room-creation rate limiting.
 - Mobile WebKit with iPhone 13 emulation: **3 grouped scenarios PASS**:
   offline/resume with deduplicated history and both-way messaging; PDF upload,
   recipient display and matching download; explicit rejected-PDF error followed
@@ -73,6 +76,9 @@ QA_PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
 The scripts refuse non-loopback targets. Browser tooling was installed outside
 the application and adds no production dependency. Database initialization and
 server startup are explicit; do not point the scripts at an existing shared DB.
+
+GitHub Actions repeats `npm ci`, unit tests, typecheck, production build and the
+HTTP/Socket.IO/PostgreSQL regression against a disposable PostgreSQL 16 service.
 
 ## Physical-iPhone acceptance still required
 

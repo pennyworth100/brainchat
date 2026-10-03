@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "fix/**"
+      - "integration/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dimle_ci
+          POSTGRES_USER: dimle
+          POSTGRES_PASSWORD: dimle_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dimle -d dimle_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://dimle:dimle_ci@127.0.0.1:5432/dimle_ci
+      UPLOAD_DIR: /tmp/dimle-ci-uploads
+      PORT: "3302"
+      QA_BASE_URL: http://127.0.0.1:3302
+      NODE_ENV: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit and regression tests
+        run: npm test
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Production build
+        run: npm run build
+
+      - name: Start isolated application
+        run: |
+          npm start > /tmp/dimle-ci-server.log 2>&1 &
+          echo $! > /tmp/dimle-ci-server.pid
+          for attempt in {1..60}; do
+            if curl --fail --silent "$QA_BASE_URL" > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/dimle-ci-server.log
+          exit 1
+
+      - name: HTTP, Socket.IO and PostgreSQL integration tests
+        run: node --import tsx scripts/qa-reconnect-upload.ts
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dimle-ci-server-log
+          path: /tmp/dimle-ci-server.log
+          if-no-files-found: ignore
+

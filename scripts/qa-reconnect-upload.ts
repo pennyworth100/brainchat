@@ -15,6 +15,20 @@ function once<T>(socket: Socket, event: string): Promise<[T]> {
   });
 }
 
+function expectNoEvent(socket: Socket, event: string, waitMs = 500): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const handler = (payload: unknown) => {
+      clearTimeout(timer);
+      reject(new Error(`Unexpected ${event}: ${JSON.stringify(payload)}`));
+    };
+    const timer = setTimeout(() => {
+      socket.off(event, handler);
+      resolve();
+    }, waitMs);
+    socket.once(event, handler);
+  });
+}
+
 async function main() {
   const base = process.env.QA_BASE_URL || "http://127.0.0.1:3302";
   assert.equal(new URL(base).hostname, "127.0.0.1", "Never run this mutating regression against production");
@@ -25,6 +39,7 @@ async function main() {
   const mobile = io(base);
   const desktop = io(base);
   const outsider = io(base);
+  const wrongPassword = io(base);
   let history: ChatMessage[] = [];
   let users: string[] = [];
   const session = createRoomSession(mobile, {
@@ -40,6 +55,11 @@ async function main() {
     const legacyHistory = once(desktop, "chat-history");
     desktop.emit("join-room", { roomId, username: "legacy-desktop", password: "local-qa" });
     await legacyHistory;
+
+    const wrongPasswordError = once<string>(wrongPassword, "join-error");
+    wrongPassword.emit("join-room", { roomId, username: "wrong-password", password: "incorrect" });
+    assert.equal((await wrongPasswordError)[0], "Wrong password");
+    console.log("PASS room creation/claim, correct password join and wrong password rejection");
     const sent = await desktop.timeout(2000).emitWithAck("send-message", { roomId, message: "before interruption" });
     assert.ok(sent.message.id);
     await session.sync();
@@ -59,6 +79,30 @@ async function main() {
     assert.equal((await fetch(`${base}/api/upload`, { method: "POST", headers: { "x-room-id": roomId, "x-socket-id": oldId! } })).status, 401);
     assert.equal((await fetch(`${base}/api/upload`, { method: "POST" })).status, 401);
     console.log("PASS unauthorized history and upload rejected (including stale socket ID)");
+
+    const outsiderHistory = once(outsider, "chat-history");
+    outsider.emit("join-room", { roomId, username: "outsider", password: "local-qa" });
+    await outsiderHistory;
+    const recipientDm = once<{ fromUsername: string; message: string; ts: number }>(desktop, "private-message");
+    const senderAck = once<{ toUsername: string; message: string }>(mobile, "private-message-sent");
+    const outsiderIsolation = expectNoEvent(outsider, "private-message");
+    mobile.emit("private-message", { roomId, toUsername: "legacy-desktop", message: "private-only" });
+    const [received] = await recipientDm;
+    assert.equal(received.fromUsername, "mobile");
+    assert.equal(received.message, "private-only");
+    assert.equal(typeof received.ts, "number");
+    const [ack] = await senderAck;
+    assert.equal(ack.toUsername, "legacy-desktop");
+    assert.equal(ack.message, "private-only");
+    await outsiderIsolation;
+    console.log("PASS private message reaches recipient and sender acknowledgement, not third session");
+
+    const oversized = await mobile.timeout(2000).emitWithAck("send-message", {
+      roomId,
+      message: "x".repeat(10_001),
+    });
+    assert.equal(oversized.error, "Invalid message");
+    console.log("PASS message length limit rejected without disconnecting the room");
 
     const bytes = Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(2 * 1024 * 1024, 32), Buffer.from("\n%%EOF")]);
     const result = await uploadRoomFile(new File([bytes], "synthetic-report.pdf", { type: "application/pdf" }), roomId, session, request);
@@ -116,9 +160,16 @@ async function main() {
     await session.sync();
     assert.equal(history.filter((m) => m.url === legacy.url).length, 1);
     console.log("PASS v3.0.1 upload response and send-file compatibility (no duplicate)");
+
+    const roomCreationStatuses: number[] = [];
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      roomCreationStatuses.push((await fetch(`${base}/api/rooms`, { method: "POST" })).status);
+    }
+    assert.ok(roomCreationStatuses.includes(429), `Expected room creation rate limit, got ${roomCreationStatuses.join(",")}`);
+    console.log("PASS room creation rate limiting returns 429");
     console.log(JSON.stringify({ result: "PASS", roomId, base, messages: history.length }));
   } finally {
-    session.dispose(); mobile.disconnect(); desktop.disconnect(); outsider.disconnect();
+    session.dispose(); mobile.disconnect(); desktop.disconnect(); outsider.disconnect(); wrongPassword.disconnect();
   }
 }
 main().catch((err) => { console.error(err); process.exitCode = 1; });
