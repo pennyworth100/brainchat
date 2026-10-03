@@ -588,7 +588,7 @@ function RoomInner() {
 
   const uploadFile = useCallback(
     async (file: File) => {
-      if (!username || !file) return;
+      if (!username || !file || !roomId) return;
 
       const uploadId = getId();
       setTimeline((prev) => [
@@ -597,9 +597,18 @@ function RoomInner() {
       ]);
 
       try {
+        const socketId = socketRef.current?.id;
+        if (!socketId) throw new Error("Room connection is not ready");
         const form = new FormData();
         form.append("file", file);
-        const resp = await fetch("/api/upload", { method: "POST", body: form });
+        const resp = await fetch("/api/upload", {
+          method: "POST",
+          headers: {
+            "x-room-id": roomId,
+            "x-socket-id": socketId,
+          },
+          body: form,
+        });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
 
@@ -839,7 +848,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v2.0.0
+            v3.0.0
           </span>
         </div>
       </header>
