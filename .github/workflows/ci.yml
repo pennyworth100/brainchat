@@ -38,7 +38,6 @@ jobs:
       UPLOAD_DIR: /tmp/dimle-ci-uploads
       PORT: "3302"
       QA_BASE_URL: http://127.0.0.1:3302
-      NODE_ENV: production
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,6 +61,8 @@ jobs:
         run: npm run build
 
       - name: Start isolated application
+        env:
+          NODE_ENV: production
         run: |
           npm start > /tmp/dimle-ci-server.log 2>&1 &
           echo $! > /tmp/dimle-ci-server.pid
@@ -84,4 +85,3 @@ jobs:
           name: dimle-ci-server-log
           path: /tmp/dimle-ci-server.log
           if-no-files-found: ignore
-
