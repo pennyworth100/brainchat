@@ -31,7 +31,6 @@ const MAX_PASSWORD_LENGTH = 256;
 const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
-const MAX_FILE_METADATA_LENGTH = 256;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -94,10 +93,12 @@ async function saveMessage(
   type: string,
   content: string
 ) {
-  await db
+  const [row] = await db
     .insert(messagesTable)
-    .values({ roomId, username, type, content, ts: new Date() });
+    .values({ roomId, username, type, content, ts: new Date() })
+    .returning();
   touchRoom(roomId).catch(() => {});
+  return deserializeMessage(row);
 }
 
 interface MessageRow {
@@ -112,13 +113,13 @@ interface MessageRow {
 function deserializeMessage(row: MessageRow) {
   const ts = row.ts instanceof Date ? row.ts.getTime() : row.ts;
   if (row.type === "message") {
-    return { type: "message", username: row.username, message: row.content, ts };
+    return { id: row.id, type: "message", username: row.username, message: row.content, ts };
   }
   try {
     const parsed = JSON.parse(row.content);
-    return { ...parsed, type: row.type, username: row.username, ts };
+    return { ...parsed, id: row.id, type: row.type, username: row.username, ts };
   } catch {
-    return { type: row.type, username: row.username, message: row.content, ts };
+    return { id: row.id, type: row.type, username: row.username, message: row.content, ts };
   }
 }
 
@@ -127,7 +128,7 @@ async function loadHistory(roomId: string) {
     .select()
     .from(messagesTable)
     .where(eq(messagesTable.roomId, roomId))
-    .orderBy(desc(messagesTable.ts))
+    .orderBy(desc(messagesTable.id))
     .limit(MAX_HISTORY);
   return rows.reverse().map(deserializeMessage);
 }
@@ -137,7 +138,7 @@ async function loadMessagesSince(roomId: string, sinceMs: number) {
     .select()
     .from(messagesTable)
     .where(eq(messagesTable.roomId, roomId))
-    .orderBy(desc(messagesTable.ts))
+    .orderBy(desc(messagesTable.id))
     .limit(MAX_HISTORY);
   return rows
     .reverse()
@@ -314,6 +315,7 @@ async function main() {
       if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
+      res.locals.uploadIdentity = { roomId, username: users.get(socketId)! };
       try {
         await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
         nxt();
@@ -328,17 +330,27 @@ async function main() {
       }
     },
     uploadMiddleware.single("file"),
-    (req, res) => {
+    async (req, res) => {
       if (!req.file) return res.status(400).json({ error: "No file" });
-      const token = (req as express.Request & { _uploadToken: string })
-        ._uploadToken;
-      const url = `/uploads/${token}/${req.file.filename}`;
-      res.json({
-        url,
+      const token = (req as express.Request & { _uploadToken: string })._uploadToken;
+      const file = {
+        url: `/uploads/${token}/${req.file.filename}`,
         name: req.file.originalname,
         size: req.file.size,
         mime: req.file.mimetype || "application/octet-stream",
-      });
+      };
+      try {
+        // Authenticate before accepting bytes; then publish independently of
+        // the socket's lifetime (iOS may sleep while the HTTP upload finishes).
+        const { roomId, username } = res.locals.uploadIdentity;
+        const message = await saveMessage(roomId, username, "file", JSON.stringify(file));
+        io.to(roomId).emit("chat-file", message);
+        res.json({ ...file, message });
+      } catch (err) {
+        console.error("upload persistence error:", err);
+        fs.promises.unlink(req.file.path).catch(() => {});
+        res.status(500).json({ error: "Could not save the attachment. Please try again." });
+      }
     }
   );
 
@@ -400,8 +412,8 @@ async function main() {
       const room = await getRoom(roomId);
       if (!room || room.creationTokenHash)
         return res.status(404).json({ error: "Room not found" });
-      await saveMessage(roomId, username, "message", message);
-      io.to(roomId).emit("chat-message", { username, message });
+      const saved = await saveMessage(roomId, username, "message", message);
+      io.to(roomId).emit("chat-message", saved);
       res.json({ ok: true });
     } catch (err) {
       console.error("POST /api/send error:", err);
@@ -484,13 +496,18 @@ async function main() {
             socket.emit("join-error", "Wrong password");
             return;
           }
+          if (!socket.connected) return;
+          // This client has one active room. Do not leave stale memberships.
+          if (currentRoom && currentRoom !== roomId) return;
           currentRoom = roomId;
           const users = getOrCreateOnlineRoom(roomId);
           users.set(socket.id, username);
-          socket.join(roomId);
+          await socket.join(roomId);
           socket.emit("room-info", { hasPassword: !!room.passwordHash });
           const history = await loadHistory(roomId);
-          if (history.length > 0) socket.emit("chat-history", history);
+          if (!socket.connected) return;
+          socket.emit("chat-history", history); // v3.0.1 compatibility
+          socket.emit("room-snapshot", { history, users: Array.from(users.values()) });
           socket.to(roomId).emit("system-message", `${username} joined`);
           io.to(roomId).emit("user-count", users.size);
           io.to(roomId).emit("user-list", Array.from(users.values()));
@@ -505,63 +522,43 @@ async function main() {
       }
     );
 
+    socket.on("sync-room", async ({ roomId }: { roomId: string }, ack) => {
+      if (typeof ack !== "function") return;
+      if (roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
+        return ack({ error: "Rejoin the room" });
+      }
+      try {
+        const history = await loadHistory(roomId);
+        if (!socket.connected) return;
+        ack({ history, users: Array.from(onlineUsers.get(roomId)?.values() || []) });
+      } catch (err) {
+        console.error("sync-room error:", err);
+        ack({ error: "Could not sync the room" });
+      }
+    });
+
     socket.on(
       "send-message",
-      async ({ roomId, message }: { roomId: string; message: string }) => {
-        if (!roomId || typeof message !== "string" || !message.trim()) return;
-        if (message.length > MAX_MESSAGE_LENGTH) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const username = users.get(socket.id);
-        if (!username) return;
+      async ({ roomId, message }: { roomId: string; message: string }, ack) => {
+        const reply = typeof ack === "function" ? ack : () => {};
+        if (!roomId || typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LENGTH) {
+          return reply({ error: "Invalid message" });
+        }
+        const username = onlineUsers.get(roomId)?.get(socket.id);
+        if (!username || !socket.rooms.has(roomId)) return reply({ error: "Rejoin the room before sending" });
         try {
-          await saveMessage(roomId, username, "message", message);
-          io.to(roomId).emit("chat-message", { username, message });
+          const saved = await saveMessage(roomId, username, "message", message);
+          io.to(roomId).emit("chat-message", saved);
+          reply({ message: saved });
         } catch (err) {
           console.error("send-message error:", err);
+          reply({ error: "Could not save the message" });
         }
       }
     );
 
-    socket.on(
-      "send-file",
-      async ({
-        roomId,
-        url,
-        name,
-        size,
-        mime,
-      }: {
-        roomId: string;
-        url: string;
-        name: string;
-        size: number;
-        mime: string;
-      }) => {
-        if (!roomId || !url) return;
-        if (!/^\/uploads\/[0-9a-f]{16}\/[^/]{1,128}$/.test(url)) return;
-        if (
-          typeof name !== "string" ||
-          name.length > MAX_FILE_METADATA_LENGTH ||
-          typeof mime !== "string" ||
-          mime.length > 128 ||
-          !Number.isFinite(size) ||
-          size < 0 ||
-          size > MAX_FILE_SIZE
-        ) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const username = users.get(socket.id);
-        if (!username) return;
-        try {
-          const content = JSON.stringify({ url, name, size, mime });
-          await saveMessage(roomId, username, "file", content);
-          io.to(roomId).emit("chat-file", { username, url, name, size, mime });
-        } catch (err) {
-          console.error("send-file error:", err);
-        }
-      }
-    );
+    // Files are now saved and broadcast by POST /api/upload. The old
+    // v3.0.1 send-file notification is intentionally ignored to avoid doubles.
 
     socket.on(
       "send-image",
@@ -575,8 +572,8 @@ async function main() {
         if (!username) return;
         try {
           const content = JSON.stringify({ dataUrl });
-          await saveMessage(roomId, username, "image", content);
-          io.to(roomId).emit("chat-image", { username, dataUrl });
+          const saved = await saveMessage(roomId, username, "image", content);
+          io.to(roomId).emit("chat-image", saved);
         } catch (err) {
           console.error("send-image error:", err);
         }
