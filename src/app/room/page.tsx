@@ -588,7 +588,7 @@ function RoomInner() {
 
   const uploadFile = useCallback(
     async (file: File) => {
-      if (!username || !file) return;
+      if (!username || !file || !roomId) return;
 
       const uploadId = getId();
       setTimeline((prev) => [
@@ -597,9 +597,18 @@ function RoomInner() {
       ]);
 
       try {
+        const socketId = socketRef.current?.id;
+        if (!socketId) throw new Error("Room connection is not ready");
         const form = new FormData();
         form.append("file", file);
-        const resp = await fetch("/api/upload", { method: "POST", body: form });
+        const resp = await fetch("/api/upload", {
+          method: "POST",
+          headers: {
+            "x-room-id": roomId,
+            "x-socket-id": socketId,
+          },
+          body: form,
+        });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
 
@@ -728,17 +737,18 @@ function RoomInner() {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col h-screen" onPaste={handlePaste}>
+    <div className="room-shell flex flex-col" onPaste={handlePaste}>
       {/* Username Modal */}
       {!username && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-[100]">
-          <div className="bg-dimle-card border border-dimle-border rounded-2xl p-8 w-[90%] max-w-[340px] text-center shadow-[0_8px_30px_rgba(0,0,0,0.08)]">
+          <div className="join-dialog bg-dimle-card border border-dimle-border p-8 w-[90%] text-center shadow-[0_8px_30px_rgba(0,0,0,0.08)]">
             <h2 className="text-xl font-bold mb-2 text-dimle-text-primary">Pick a username</h2>
             <p className="text-dimle-text-muted text-sm mb-5">
               This is how others will see you
             </p>
             <input
               type="text"
+              aria-label="Username"
               value={usernameInput}
               onChange={(e) => setUsernameInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && joinRoom()}
@@ -748,6 +758,7 @@ function RoomInner() {
             />
             <input
               type="password"
+              aria-label="Room password (if any)"
               value={passwordInput}
               onChange={(e) => setPasswordInput(e.target.value)}
               maxLength={256}
@@ -762,7 +773,7 @@ function RoomInner() {
               Join Chat
             </button>
             {joinError && (
-              <p className="text-red-500 text-sm mt-2">{joinError}</p>
+              <p className="text-red-700 text-sm mt-2">{joinError}</p>
             )}
           </div>
         </div>
@@ -783,10 +794,10 @@ function RoomInner() {
       )}
 
       {/* Header */}
-      <header className="flex items-center justify-between px-5 py-3 bg-dimle-card border-b border-dimle-border">
+      <header className="room-header flex items-center justify-between px-5 py-3 bg-dimle-card border-b border-dimle-border">
         <a
           href="/"
-          className="font-bold text-lg text-dimle-accent no-underline"
+          className="wordmark no-underline"
         >
           Dimle
         </a>
@@ -836,16 +847,17 @@ function RoomInner() {
               </div>
             )}
           </span>
-          <span className="text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v2.0.0
+          <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
+            v3.0.1
           </span>
         </div>
       </header>
 
+      <section className="room-intro"><p className="eyebrow text-dimle-accent">Your shared space</p><h1 className="room-title">The conversation.</h1></section>
       {/* Messages */}
       <div
         ref={messagesRef}
-        className={`flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-1.5 relative ${
+        className={`chat-timeline flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-1.5 relative ${
           dragOver
             ? "after:content-['Drop_to_send'] after:fixed after:inset-0 after:bg-dimle-accent/10 after:border-[3px] after:border-dashed after:border-dimle-accent after:flex after:items-center after:justify-center after:text-xl after:font-semibold after:text-dimle-accent after:pointer-events-none after:z-[200] after:rounded-2xl"
             : ""
@@ -913,7 +925,7 @@ function RoomInner() {
       </div>
 
       {/* Input bar */}
-      <div className="flex items-center gap-2 px-5 py-3 bg-dimle-card border-t border-dimle-border">
+      <div className="chat-composer flex items-center gap-2 px-5 py-3 bg-dimle-card border-t border-dimle-border">
         <input
           type="file"
           ref={fileInputRef}
@@ -927,13 +939,15 @@ function RoomInner() {
         <button
           onClick={() => fileInputRef.current?.click()}
           title="Attach file"
+          aria-label="Attach file"
           className="shrink-0 w-[42px] h-[42px] border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-secondary text-xl flex items-center justify-center hover:bg-dimle-border transition-colors"
         >
-          📎
+          <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="m21 11-8 8a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8L16 5" /></svg>
         </button>
         <input
           ref={msgInputRef}
           type="text"
+          aria-label="Message"
           value={msgInput}
           onChange={(e) => setMsgInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && sendMessage()}

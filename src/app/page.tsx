@@ -28,7 +28,6 @@ export default function Home() {
       setCreating(false);
     }
   }, [router]);
-
   const joinRoom = useCallback(() => {
     const trimmed = code.trim();
     if (!isValidRoomId(trimmed)) {
@@ -39,50 +38,28 @@ export default function Home() {
   }, [code, router]);
 
   return (
-    <div className="flex items-center justify-center min-h-screen">
-      <div className="text-center max-w-[400px] w-[90%]">
-        <h1 className="text-[2.5rem] font-bold mb-1 text-dimle-accent">
-          Dimle
-        </h1>
-        <p className="text-dimle-text-muted mb-10 text-[0.95rem]">
-          Ephemeral rooms. No accounts. No history.
-        </p>
-        <div className="bg-dimle-card border border-dimle-border rounded-2xl p-8 mb-4 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-          <button
-            onClick={createRoom}
-            disabled={creating}
-            className="w-full py-3.5 rounded-xl font-semibold text-white bg-dimle-accent hover:bg-dimle-accent-dark transition-colors"
-          >
-            {creating ? "Creating…" : "Create Room"}
-          </button>
-          <div className="text-dimle-text-muted my-6 text-sm">
-            — or join an existing room —
-          </div>
-          <input
-            type="text"
-            value={code}
-            onChange={(e) => {
-              setCode(e.target.value);
-              setError("");
-            }}
-            onKeyDown={(e) => e.key === "Enter" && joinRoom()}
-            placeholder="Room ID"
-            maxLength={16}
-            autoCapitalize="none"
-            autoCorrect="off"
-            className="w-full py-3.5 px-4 border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-primary text-lg text-center font-mono mb-3 outline-none focus:border-dimle-accent focus:ring-2 focus:ring-dimle-accent-light placeholder:font-sans placeholder:text-dimle-text-muted transition-colors"
-          />
-          <button
-            onClick={joinRoom}
-            className="w-full py-3.5 rounded-xl font-semibold text-dimle-text-primary bg-dimle-surface border border-dimle-border hover:bg-dimle-border transition-colors"
-          >
-            Join Room
-          </button>
-          {error && (
-            <p className="text-red-500 text-sm mt-2">{error}</p>
-          )}
-        </div>
-      </div>
+    <div className="home-shell">
+      <header className="site-header"><a className="wordmark" href="/">Dimle</a><span className="eyebrow">Chat rooms</span></header>
+      <main id="main" className="home-main">
+        <section className="hero-copy" aria-labelledby="hero-title">
+          <p className="eyebrow hero-kicker">A little space to connect</p>
+          <h1 id="hero-title">Just a room.<br />Just us.</h1>
+          <p className="hero-description">Chat rooms. No accounts. Room messages are saved.</p>
+          <div className="hero-rule" aria-hidden="true"><span>Dimle</span><span>Come together. Keep it simple.</span></div>
+        </section>
+        <section className="entry-panel" aria-labelledby="entry-title">
+          <p className="eyebrow">Your conversation starts here</p>
+          <h2 id="entry-title">Make room.</h2>
+          <button onClick={createRoom} disabled={creating} aria-busy={creating} className="primary-button">{creating ? "Creating…" : "Create Room"} <span aria-hidden="true">↗</span></button>
+          <form onSubmit={(event) => { event.preventDefault(); joinRoom(); }} className="join-form">
+            <label htmlFor="room-code">Or join an existing room</label>
+            <input id="room-code" type="text" value={code} onChange={(e) => { setCode(e.target.value); setError(""); }} placeholder="Room ID" maxLength={16} autoCapitalize="none" autoCorrect="off" autoComplete="off" aria-invalid={!!error} aria-describedby={error ? "code-error" : undefined} />
+            <button type="submit" className="secondary-button">Join Room <span aria-hidden="true">→</span></button>
+            {error && <p id="code-error" role="alert" className="form-error">{error}</p>}
+          </form>
+        </section>
+      </main>
+      <footer className="site-footer"><span>Dimle</span><span>No accounts. Just conversation.</span></footer>
     </div>
   );
 }

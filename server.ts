@@ -28,6 +28,10 @@ const ALFRED_API_KEY = process.env.ALFRED_API_KEY;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "/tmp/dimle-uploads";
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_PASSWORD_LENGTH = 256;
+const MAX_USERNAME_LENGTH = 64;
+const MAX_MESSAGE_LENGTH = 10_000;
+const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
+const MAX_FILE_METADATA_LENGTH = 256;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -183,8 +187,15 @@ async function main() {
     points: 8,
     duration: 60,
   });
+  const uploadLimiter = new RateLimiterPostgres({
+    ...rateLimiterStore,
+    keyPrefix: "upload",
+    points: 30,
+    duration: 60 * 60,
+  });
 
   // Security headers
+  expressApp.disable("x-powered-by");
   expressApp.use((_req, res, nxt) => {
     res.setHeader(
       "Strict-Transport-Security",
@@ -192,10 +203,19 @@ async function main() {
     );
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader(
+      "Permissions-Policy",
+      "camera=(), microphone=(), geolocation=(), payment=()"
+    );
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:"
+    );
     nxt();
   });
 
-  expressApp.use(express.json());
+  expressApp.use(express.json({ limit: "32kb" }));
 
   // ── Room creation ─────────────────────────────────────────────────────────
   expressApp.post("/api/rooms", async (req, res) => {
@@ -238,11 +258,22 @@ async function main() {
   expressApp.use(
     "/uploads",
     (req, res, nxt) => {
-      const rel = decodeURIComponent(req.path);
+      let rel: string;
+      try {
+        rel = decodeURIComponent(req.path);
+      } catch {
+        return res.status(400).end();
+      }
       if (rel.includes("..")) return res.status(403).end();
       nxt();
     },
-    express.static(UPLOAD_DIR)
+    express.static(UPLOAD_DIR, {
+      setHeaders: (res) => {
+        res.setHeader("Content-Disposition", "attachment");
+        res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+        res.setHeader("Cache-Control", "private, max-age=3600");
+      },
+    })
   );
 
   // ── File uploads ──────────────────────────────────────────────────────────
@@ -268,6 +299,34 @@ async function main() {
 
   expressApp.post(
     "/api/upload",
+    async (req, res, nxt) => {
+      const roomId = req.headers["x-room-id"];
+      const socketId = req.headers["x-socket-id"];
+      if (
+        typeof roomId !== "string" ||
+        typeof socketId !== "string" ||
+        !isValidRoomId(roomId)
+      ) {
+        return res.status(401).json({ error: "Join the room before uploading" });
+      }
+      const users = onlineUsers.get(roomId);
+      const activeSocket = io.sockets.sockets.get(socketId);
+      if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
+        return res.status(401).json({ error: "Join the room before uploading" });
+      }
+      try {
+        await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
+        nxt();
+      } catch (err) {
+        if (typeof err === "object" && err && "msBeforeNext" in err) {
+          res.setHeader(
+            "Retry-After",
+            Math.ceil(Number(err.msBeforeNext) / 1000).toString()
+          );
+        }
+        return res.status(429).json({ error: "Too many uploads. Try again later." });
+      }
+    },
     uploadMiddleware.single("file"),
     (req, res) => {
       if (!req.file) return res.status(400).json({ error: "No file" });
@@ -304,6 +363,8 @@ async function main() {
     async (req, res) => {
       try {
         const roomId = req.params.roomId as string;
+        if (!isValidRoomId(roomId))
+          return res.status(400).json({ error: "Invalid room ID" });
         const since = parseInt(req.query.since as string) || 0;
         if (!(await roomExists(roomId)))
           return res.status(404).json({ error: "Room not found" });
@@ -327,6 +388,15 @@ async function main() {
         return res
           .status(400)
           .json({ error: "Missing roomId, username or message" });
+      if (
+        !isValidRoomId(roomId) ||
+        typeof username !== "string" ||
+        username.length > MAX_USERNAME_LENGTH ||
+        typeof message !== "string" ||
+        message.length > MAX_MESSAGE_LENGTH
+      ) {
+        return res.status(400).json({ error: "Invalid message payload" });
+      }
       const room = await getRoom(roomId);
       if (!room || room.creationTokenHash)
         return res.status(404).json({ error: "Room not found" });
@@ -359,6 +429,10 @@ async function main() {
         if (!roomId || !username) return;
         if (!isValidRoomId(roomId)) {
           socket.emit("join-error", "Invalid room ID");
+          return;
+        }
+        if (typeof username !== "string" || username.length > MAX_USERNAME_LENGTH) {
+          socket.emit("join-error", "Username is too long");
           return;
         }
         if ((password?.length ?? 0) > MAX_PASSWORD_LENGTH) {
@@ -434,7 +508,8 @@ async function main() {
     socket.on(
       "send-message",
       async ({ roomId, message }: { roomId: string; message: string }) => {
-        if (!roomId || !message) return;
+        if (!roomId || typeof message !== "string" || !message.trim()) return;
+        if (message.length > MAX_MESSAGE_LENGTH) return;
         const users = onlineUsers.get(roomId);
         if (!users) return;
         const username = users.get(socket.id);
@@ -464,7 +539,16 @@ async function main() {
         mime: string;
       }) => {
         if (!roomId || !url) return;
-        if (!url.startsWith("/uploads/")) return;
+        if (!/^\/uploads\/[0-9a-f]{16}\/[^/]{1,128}$/.test(url)) return;
+        if (
+          typeof name !== "string" ||
+          name.length > MAX_FILE_METADATA_LENGTH ||
+          typeof mime !== "string" ||
+          mime.length > 128 ||
+          !Number.isFinite(size) ||
+          size < 0 ||
+          size > MAX_FILE_SIZE
+        ) return;
         const users = onlineUsers.get(roomId);
         if (!users) return;
         const username = users.get(socket.id);
@@ -483,7 +567,8 @@ async function main() {
       "send-image",
       async ({ roomId, dataUrl }: { roomId: string; dataUrl: string }) => {
         if (!roomId || !dataUrl) return;
-        if (!dataUrl.startsWith("data:image/")) return;
+        if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return;
+        if (!/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(dataUrl)) return;
         const users = onlineUsers.get(roomId);
         if (!users) return;
         const username = users.get(socket.id);
@@ -509,7 +594,8 @@ async function main() {
         toUsername: string;
         message: string;
       }) => {
-        if (!roomId || !toUsername || !message) return;
+        if (!roomId || !toUsername || typeof message !== "string" || !message.trim()) return;
+        if (message.length > MAX_MESSAGE_LENGTH || toUsername.length > MAX_USERNAME_LENGTH) return;
         const users = onlineUsers.get(roomId);
         if (!users) return;
         const fromUsername = users.get(socket.id);
@@ -555,6 +641,17 @@ async function main() {
       }
     });
   });
+
+  expressApp.use(
+    (err: unknown, _req: express.Request, res: express.Response, nxt: express.NextFunction) => {
+      if (err instanceof multer.MulterError) {
+        return res
+          .status(err.code === "LIMIT_FILE_SIZE" ? 413 : 400)
+          .json({ error: err.code === "LIMIT_FILE_SIZE" ? "File is too large" : "Invalid upload" });
+      }
+      nxt(err);
+    }
+  );
 
   // ── Next.js handler (catch-all) ──────────────────────────────────────────
   expressApp.all("*", (req, res) => {
