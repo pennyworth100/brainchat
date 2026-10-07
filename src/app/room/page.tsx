@@ -12,21 +12,11 @@ import {
 } from "react";
 import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
-import { isValidRoomId } from "@/lib/room-id";
+import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
+import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
+import { uploadRoomFile } from "@/lib/upload-client";
 
 // ── Types ───────────────────────────────────────────────────────────────────
-
-interface ChatMessage {
-  type: "message" | "file" | "image";
-  username: string;
-  message?: string;
-  url?: string;
-  name?: string;
-  size?: number;
-  mime?: string;
-  dataUrl?: string;
-  ts?: number;
-}
 
 interface DMWindow {
   peerName: string;
@@ -224,7 +214,7 @@ function DMPanel({
   onClose,
 }: {
   dm: DMWindow;
-  onSend: (peerName: string, message: string) => void;
+  onSend: (peerName: string, message: string) => boolean;
   onToggleMinimize: (peerName: string) => void;
   onClose: (peerName: string) => void;
 }) {
@@ -247,8 +237,7 @@ function DMPanel({
   const doSend = () => {
     const msg = input.trim();
     if (!msg) return;
-    onSend(dm.peerName, msg);
-    setInput("");
+    if (onSend(dm.peerName, msg)) setInput("");
   };
 
   return (
@@ -341,7 +330,8 @@ function DMPanel({
 
 function RoomInner() {
   const searchParams = useSearchParams();
-  const roomId = searchParams.get("id");
+  const rawRoomId = searchParams.get("id");
+  const roomId = rawRoomId ? normalizeRoomId(rawRoomId) : null;
 
   const [username, setUsername] = useState<string | null>(null);
   const [usernameInput, setUsernameInput] = useState(
@@ -349,14 +339,6 @@ function RoomInner() {
   );
   const [passwordInput, setPasswordInput] = useState("");
   const [joinError, setJoinError] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [systemMessages, setSystemMessages] = useState<
-    { id: number; text: string }[]
-  >([]);
-  const [allItems, setAllItems] = useState<
-    { type: "msg"; data: ChatMessage; id: number }
-    | { type: "sys"; text: string; id: number }[]
-  >([]);
   const [msgInput, setMsgInput] = useState("");
   const [userCount, setUserCount] = useState(0);
   const [userList, setUserList] = useState<string[]>([]);
@@ -364,7 +346,9 @@ function RoomInner() {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [dmWindows, setDmWindows] = useState<Map<string, DMWindow>>(new Map());
   const [dragOver, setDragOver] = useState(false);
-  const [uploading, setUploading] = useState<string | null>(null);
+  const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
 
   // Timeline: mixed messages and system messages
   const [timeline, setTimeline] = useState<
@@ -379,6 +363,7 @@ function RoomInner() {
   const getId = () => nextId.current++;
 
   const socketRef = useRef<Socket | null>(null);
+  const sessionRef = useRef<RoomSession | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const msgInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -403,96 +388,66 @@ function RoomInner() {
     }
   }, [timeline]);
 
+  // Reconcile snapshots and live events by server ID, including events that
+  // race with a history query or the HTTP upload response.
+  const receiveMessages = useCallback((incoming: ChatMessage[]) => {
+    setTimeline((prev) => {
+      const existing = prev.flatMap((item) => item.kind === "msg" ? [item.data] : []);
+      const knownIds = new Set(existing.map((message) => message.id));
+      const unseen = incoming.filter((message) => !knownIds.has(message.id));
+      if (unseen.length === 0) return prev; // don't scroll on an unchanged health check
+      const merged = mergeMessages(existing, unseen);
+      const keys = new Map(prev.flatMap((item) => item.kind === "msg" ? [[item.data.id, item.id] as const] : []));
+      const items = merged.map((data) => ({ kind: "msg" as const, data, id: keys.get(data.id) ?? getId() }));
+      let index = 0;
+      const timeline = prev.map((item) => item.kind === "msg" ? items[index++] : item);
+      return [...timeline, ...items.slice(index)];
+    });
+  }, []);
+
   // Socket connection
   useEffect(() => {
     if (!roomId) return;
     const socket = io();
     socketRef.current = socket;
-
-    socket.on("room-info", () => {
-      setJoinError("");
-      if (roomId) sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+    const session = createRoomSession(socket, {
+      onState: (state) => {
+        setConnectionState(state);
+        if (state !== "ready") {
+          setShowParticipants(false);
+          if (state !== "syncing") { setUserCount(0); setUserList([]); }
+        }
+      },
+      onSnapshot: ({ history, users }) => {
+        receiveMessages(history);
+        setUserList(users);
+        setUserCount(users.length);
+      },
+      onJoined: () => {
+        setJoinError("");
+        sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+      },
+      onError: (message) => {
+        setJoinError(message);
+        setUsername(null);
+        usernameRef.current = null;
+      },
     });
-
-    socket.on("join-error", (msg: string) => {
-      setJoinError(msg);
-      setUsername(null);
-      usernameRef.current = null;
-    });
-
-    socket.on("chat-history", (history: ChatMessage[]) => {
-      setTimeline((prev) => [
-        ...prev,
-        { kind: "sep", count: history.length, id: getId() },
-        ...history.map((m) => ({
-          kind: "msg" as const,
-          data: m,
-          id: getId(),
-        })),
-      ]);
-    });
-
-    socket.on(
-      "chat-message",
-      ({ username: sender, message }: { username: string; message: string }) => {
-        setTimeline((prev) => [
-          ...prev,
-          {
-            kind: "msg",
-            data: {
-              type: "message",
-              username: sender,
-              message,
-              ts: Date.now(),
-            },
-            id: getId(),
-          },
-        ]);
+    sessionRef.current = session;
+    const onMessage = (message: ChatMessage) => receiveMessages([message]);
+    socket.on("chat-message", onMessage);
+    socket.on("chat-file", onMessage);
+    socket.on("chat-image", onMessage);
+    const resume = () => {
+      if (document.visibilityState === "visible" && usernameRef.current) {
+        session.sync().catch(() => {}); // status remains reconnecting, never stale online
       }
-    );
-
-    socket.on(
-      "chat-file",
-      ({
-        username: sender,
-        url,
-        name,
-        size,
-        mime,
-      }: {
-        username: string;
-        url: string;
-        name: string;
-        size: number;
-        mime: string;
-      }) => {
-        // Skip if we sent it (optimistic render)
-        if (sender === usernameRef.current) return;
-        setTimeline((prev) => [
-          ...prev,
-          {
-            kind: "msg",
-            data: { type: "file", username: sender, url, name, size, mime, ts: Date.now() },
-            id: getId(),
-          },
-        ]);
-      }
-    );
-
-    socket.on(
-      "chat-image",
-      ({ username: sender, dataUrl }: { username: string; dataUrl: string }) => {
-        if (sender === usernameRef.current) return;
-        setTimeline((prev) => [
-          ...prev,
-          {
-            kind: "msg",
-            data: { type: "image", username: sender, dataUrl, ts: Date.now() },
-            id: getId(),
-          },
-        ]);
-      }
-    );
+    };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("pageshow", resume);
+    window.addEventListener("online", resume);
+    window.addEventListener("focus", resume);
+    const healthTimer = window.setInterval(resume, 15_000);
 
     socket.on("system-message", (text: string) => {
       setTimeline((prev) => [...prev, { kind: "sys", text, id: getId() }]);
@@ -559,9 +514,16 @@ function RoomInner() {
     );
 
     return () => {
+      window.clearInterval(healthTimer);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("pageshow", resume);
+      window.removeEventListener("online", resume);
+      window.removeEventListener("focus", resume);
+      session.dispose();
+      sessionRef.current = null;
       socket.disconnect();
     };
-  }, [roomId]);
+  }, [roomId, receiveMessages]);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -569,7 +531,8 @@ function RoomInner() {
     const name = usernameInput.trim() || "User_" + Math.floor(10 + Math.random() * 90);
     setUsername(name);
     usernameRef.current = name;
-    socketRef.current?.emit("join-room", {
+    if (!roomId) return;
+    sessionRef.current?.join({
       roomId,
       username: name,
       password: passwordInput,
@@ -579,79 +542,51 @@ function RoomInner() {
     });
   }, [usernameInput, passwordInput, roomId]);
 
-  const sendMessage = useCallback(() => {
+  const sendMessage = useCallback(async () => {
     const msg = msgInput.trim();
-    if (!msg || !username) return;
-    socketRef.current?.emit("send-message", { roomId, message: msg });
-    setMsgInput("");
-  }, [msgInput, username, roomId]);
+    const session = sessionRef.current;
+    const socket = socketRef.current;
+    if (!msg || !username || !session || !socket || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      await session.sync();
+      const result = await socket.timeout(10_000).emitWithAck("send-message", { roomId, message: msg });
+      if (result.error) throw new Error(result.error);
+      receiveMessages([result.message]);
+      setMsgInput((current) => current === msgInput ? "" : current);
+    } catch (err) {
+      setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
+        ? err.message : "Delivery not confirmed. Check the chat before retrying; your draft is kept.", id: getId() }]);
+      session.sync().catch(() => {});
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
+  }, [msgInput, username, roomId, receiveMessages]);
 
   const uploadFile = useCallback(
     async (file: File) => {
-      if (!username || !file || !roomId) return;
-
+      const session = sessionRef.current;
+      if (!username || !file || !roomId || !session) return;
       const uploadId = getId();
-      setTimeline((prev) => [
-        ...prev,
-        { kind: "uploading", name: file.name, id: uploadId },
-      ]);
-
+      setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
       try {
-        const socketId = socketRef.current?.id;
-        if (!socketId) throw new Error("Room connection is not ready");
-        const form = new FormData();
-        form.append("file", file);
-        const resp = await fetch("/api/upload", {
-          method: "POST",
-          headers: {
-            "x-room-id": roomId,
-            "x-socket-id": socketId,
-          },
-          body: form,
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-
-        // Replace uploading indicator with real message
-        setTimeline((prev) =>
-          prev.map((item) =>
-            item.id === uploadId
-              ? {
-                  kind: "msg" as const,
-                  data: {
-                    type: "file" as const,
-                    username: username!,
-                    url: data.url,
-                    name: data.name,
-                    size: data.size,
-                    mime: data.mime,
-                    ts: Date.now(),
-                  },
-                  id: uploadId,
-                }
-              : item
-          )
-        );
-
-        socketRef.current?.emit("send-file", {
-          roomId,
-          url: data.url,
-          name: data.name,
-          size: data.size,
-          mime: data.mime,
-        });
+        const data = await uploadRoomFile(file, roomId, session);
+        // The server persists + broadcasts before returning. No second socket
+        // send is needed, so a disconnect cannot strand an uploaded attachment.
+        setTimeline((prev) => prev.filter((item) => item.id !== uploadId));
+        receiveMessages([data.message]);
       } catch (err) {
-        setTimeline((prev) =>
-          prev.map((item) =>
-            item.id === uploadId
-              ? { kind: "sys" as const, text: `Upload failed: ${file.name}`, id: uploadId }
-              : item
-          )
-        );
-        console.error("Upload error:", err);
+        const reason = err instanceof Error ? err.message : "Please try again.";
+        setTimeline((prev) => prev.map((item) => item.id === uploadId
+          ? { kind: "sys" as const, text: `Upload failed: ${file.name} — ${reason}`, id: uploadId }
+          : item));
+      } finally {
+        session.sync().catch(() => {});
       }
     },
-    [username, roomId]
+    [username, roomId, receiveMessages]
   );
 
   const handleDrop = useCallback(
@@ -704,11 +639,16 @@ function RoomInner() {
 
   const sendDM = useCallback(
     (peerName: string, message: string) => {
+      if (!sessionRef.current?.isReady()) {
+        alert("Room is reconnecting. Please try again when connected.");
+        return false;
+      }
       socketRef.current?.emit("private-message", {
         roomId,
         toUsername: peerName,
         message,
       });
+      return true;
     },
     [roomId]
   );
@@ -815,7 +755,9 @@ function RoomInner() {
               setShowParticipants((v) => !v);
             }}
           >
-            <span className="text-dimle-accent font-medium">{userCount}</span> online
+            <span role="status" aria-live="polite">
+              {connectionState === "ready" ? `${userCount} online` : connectionState === "syncing" ? "Syncing…" : username ? "Reconnecting…" : "Not connected"}
+            </span>
             {showParticipants && (
               <div
                 className="absolute top-[calc(100%+8px)] right-0 bg-dimle-card border border-dimle-border rounded-2xl p-3 min-w-[160px] max-w-[220px] z-50 shadow-[0_8px_24px_rgba(0,0,0,0.08)]"
@@ -848,7 +790,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v3.0.1
+            v3.0.3
           </span>
         </div>
       </header>
@@ -938,6 +880,7 @@ function RoomInner() {
         />
         <button
           onClick={() => fileInputRef.current?.click()}
+          disabled={connectionState !== "ready"}
           title="Attach file"
           aria-label="Attach file"
           className="shrink-0 w-[42px] h-[42px] border border-dimle-border rounded-xl bg-dimle-surface text-dimle-text-secondary text-xl flex items-center justify-center hover:bg-dimle-border transition-colors"
@@ -957,9 +900,10 @@ function RoomInner() {
         />
         <button
           onClick={sendMessage}
+          disabled={connectionState !== "ready" || sending}
           className="py-3 px-6 rounded-xl font-semibold text-white bg-dimle-accent hover:bg-dimle-accent-dark transition-colors"
         >
-          Send
+          {sending ? "Sending…" : "Send"}
         </button>
       </div>
 

@@ -2,7 +2,7 @@
 
 import { useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { isValidRoomId } from "@/lib/room-id";
+import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
 
 export default function Home() {
   const router = useRouter();
@@ -29,12 +29,12 @@ export default function Home() {
     }
   }, [router]);
   const joinRoom = useCallback(() => {
-    const trimmed = code.trim();
-    if (!isValidRoomId(trimmed)) {
-      setError("Enter a valid room ID");
+    const roomId = normalizeRoomId(code);
+    if (!isValidRoomId(roomId)) {
+      setError("Enter a room name like apple482");
       return;
     }
-    router.push(`/room?id=${trimmed}`);
+    router.push(`/room?id=${encodeURIComponent(roomId)}`);
   }, [code, router]);
 
   return (
@@ -53,7 +53,8 @@ export default function Home() {
           <button onClick={createRoom} disabled={creating} aria-busy={creating} className="primary-button">{creating ? "Creating…" : "Create Room"} <span aria-hidden="true">↗</span></button>
           <form onSubmit={(event) => { event.preventDefault(); joinRoom(); }} className="join-form">
             <label htmlFor="room-code">Or join an existing room</label>
-            <input id="room-code" type="text" value={code} onChange={(e) => { setCode(e.target.value); setError(""); }} placeholder="Room ID" maxLength={16} autoCapitalize="none" autoCorrect="off" autoComplete="off" aria-invalid={!!error} aria-describedby={error ? "code-error" : undefined} />
+            <input id="room-code" type="text" value={code} onChange={(e) => { setCode(e.target.value); setError(""); }} placeholder="apple482" maxLength={16} autoCapitalize="none" autoCorrect="off" autoComplete="off" aria-invalid={!!error} aria-describedby={error ? "code-error" : "room-code-hint"} />
+            <p id="room-code-hint" className="form-hint">A short word and 3 digits.</p>
             <button type="submit" className="secondary-button">Join Room <span aria-hidden="true">→</span></button>
             {error && <p id="code-error" role="alert" className="form-error">{error}</p>}
           </form>
