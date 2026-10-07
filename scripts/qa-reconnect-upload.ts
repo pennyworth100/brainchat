@@ -36,6 +36,7 @@ async function main() {
   const create = await fetch(`${base}/api/rooms`, { method: "POST" });
   assert.equal(create.status, 201);
   const { roomId, creationToken } = await create.json();
+  assert.match(roomId, /^[a-z]{3,5}\d{3}$/);
   const mobile = io(base);
   const desktop = io(base);
   const outsider = io(base);

@@ -1,11 +1,14 @@
 import crypto from "crypto";
 import argon2 from "argon2";
 import { isValidRoomId } from "./room-id";
+import { ROOM_NOUNS } from "./room-words";
 
-export { isValidRoomId } from "./room-id";
+export { isValidRoomId, normalizeRoomId } from "./room-id";
 
 export function generateRoomId() {
-  return crypto.randomBytes(12).toString("base64url");
+  const noun = ROOM_NOUNS[crypto.randomInt(ROOM_NOUNS.length)];
+  const digits = crypto.randomInt(1000).toString().padStart(3, "0");
+  return `${noun}${digits}`;
 }
 
 export function generateCreationToken() {

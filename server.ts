@@ -17,6 +17,7 @@ import {
   hashCreationToken,
   hashPassword,
   isValidRoomId,
+  normalizeRoomId,
   safeEqual,
   verifyPassword,
 } from "./src/lib/security";
@@ -301,15 +302,16 @@ async function main() {
   expressApp.post(
     "/api/upload",
     async (req, res, nxt) => {
-      const roomId = req.headers["x-room-id"];
+      const rawRoomId = req.headers["x-room-id"];
       const socketId = req.headers["x-socket-id"];
       if (
-        typeof roomId !== "string" ||
+        typeof rawRoomId !== "string" ||
         typeof socketId !== "string" ||
-        !isValidRoomId(roomId)
+        !isValidRoomId(rawRoomId)
       ) {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
+      const roomId = normalizeRoomId(rawRoomId);
       const users = onlineUsers.get(roomId);
       const activeSocket = io.sockets.sockets.get(socketId);
       if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
@@ -374,9 +376,10 @@ async function main() {
     requireApiKey,
     async (req, res) => {
       try {
-        const roomId = req.params.roomId as string;
-        if (!isValidRoomId(roomId))
+        const rawRoomId = req.params.roomId as string;
+        if (!isValidRoomId(rawRoomId))
           return res.status(400).json({ error: "Invalid room ID" });
+        const roomId = normalizeRoomId(rawRoomId);
         const since = parseInt(req.query.since as string) || 0;
         if (!(await roomExists(roomId)))
           return res.status(404).json({ error: "Room not found" });
@@ -395,13 +398,14 @@ async function main() {
   // POST /api/send
   expressApp.post("/api/send", requireApiKey, async (req, res) => {
     try {
-      const { roomId, username, message } = req.body;
-      if (!roomId || !username || !message)
+      const { roomId: rawRoomId, username, message } = req.body;
+      if (!rawRoomId || !username || !message)
         return res
           .status(400)
           .json({ error: "Missing roomId, username or message" });
       if (
-        !isValidRoomId(roomId) ||
+        typeof rawRoomId !== "string" ||
+        !isValidRoomId(rawRoomId) ||
         typeof username !== "string" ||
         username.length > MAX_USERNAME_LENGTH ||
         typeof message !== "string" ||
@@ -409,6 +413,7 @@ async function main() {
       ) {
         return res.status(400).json({ error: "Invalid message payload" });
       }
+      const roomId = normalizeRoomId(rawRoomId);
       const room = await getRoom(roomId);
       if (!room || room.creationTokenHash)
         return res.status(404).json({ error: "Room not found" });
@@ -428,7 +433,7 @@ async function main() {
     socket.on(
       "join-room",
       async ({
-        roomId,
+        roomId: rawRoomId,
         username,
         password,
         creationToken,
@@ -438,11 +443,12 @@ async function main() {
         password?: string;
         creationToken?: string;
       }) => {
-        if (!roomId || !username) return;
-        if (!isValidRoomId(roomId)) {
+        if (typeof rawRoomId !== "string" || !rawRoomId || !username) return;
+        if (!isValidRoomId(rawRoomId)) {
           socket.emit("join-error", "Invalid room ID");
           return;
         }
+        const roomId = normalizeRoomId(rawRoomId);
         if (typeof username !== "string" || username.length > MAX_USERNAME_LENGTH) {
           socket.emit("join-error", "Username is too long");
           return;

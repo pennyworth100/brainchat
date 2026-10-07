@@ -12,7 +12,7 @@ import {
 } from "react";
 import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
-import { isValidRoomId } from "@/lib/room-id";
+import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
 import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
 import { uploadRoomFile } from "@/lib/upload-client";
 
@@ -330,7 +330,8 @@ function DMPanel({
 
 function RoomInner() {
   const searchParams = useSearchParams();
-  const roomId = searchParams.get("id");
+  const rawRoomId = searchParams.get("id");
+  const roomId = rawRoomId ? normalizeRoomId(rawRoomId) : null;
 
   const [username, setUsername] = useState<string | null>(null);
   const [usernameInput, setUsernameInput] = useState(
@@ -789,7 +790,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v3.0.2
+            v3.0.3
           </span>
         </div>
       </header>
