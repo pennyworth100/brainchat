@@ -1,0 +1,2 @@
+ALTER TABLE "messages" ADD COLUMN "client_message_id" varchar(128);--> statement-breakpoint
+CREATE UNIQUE INDEX "messages_agent_idempotency_idx" ON "messages" USING btree ("room_id","username","client_message_id");

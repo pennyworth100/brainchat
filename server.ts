@@ -10,6 +10,11 @@ import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
+import {
+  authenticateAgent,
+  loadAgentPrincipals,
+  type AgentPrincipal,
+} from "./src/lib/agent-api-auth";
 import type { JoinErrorDetails } from "./src/lib/join-error";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
@@ -26,13 +31,18 @@ import {
 const dev = process.env.NODE_ENV !== "production";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const MAX_HISTORY = 100;
-const ALFRED_API_KEY = process.env.ALFRED_API_KEY;
+const AGENT_PRINCIPALS = loadAgentPrincipals(
+  process.env.ALFRED_API_KEY,
+  process.env.DIMLE_AGENT_API_KEYS_JSON
+);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "/tmp/dimle-uploads";
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_PASSWORD_LENGTH = 256;
 const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
+
+class IdempotencyConflictError extends Error {}
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -103,12 +113,54 @@ async function saveMessage(
   return deserializeMessage(row);
 }
 
+async function saveAgentMessage(
+  roomId: string,
+  username: string,
+  content: string,
+  clientMessageId?: string
+) {
+  if (!clientMessageId) {
+    return { message: await saveMessage(roomId, username, "message", content), deduplicated: false };
+  }
+
+  const [inserted] = await db
+    .insert(messagesTable)
+    .values({ roomId, username, type: "message", content, clientMessageId, ts: new Date() })
+    .onConflictDoNothing({
+      target: [messagesTable.roomId, messagesTable.username, messagesTable.clientMessageId],
+    })
+    .returning();
+
+  if (inserted) {
+    touchRoom(roomId).catch(() => {});
+    return { message: deserializeMessage(inserted), deduplicated: false };
+  }
+
+  const [existing] = await db
+    .select()
+    .from(messagesTable)
+    .where(
+      and(
+        eq(messagesTable.roomId, roomId),
+        eq(messagesTable.username, username),
+        eq(messagesTable.clientMessageId, clientMessageId)
+      )
+    )
+    .limit(1);
+  if (!existing) throw new Error("Idempotent message conflict could not be resolved");
+  if (existing.type !== "message" || existing.content !== content) {
+    throw new IdempotencyConflictError("clientMessageId was already used for another payload");
+  }
+  return { message: deserializeMessage(existing), deduplicated: true };
+}
+
 interface MessageRow {
   id: number;
   roomId: string;
   username: string;
   type: string;
   content: string;
+  clientMessageId: string | null;
   ts: Date;
 }
 
@@ -374,10 +426,12 @@ async function main() {
     nxt: express.NextFunction
   ) {
     const key = req.headers["x-api-key"];
-    if (!ALFRED_API_KEY)
+    if (AGENT_PRINCIPALS.length === 0)
       return res.status(503).json({ error: "API integration is not configured" });
-    if (typeof key !== "string" || !safeEqual(key, ALFRED_API_KEY))
+    const principal = authenticateAgent(typeof key === "string" ? key : undefined, AGENT_PRINCIPALS);
+    if (!principal)
       return res.status(401).json({ error: "Unauthorized" });
+    res.locals.agentPrincipal = principal;
     nxt();
   }
 
@@ -417,18 +471,20 @@ async function main() {
   // POST /api/send
   expressApp.post("/api/send", requireApiKey, async (req, res) => {
     try {
-      const { roomId: rawRoomId, username, message } = req.body;
-      if (!rawRoomId || !username || !message)
+      const { roomId: rawRoomId, message, clientMessageId } = req.body;
+      const principal = res.locals.agentPrincipal as AgentPrincipal;
+      if (!rawRoomId || !message)
         return res
           .status(400)
-          .json({ error: "Missing roomId, username or message" });
+          .json({ error: "Missing roomId or message" });
       if (
         typeof rawRoomId !== "string" ||
         !isValidRoomId(rawRoomId) ||
-        typeof username !== "string" ||
-        username.length > MAX_USERNAME_LENGTH ||
         typeof message !== "string" ||
-        message.length > MAX_MESSAGE_LENGTH
+        message.length > MAX_MESSAGE_LENGTH ||
+        (clientMessageId !== undefined &&
+          (typeof clientMessageId !== "string" ||
+            !/^[A-Za-z0-9_-]{1,128}$/.test(clientMessageId)))
       ) {
         return res.status(400).json({ error: "Invalid message payload" });
       }
@@ -436,10 +492,18 @@ async function main() {
       const room = await getRoom(roomId);
       if (!room || room.creationTokenHash)
         return res.status(404).json({ error: "Room not found" });
-      const saved = await saveMessage(roomId, username, "message", message);
-      io.to(roomId).emit("chat-message", saved);
-      res.json({ ok: true });
+      const result = await saveAgentMessage(
+        roomId,
+        principal.username,
+        message,
+        clientMessageId
+      );
+      if (!result.deduplicated) io.to(roomId).emit("chat-message", result.message);
+      res.json({ ok: true, ...result });
     } catch (err) {
+      if (err instanceof IdempotencyConflictError) {
+        return res.status(409).json({ error: err.message });
+      }
       console.error("POST /api/send error:", err);
       res.status(500).json({ error: "Internal error" });
     }
