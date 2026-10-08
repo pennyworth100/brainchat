@@ -136,6 +136,7 @@ async function main() {
     const outsiderHistory = once(outsider, "chat-history");
     outsider.emit("join-room", { roomId, username: "outsider", password: "local-qa" });
     await outsiderHistory;
+    desktop.once("private-message", (_message, ack) => ack({ received: true }));
     const recipientDm = once<{ fromUsername: string; message: string; ts: number }>(desktop, "private-message");
     const senderAck = once<{ toUsername: string; message: string }>(mobile, "private-message-sent");
     const outsiderIsolation = expectNoEvent(outsider, "private-message");

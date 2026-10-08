@@ -16,6 +16,7 @@ import {
   type AgentPrincipal,
 } from "./src/lib/agent-api-auth";
 import type { JoinErrorDetails } from "./src/lib/join-error";
+import { registerPrivateMessages } from "./src/lib/private-message";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -671,45 +672,7 @@ async function main() {
       }
     );
 
-    socket.on(
-      "private-message",
-      ({
-        roomId,
-        toUsername,
-        message,
-      }: {
-        roomId: string;
-        toUsername: string;
-        message: string;
-      }) => {
-        if (!roomId || !toUsername || typeof message !== "string" || !message.trim()) return;
-        if (message.length > MAX_MESSAGE_LENGTH || toUsername.length > MAX_USERNAME_LENGTH) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const fromUsername = users.get(socket.id);
-        if (!fromUsername) return;
-
-        let toSocketId: string | null = null;
-        for (const [sid, uname] of users.entries()) {
-          if (uname === toUsername) {
-            toSocketId = sid;
-            break;
-          }
-        }
-
-        if (!toSocketId) {
-          socket.emit("private-error", {
-            toUsername,
-            error: "User not found or offline",
-          });
-          return;
-        }
-
-        const ts = Date.now();
-        io.to(toSocketId).emit("private-message", { fromUsername, message, ts });
-        socket.emit("private-message-sent", { toUsername, message, ts });
-      }
-    );
+    registerPrivateMessages(io, socket, onlineUsers);
 
     socket.on("disconnect", () => {
       if (!currentRoom) return;

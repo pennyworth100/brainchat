@@ -16,6 +16,7 @@ import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
 import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
 import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
+import { sendPrivateMessage } from "@/lib/private-message-client";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -215,11 +216,14 @@ function DMPanel({
   onClose,
 }: {
   dm: DMWindow;
-  onSend: (peerName: string, message: string) => boolean;
+  onSend: (peerName: string, message: string) => Promise<void>;
   onToggleMinimize: (peerName: string) => void;
   onClose: (peerName: string) => void;
 }) {
   const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const [sendError, setSendError] = useState("");
   const msgRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -235,10 +239,21 @@ function DMPanel({
     }
   }, [dm.minimized]);
 
-  const doSend = () => {
+  const doSend = async () => {
     const msg = input.trim();
-    if (!msg) return;
-    if (onSend(dm.peerName, msg)) setInput("");
+    if (!msg || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    setSendError("");
+    try {
+      await onSend(dm.peerName, msg);
+      setInput("");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Delivery not confirmed. Check before retrying.");
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
   };
 
   return (
@@ -305,11 +320,13 @@ function DMPanel({
       </div>
 
       {/* Input */}
+      {sendError && <p role="alert" className="px-3 py-1 text-xs text-red-600">{sendError} Your text is kept below.</p>}
       <div className="flex gap-1.5 px-2 py-1.5 border-t border-dimle-border shrink-0">
         <input
           ref={inputRef}
           type="text"
           value={input}
+          disabled={sending}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), doSend())}
           placeholder={`Message ${dm.peerName}…`}
@@ -318,9 +335,10 @@ function DMPanel({
         />
         <button
           onClick={doSend}
+          disabled={sending}
           className="bg-dimle-accent text-white rounded-xl px-2.5 py-1.5 text-xs hover:bg-dimle-accent-dark transition-colors"
         >
-          Send
+          {sending ? "Confirming…" : "Send"}
         </button>
       </div>
     </div>
@@ -517,7 +535,7 @@ function RoomInner() {
 
     socket.on(
       "private-message",
-      ({ fromUsername, message }: { fromUsername: string; message: string }) => {
+      ({ fromUsername, message }: { fromUsername: string; message: string }, ack?: (result: { received: true }) => void) => {
         setDmWindows((prev) => {
           const next = new Map(prev);
           if (!next.has(fromUsername)) {
@@ -537,6 +555,7 @@ function RoomInner() {
           next.set(fromUsername, w);
           return next;
         });
+        if (typeof ack === "function") ack({ received: true });
       }
     );
 
@@ -675,17 +694,15 @@ function RoomInner() {
   }, []);
 
   const sendDM = useCallback(
-    (peerName: string, message: string) => {
-      if (!sessionRef.current?.isReady()) {
-        alert("Room is reconnecting. Please try again when connected.");
-        return false;
+    async (peerName: string, message: string) => {
+      if (!sessionRef.current?.isReady() || !socketRef.current || !roomId) {
+        throw new Error("Room is reconnecting. Please try again when connected.");
       }
-      socketRef.current?.emit("private-message", {
+      await sendPrivateMessage(socketRef.current, {
         roomId,
         toUsername: peerName,
         message,
       });
-      return true;
     },
     [roomId]
   );
@@ -837,7 +854,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v3.0.4
+            v3.0.6
           </span>
         </div>
       </header>
