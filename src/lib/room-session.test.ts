@@ -71,6 +71,33 @@ test("transport reconnect rejoins with credentials, restores missed history and 
   assert.equal(received.length, 3);
 });
 
+for (const transient of ["Server error", "Too many attempts. Try again later."]) {
+  test(`Socket.IO transient recovery: ${transient}`, async (t) => {
+    const server = http.createServer();
+    const sockets = new Server(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    let joins = 0;
+    const times: number[] = [];
+    sockets.on("connection", (socket) => socket.on("join-room", (credentials) => {
+      assert.equal(credentials.password, "qa-password");
+      times.push(Date.now());
+      if (++joins === 1) {
+        socket.emit("join-error", transient, transient === "Server error"
+          ? { code: "SERVER_ERROR" } : { code: "RATE_LIMITED", retryAfterMs: 1100 });
+      } else socket.emit("room-snapshot", { history: [message(1)], users: ["qa"] });
+    }));
+    const socket = io(`http://127.0.0.1:${(server.address() as { port: number }).port}`);
+    const session = createRoomSession(socket, {
+      onState() {}, onSnapshot() {}, onJoined() {}, onError: assert.fail,
+    });
+    t.after(async () => { session.dispose(); socket.disconnect(); await new Promise<void>((resolve) => sockets.close(() => resolve())); });
+    session.join({ roomId: "qa", username: "mobile", password: "qa-password" });
+    await waitFor(() => session.isReady());
+    assert.equal(joins, 2);
+    assert.ok(times[1] - times[0] >= (transient === "Server error" ? 1000 : 1100));
+  });
+}
+
 test("wrong-password failure is not treated as a connected room", async (t) => {
   const server = http.createServer();
   const sockets = new Server(server);

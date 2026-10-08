@@ -10,6 +10,7 @@ import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
+import type { JoinErrorDetails } from "./src/lib/join-error";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -537,11 +538,13 @@ async function main() {
           io.to(roomId).emit("user-list", Array.from(users.values()));
         } catch (err) {
           if (typeof err === "object" && err && "msBeforeNext" in err) {
-            socket.emit("join-error", "Too many attempts. Try again later.");
+            socket.emit("join-error", "Too many attempts. Try again later.", {
+              code: "RATE_LIMITED", retryAfterMs: Number(err.msBeforeNext),
+            } satisfies JoinErrorDetails);
             return;
           }
           console.error("join-room error:", err);
-          socket.emit("join-error", "Server error");
+          socket.emit("join-error", "Server error", { code: "SERVER_ERROR" } satisfies JoinErrorDetails);
         }
       }
     );
