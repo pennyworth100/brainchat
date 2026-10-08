@@ -6,7 +6,7 @@ import path from "path";
 import multer from "multer";
 import crypto from "crypto";
 import fs from "fs";
-import { and, eq, desc } from "drizzle-orm";
+import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
@@ -145,6 +145,16 @@ async function loadMessagesSince(roomId: string, sinceMs: number) {
     .reverse()
     .map(deserializeMessage)
     .filter((m) => (m.ts || 0) > sinceMs);
+}
+
+async function loadMessagesAfterId(roomId: string, afterId: number) {
+  const rows = await db
+    .select()
+    .from(messagesTable)
+    .where(and(eq(messagesTable.roomId, roomId), gt(messagesTable.id, afterId)))
+    .orderBy(asc(messagesTable.id))
+    .limit(MAX_HISTORY);
+  return rows.map(deserializeMessage);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -380,11 +390,19 @@ async function main() {
         if (!isValidRoomId(rawRoomId))
           return res.status(400).json({ error: "Invalid room ID" });
         const roomId = normalizeRoomId(rawRoomId);
+        const rawAfterId = req.query.afterId;
+        const afterId = typeof rawAfterId === "string" && /^\d+$/.test(rawAfterId)
+          ? Number(rawAfterId)
+          : null;
+        if (rawAfterId !== undefined && (!Number.isSafeInteger(afterId) || afterId! < 0))
+          return res.status(400).json({ error: "Invalid afterId cursor" });
         const since = parseInt(req.query.since as string) || 0;
         if (!(await roomExists(roomId)))
           return res.status(404).json({ error: "Room not found" });
         const msgs =
-          since > 0
+          afterId !== null
+            ? await loadMessagesAfterId(roomId, afterId)
+            : since > 0
             ? await loadMessagesSince(roomId, since)
             : await loadHistory(roomId);
         res.json({ messages: msgs });
