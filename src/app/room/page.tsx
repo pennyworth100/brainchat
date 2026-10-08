@@ -14,6 +14,7 @@ import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
 import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
 import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
+import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -368,11 +369,19 @@ function RoomInner() {
   const msgInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const usernameRef = useRef<string | null>(null);
+  const knownMessageIdsRef = useRef(new Set<number>());
+  const unreadCountRef = useRef(0);
 
   // Keep usernameRef in sync
   useEffect(() => {
     usernameRef.current = username;
   }, [username]);
+
+  useEffect(() => {
+    if (!roomId) return;
+    document.title = roomDocumentTitle(roomId, unreadCountRef.current);
+    return () => { document.title = "Dimle"; };
+  }, [roomId]);
 
   // Redirect if no valid room ID
   useEffect(() => {
@@ -390,20 +399,39 @@ function RoomInner() {
 
   // Reconcile snapshots and live events by server ID, including events that
   // race with a history query or the HTTP upload response.
-  const receiveMessages = useCallback((incoming: ChatMessage[]) => {
+  const receiveMessages = useCallback((incoming: ChatMessage[], notify = false) => {
+    const unseen = incoming.filter((message) => !knownMessageIdsRef.current.has(message.id));
+    if (unseen.length === 0) return;
+    for (const message of unseen) knownMessageIdsRef.current.add(message.id);
+
+    if (notify && roomId) {
+      for (const message of unseen) {
+        if (!shouldNotifyRoomMessage(message, usernameRef.current, document.visibilityState)) continue;
+        unreadCountRef.current += 1;
+        document.title = roomDocumentTitle(roomId, unreadCountRef.current);
+        if ("Notification" in window && Notification.permission === "granted") {
+          const notification = new Notification(`${message.username} · ${roomId}`, {
+            body: roomNotificationBody(message),
+            tag: `dimle:${roomId}`,
+          });
+          notification.onclick = () => { window.focus(); notification.close(); };
+        }
+      }
+    }
+
     setTimeline((prev) => {
       const existing = prev.flatMap((item) => item.kind === "msg" ? [item.data] : []);
       const knownIds = new Set(existing.map((message) => message.id));
-      const unseen = incoming.filter((message) => !knownIds.has(message.id));
-      if (unseen.length === 0) return prev; // don't scroll on an unchanged health check
-      const merged = mergeMessages(existing, unseen);
+      const newMessages = unseen.filter((message) => !knownIds.has(message.id));
+      if (newMessages.length === 0) return prev; // don't scroll on an unchanged health check
+      const merged = mergeMessages(existing, newMessages);
       const keys = new Map(prev.flatMap((item) => item.kind === "msg" ? [[item.data.id, item.id] as const] : []));
       const items = merged.map((data) => ({ kind: "msg" as const, data, id: keys.get(data.id) ?? getId() }));
       let index = 0;
       const timeline = prev.map((item) => item.kind === "msg" ? items[index++] : item);
       return [...timeline, ...items.slice(index)];
     });
-  }, []);
+  }, [roomId]);
 
   // Socket connection
   useEffect(() => {
@@ -436,11 +464,15 @@ function RoomInner() {
       },
     });
     sessionRef.current = session;
-    const onMessage = (message: ChatMessage) => receiveMessages([message]);
+    const onMessage = (message: ChatMessage) => receiveMessages([message], true);
     socket.on("chat-message", onMessage);
     socket.on("chat-file", onMessage);
     socket.on("chat-image", onMessage);
     const resume = () => {
+      if (document.visibilityState === "visible") {
+        unreadCountRef.current = 0;
+        document.title = roomDocumentTitle(roomId, 0);
+      }
       if (document.visibilityState === "visible" && usernameRef.current) {
         session.sync().catch(() => {}); // status remains reconnecting, never stale online
       }
@@ -530,6 +562,9 @@ function RoomInner() {
   // ── Handlers ────────────────────────────────────────────────────────────
 
   const joinRoom = useCallback(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      void Notification.requestPermission().catch(() => {});
+    }
     const name = usernameInput.trim() || "User_" + Math.floor(10 + Math.random() * 90);
     setUsername(name);
     usernameRef.current = name;
