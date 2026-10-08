@@ -51,6 +51,7 @@ export function createRoomSession(
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let retries = 0;
   let probe: Promise<string> | null = null;
+  let healthProbe: Promise<string> | null = null;
   const waiters = new Set<{ resolve: (id: string) => void; reject: (err: Error) => void }>();
   const setState = (next: ConnectionState) => {
     state = next;
@@ -174,6 +175,30 @@ export function createRoomSession(
     return probe;
   };
 
+  // Periodic liveness must not fetch history, announce another join, or disable
+  // the editor. Foreground recovery and pre-send checks still use full sync().
+  const checkHealth = (): Promise<string> => {
+    if (healthProbe) return healthProbe;
+    if (disposed || !credentials) return Promise.reject(new Error("Join the room before sending"));
+    if (state !== "ready" || !socket.connected) return whenReady();
+    const generation = epoch;
+    healthProbe = new Promise<string>((resolve, reject) => {
+      socket.timeout(timeoutMs).emit("sync-room", { roomId: credentials!.roomId, probeOnly: true },
+        (err: Error | null, result?: { ok?: boolean; error?: string; history?: unknown; users?: unknown }) => {
+          if (disposed) return reject(new Error("Room closed"));
+          if (generation !== epoch) return void whenReady().then(resolve, reject);
+          // Older servers return a snapshot for this event. Accept that as a
+          // liveness ACK, without presenting it as another join or sync.
+          const healthy = result?.ok === true || (Array.isArray(result?.history) && Array.isArray(result?.users));
+          if (err || result?.error || !healthy) {
+            restart();
+          }
+          whenReady().then(resolve, reject);
+        });
+    }).finally(() => { healthProbe = null; });
+    return healthProbe;
+  };
+
   return {
     join(next: RoomCredentials) {
       if (disposed) return;
@@ -188,6 +213,7 @@ export function createRoomSession(
       socket.connect();
     },
     sync,
+    checkHealth,
     async reconnect() {
       if (state === "error" && credentials) {
         if (retryTimer) throw new Error("Please wait before retrying the connection.");

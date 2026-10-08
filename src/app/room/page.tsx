@@ -499,7 +499,11 @@ function RoomInner() {
     window.addEventListener("pageshow", resume);
     window.addEventListener("online", resume);
     window.addEventListener("focus", resume);
-    const healthTimer = window.setInterval(resume, 15_000);
+    const healthTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && usernameRef.current) {
+        session.checkHealth().catch(() => {});
+      }
+    }, 15_000);
 
     socket.on("system-message", (text: string) => {
       setTimeline((prev) => [...prev, { kind: "sys", text, id: getId() }]);

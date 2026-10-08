@@ -61,6 +61,15 @@ async function main() {
     wrongPassword.emit("join-room", { roomId, username: "wrong-password", password: "incorrect" });
     assert.equal((await wrongPasswordError)[0], "Wrong password");
     console.log("PASS room creation/claim, correct password join and wrong password rejection");
+    assert.deepEqual(await mobile.timeout(2000).emitWithAck("sync-room", { roomId, probeOnly: true }), { ok: true });
+    for (const payload of [{ roomId, probeOnly: true }, null, {}, { roomId: 42, probeOnly: true }]) {
+      const denied = await outsider.timeout(2000).emitWithAck("sync-room", payload);
+      assert.deepEqual(denied, { error: "Rejoin the room" });
+    }
+    assert.deepEqual(await mobile.timeout(2000).emitWithAck("sync-room", { roomId: "wrong999", probeOnly: true }), { error: "Rejoin the room" });
+    await session.checkHealth();
+    assert.equal(session.isReady(), true);
+    console.log("PASS quiet membership probe has no history; malformed, outsider and wrong-room probes denied");
     const sent = await desktop.timeout(2000).emitWithAck("send-message", { roomId, message: "before interruption" });
     assert.ok(sent.message.id);
     await session.sync();

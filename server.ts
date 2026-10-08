@@ -615,11 +615,15 @@ async function main() {
       }
     );
 
-    socket.on("sync-room", async ({ roomId }: { roomId: string }, ack) => {
+    socket.on("sync-room", async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack) => {
       if (typeof ack !== "function") return;
-      if (roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
+      const roomId = payload?.roomId;
+      if (typeof roomId !== "string" || roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
         return ack({ error: "Rejoin the room" });
       }
+      // Membership/transport liveness only, not database or history readiness.
+      // Keep the existing event for rolling compatibility with older clients.
+      if (payload?.probeOnly === true) return ack({ ok: true });
       try {
         const history = await loadHistory(roomId);
         if (!socket.connected) return;
