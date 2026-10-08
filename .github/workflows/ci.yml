@@ -38,6 +38,7 @@ jobs:
       UPLOAD_DIR: /tmp/dimle-ci-uploads
       PORT: "3302"
       QA_BASE_URL: http://127.0.0.1:3302
+      ALFRED_API_KEY: ci-alfred-key
     steps:
       - name: Checkout
         uses: actions/checkout@v4

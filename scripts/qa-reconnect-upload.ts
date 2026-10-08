@@ -67,6 +67,20 @@ async function main() {
     const oldId = mobile.id;
     mobile.disconnect();
     const missed = await desktop.timeout(2000).emitWithAck("send-message", { roomId, message: "sent while mobile offline" });
+    const unauthorizedApi = await fetch(`${base}/api/messages/${roomId}?afterId=${sent.message.id}`);
+    assert.equal(unauthorizedApi.status, 401);
+    const cursorResponse = await fetch(`${base}/api/messages/${roomId}?afterId=${sent.message.id}`, {
+      headers: { "x-api-key": "ci-alfred-key" },
+    });
+    assert.equal(cursorResponse.status, 200);
+    const cursorMessages = (await cursorResponse.json()).messages as ChatMessage[];
+    assert.ok(cursorMessages.some((message) => message.id === missed.message.id));
+    assert.ok(cursorMessages.every((message) => message.id > sent.message.id));
+    const invalidCursor = await fetch(`${base}/api/messages/${roomId}?afterId=not-a-number`, {
+      headers: { "x-api-key": "ci-alfred-key" },
+    });
+    assert.equal(invalidCursor.status, 400);
+    console.log("PASS authenticated message cursor returns only IDs after the requested event");
     await session.reconnect();
     assert.notEqual(mobile.id, oldId);
     assert.equal(history.filter((m) => m.id === missed.message.id).length, 1);
