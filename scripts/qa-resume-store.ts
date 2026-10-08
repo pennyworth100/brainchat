@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
+import { claimRoomPolicy } from "../src/lib/room-policy";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
 async function main() {
@@ -20,7 +21,7 @@ const check = (value: unknown) => { assert.ok(value); checks++; };
 try {
   await a.query('CREATE SCHEMA "' + schema + '"');
   for (const client of [a, b]) await client.query('SET search_path TO "' + schema + '"');
-  await a.query("CREATE TABLE rooms (id text PRIMARY KEY)");
+  await a.query("CREATE TABLE rooms (id text PRIMARY KEY, password_hash text, creation_token_hash text)");
   // Apply the actual generated additive migration, scoped to our private fixture.
   const sql = (await readFile("drizzle/0004_long_nighthawk.sql", "utf8"))
     .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"');
@@ -247,7 +248,48 @@ try {
   check(await count() === 2);
   await a.query("DELETE FROM rooms WHERE id = 'candy986'");
   check(Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count) === 0);
-  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated generated migrations + independent DB clients, CAS and durable-operation lock races; not socket resume" }));
+  // A claim consumes the token and increments policy in ONE write. A second
+  // claimant actually waits on the first updater, then loses without mutation.
+  await a.query("INSERT INTO rooms (id, creation_token_hash) VALUES ('claim123', 'claim-token')");
+  check(await first.issueAfterAuthenticatedJoin("claim123", "Guest", 1) === null);
+  check(await claimRoomPolicy(a, "claim123", "wrong-token", "wrong-password") === null);
+  await a.query("BEGIN");
+  const claim = await claimRoomPolicy(a, "claim123", "claim-token", "password-A");
+  check(claim?.authVersion === 2 && claim.passwordHash === "password-A" && claim.creationTokenHash === null);
+  const losingClaim = claimRoomPolicy(b, "claim123", "claim-token", "password-B");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await losingClaim === null);
+  const claimedRow = (await a.query("SELECT * FROM rooms WHERE id = 'claim123'")).rows[0];
+  check(claimedRow.auth_version === 2 && claimedRow.password_hash === "password-A" && claimedRow.creation_token_hash === null);
+  check(await second.issueAfterAuthenticatedJoin("claim123", "Guest", 1) === null);
+  check((await second.issueAfterAuthenticatedJoin("claim123", "x".repeat(64), 2))?.username.length === 64);
+  await assert.rejects(first.issueAfterAuthenticatedJoin("claim123", "x".repeat(65), 2)); checks++;
+
+  // Policy wins first: issuance blocks on the real row lock and rechecks the
+  // version after commit; its older statement snapshot cannot mint a token.
+  const beforePolicyIssue = Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count);
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'claim123'");
+  const pendingIssue = second.issueAfterAuthenticatedJoin("claim123", "Stale auth", 2);
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await pendingIssue === null);
+  check(Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count) === beforePolicyIssue);
+
+  // Issuance wins first: its SHARE lock holds the policy updater until commit.
+  await a.query("BEGIN");
+  const issuedBeforePolicy = await first.issueAfterAuthenticatedJoin("claim123", "Fresh auth", 3);
+  assert.ok(issuedBeforePolicy);
+  const waitingPolicy = b.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'claim123'");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  await waitingPolicy;
+  const oldCredential = { roomId: "claim123", sessionId: issuedBeforePolicy.sessionId, token: issuedBeforePolicy.token };
+  check(await first.lookup(oldCredential) === null);
+  check(await first.advanceGeneration(oldCredential, 0, opA, socketA) === null);
+  check((await first.issueAfterAuthenticatedJoin("claim123", "Current auth", 4))?.authVersion === 4);
+  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, independent DB clients, claim/issue policy races, CAS and durable-operation locks; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
   await a.query('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE');

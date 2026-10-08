@@ -2,6 +2,26 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { hashResumeToken, ResumeStore } from "./resume-store";
+import { claimRoomPolicy } from "./room-policy";
+
+test("issuance preserves the existing 64-character username boundary", async () => {
+  let calls = 0;
+  const store = new ResumeStore({ query: async () => { calls++; return { rowCount: 0, rows: [] }; } } as never);
+  assert.equal(await store.issueAfterAuthenticatedJoin("candy986", "x".repeat(64), 1), null);
+  for (const name of ["", "   ", "x".repeat(65)]) {
+    await assert.rejects(store.issueAfterAuthenticatedJoin("candy986", name, 1), /Invalid authenticated join/);
+  }
+  assert.equal(calls, 1);
+});
+
+test("claim fails closed for absent token and database errors", async () => {
+  let calls = 0;
+  const database = { query: async () => { calls++; throw new Error("offline"); } } as never;
+  assert.equal(await claimRoomPolicy(database, "candy986", "", null), null);
+  assert.equal(calls, 0);
+  await assert.rejects(claimRoomPolicy(database, "candy986", "verified-hash", null), /offline/);
+  assert.equal(calls, 1);
+});
 
 test("resume token parser rejects malformed and noncanonical bearer values", () => {
   for (const value of [null, undefined, {}, 42, "", "a".repeat(42), "a".repeat(44), "!".repeat(43), "_".repeat(43)]) {

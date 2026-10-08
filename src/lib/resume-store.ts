@@ -29,18 +29,26 @@ export class ResumeStore {
 
   // Caller must authenticate a normal join first and pass the authVersion
   // observed during that authentication. Never accept it from a client.
+  // SHARE serializes issuance with policy updates; READ COMMITTED rechecks the
+  // version after a wait. An unclaimed room cannot issue credentials. Success
+  // is only a credential, not admission: CAS/binding must still authorize it.
   async issueAfterAuthenticatedJoin(roomId: string, username: string, authVersion: number) {
     if (typeof roomId !== "string" || !isValidRoomId(roomId) || typeof username !== "string" ||
-        !username.trim() || username.length > 32 ||
+        !username.trim() || username.length > 64 ||
         !Number.isSafeInteger(authVersion) || authVersion < 1) throw new Error("Invalid authenticated join");
     const token = randomBytes(32).toString("base64url");
     const sessionId = randomUUID();
     const result = await this.database.query<ResumeIdentity>(`
+      WITH authorized_room AS MATERIALIZED (
+        SELECT id, auth_version FROM rooms
+        WHERE id = $3 AND auth_version = $5 AND creation_token_hash IS NULL
+        FOR SHARE
+      )
       INSERT INTO room_resume_sessions
         (id, token_hash, room_id, username, auth_version, issued_at, expires_at)
       SELECT $1, $2, id, $4, auth_version, statement_timestamp(),
              statement_timestamp() + interval '24 hours'
-      FROM rooms WHERE id = $3 AND auth_version = $5
+      FROM authorized_room
       RETURNING id AS "sessionId", room_id AS "roomId", username,
         auth_version AS "authVersion", generation, issued_at AS "issuedAt", expires_at AS "expiresAt"
     `, [sessionId, hashResumeToken(token), roomId, username, authVersion]);

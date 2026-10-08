@@ -17,6 +17,7 @@ import {
 } from "./src/lib/agent-api-auth";
 import type { JoinErrorDetails } from "./src/lib/join-error";
 import { registerPrivateMessages } from "./src/lib/private-message";
+import { claimRoomPolicy } from "./src/lib/room-policy";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -565,21 +566,12 @@ async function main() {
             }
 
             const passwordHash = password ? await hashPassword(password) : null;
-            const [claimed] = await db
-              .update(roomsTable)
-              .set({ passwordHash, creationTokenHash: null })
-              .where(
-                and(
-                  eq(roomsTable.id, roomId),
-                  eq(roomsTable.creationTokenHash, room.creationTokenHash)
-                )
-              )
-              .returning();
+            const claimed = await claimRoomPolicy(pool, roomId, room.creationTokenHash, passwordHash);
             if (!claimed) {
               socket.emit("join-error", "Room was already claimed");
               return;
             }
-            room = claimed;
+            room = { ...room, ...claimed };
           } else if (
             room.passwordHash &&
             !(await verifyPassword(room.passwordHash, password || ""))
