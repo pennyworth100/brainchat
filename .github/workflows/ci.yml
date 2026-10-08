@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - "fix/**"
+      - "feat/**"
       - "integration/**"
 
 permissions:
@@ -39,6 +40,7 @@ jobs:
       PORT: "3302"
       QA_BASE_URL: http://127.0.0.1:3302
       ALFRED_API_KEY: ci-alfred-key
+      DIMLE_AGENT_API_KEYS_JSON: '{"elon":{"username":"Elon","key":"ci-elon-key-123456"}}'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -81,6 +81,44 @@ async function main() {
     });
     assert.equal(invalidCursor.status, 400);
     console.log("PASS authenticated message cursor returns only IDs after the requested event");
+
+    const agentEvent = once<ChatMessage>(desktop, "chat-message");
+    const agentPayload = {
+      roomId,
+      username: "Mallory",
+      message: "idempotent agent message",
+      clientMessageId: "qa-agent-message-1",
+    };
+    const firstAgentSend = await fetch(`${base}/api/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "ci-elon-key-123456" },
+      body: JSON.stringify(agentPayload),
+    });
+    assert.equal(firstAgentSend.status, 200);
+    const firstAgentResult = await firstAgentSend.json();
+    assert.equal(firstAgentResult.deduplicated, false);
+    assert.equal(firstAgentResult.message.username, "Elon");
+    assert.equal((await agentEvent)[0].id, firstAgentResult.message.id);
+
+    const duplicateEvent = expectNoEvent(desktop, "chat-message");
+    const duplicateAgentSend = await fetch(`${base}/api/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "ci-elon-key-123456" },
+      body: JSON.stringify(agentPayload),
+    });
+    assert.equal(duplicateAgentSend.status, 200);
+    const duplicateAgentResult = await duplicateAgentSend.json();
+    assert.equal(duplicateAgentResult.deduplicated, true);
+    assert.equal(duplicateAgentResult.message.id, firstAgentResult.message.id);
+    assert.equal(duplicateAgentResult.message.message, agentPayload.message);
+    const conflictingAgentSend = await fetch(`${base}/api/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "ci-elon-key-123456" },
+      body: JSON.stringify({ ...agentPayload, message: "must not overwrite the first write" }),
+    });
+    assert.equal(conflictingAgentSend.status, 409);
+    await duplicateEvent;
+    console.log("PASS server-owned agent identity; exact retries broadcast once; conflicting key reuse is rejected");
     await session.reconnect();
     assert.notEqual(mobile.id, oldId);
     assert.equal(history.filter((m) => m.id === missed.message.id).length, 1);

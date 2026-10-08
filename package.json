@@ -1,12 +1,12 @@
 {
   "name": "dimle",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "description": "Dimle — chat rooms, now on Next.js",
   "private": true,
   "scripts": {
     "dev": "tsx server.ts",
     "build": "next build",
-    "test": "node --import tsx --test src/**/*.test.ts",
+    "test": "node --import tsx --test src/**/*.test.ts && npm --prefix plugins/openclaw-dimle test",
     "start": "node --import tsx server.ts",
     "db:migrate": "node --import tsx src/lib/db/migrate.ts",
     "db:generate": "drizzle-kit generate"

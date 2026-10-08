@@ -1,0 +1,28 @@
+{
+  "name": "@dimle/openclaw-channel",
+  "version": "3.0.5",
+  "description": "Native Dimle channel for OpenClaw",
+  "type": "module",
+  "license": "UNLICENSED",
+  "files": [
+    "index.js",
+    "setup-entry.js",
+    "openclaw.plugin.json",
+    "src"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.9.8"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "setupEntry": "./setup-entry.js",
+    "channel": {
+      "id": "dimle",
+      "label": "Dimle",
+      "blurb": "Connect OpenClaw agents to Dimle rooms."
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
