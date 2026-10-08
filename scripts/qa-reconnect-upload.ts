@@ -167,6 +167,40 @@ async function main() {
     assert.equal(history.filter((m) => m.id === result.message.id).length, 1);
     console.log("PASS PDF upload/download byte match; HTTP response/live/history produce one message");
 
+    // Harmless consecutive dots are not parent-directory path segments.
+    for (const name of ["report..txt", "report...txt", "report..final.txt"]) {
+      const contents = "attachment: " + name;
+      const uploaded = await uploadRoomFile(new File([contents], name), roomId, session, request);
+      const response = await fetch(base + uploaded.message.url);
+      assert.equal(response.status, 200, name);
+      assert.equal(await response.text(), contents);
+      assert.equal(response.headers.get("content-disposition"), "attachment");
+      assert.equal(response.headers.get("cross-origin-resource-policy"), "same-origin");
+      await session.sync();
+      assert.equal(history.filter((m) => m.id === uploaded.message.id).length, 1);
+    }
+    // Send raw request targets: fetch/URL would normalize literal ../ first.
+    for (const [target, status] of [
+      ["/uploads/../package.json", 403],
+      ["/uploads/%2e%2e/package.json", 403],
+      ["/uploads/token/%2E%2E/package.json", 403],
+      ["/uploads/token%2f..%2fpackage.json", 403],
+      ["/uploads/token%5c..%5cpackage.json", 403],
+      ["/uploads/%zz", 400],
+    ] as const) {
+      const actual = await new Promise<number>((resolve, reject) => {
+        const url = new URL(base);
+        const req = http.get({ hostname: url.hostname, port: url.port, path: target }, (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode!));
+        });
+        req.setTimeout(5000, () => req.destroy(new Error("Upload path probe timed out")));
+        req.on("error", reject);
+      });
+      assert.equal(actual, status, target);
+    }
+    console.log("PASS dotted attachment names round-trip; raw/encoded traversal and malformed paths rejected");
+
     // A rejected upload must not close the room socket.
     const broken = await fetch(`${base}/api/upload`, { method: "POST", headers: { "x-room-id": roomId, "x-socket-id": mobile.id! }, body: new FormData() });
     assert.equal(broken.status, 400);

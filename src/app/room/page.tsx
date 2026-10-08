@@ -854,7 +854,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v3.0.6
+            v3.0.7
           </span>
         </div>
       </header>
