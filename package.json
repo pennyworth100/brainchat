@@ -1,6 +1,6 @@
 {
   "name": "dimle",
-  "version": "3.0.9",
+  "version": "3.0.10",
   "description": "Dimle — chat rooms, now on Next.js",
   "private": true,
   "scripts": {
