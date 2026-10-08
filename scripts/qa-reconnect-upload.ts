@@ -162,6 +162,24 @@ async function main() {
     assert.equal(history.filter((m) => m.url === legacy.url).length, 1);
     console.log("PASS v3.0.1 upload response and send-file compatibility (no duplicate)");
 
+    let rateLimited = false;
+    for (let attempt = 0; attempt < 10 && !rateLimited; attempt++) {
+      const failure = new Promise<{ message: string; details?: { code: string; retryAfterMs: number } }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Join limiter response timed out")), 5000);
+        wrongPassword.once("join-error", (message, details) => { clearTimeout(timer); resolve({ message, details }); });
+      });
+      wrongPassword.emit("join-room", { roomId, username: "wrong-password", password: "incorrect" });
+      const result = await failure;
+      if (result.message === "Too many attempts. Try again later.") {
+        assert.equal(result.details?.code, "RATE_LIMITED");
+        assert.ok(result.details!.retryAfterMs > 0);
+        assert.ok(result.details!.retryAfterMs <= 60_000);
+        rateLimited = true;
+      } else assert.equal(result.message, "Wrong password");
+    }
+    assert.equal(rateLimited, true);
+    console.log("PASS real PostgreSQL join limiter retains legacy message plus typed retryAfter");
+
     const roomCreationStatuses: number[] = [];
     for (let attempt = 0; attempt < 10; attempt += 1) {
       roomCreationStatuses.push((await fetch(`${base}/api/rooms`, { method: "POST" })).status);

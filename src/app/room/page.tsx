@@ -427,10 +427,12 @@ function RoomInner() {
         setJoinError("");
         sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
       },
-      onError: (message) => {
+      onError: (message, terminal = true) => {
         setJoinError(message);
-        setUsername(null);
-        usernameRef.current = null;
+        if (terminal) {
+          setUsername(null);
+          usernameRef.current = null;
+        }
       },
     });
     sessionRef.current = session;
@@ -756,8 +758,18 @@ function RoomInner() {
             }}
           >
             <span role="status" aria-live="polite">
-              {connectionState === "ready" ? `${userCount} online` : connectionState === "syncing" ? "Syncing…" : username ? "Reconnecting…" : "Not connected"}
+              {connectionState === "ready" ? `${userCount} online` : connectionState === "error" ? (joinError || "Connection failed") : connectionState === "syncing" ? "Syncing…" : username ? "Reconnecting…" : "Not connected"}
             </span>
+            {connectionState === "error" && username && (
+              <button
+                className="ml-2 underline"
+                title={joinError || "Retry room connection"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void sessionRef.current?.reconnect().catch((error: Error) => setJoinError(error.message));
+                }}
+              >Retry</button>
+            )}
             {showParticipants && (
               <div
                 className="absolute top-[calc(100%+8px)] right-0 bg-dimle-card border border-dimle-border rounded-2xl p-3 min-w-[160px] max-w-[220px] z-50 shadow-[0_8px_24px_rgba(0,0,0,0.08)]"
@@ -790,7 +802,7 @@ function RoomInner() {
             )}
           </span>
           <span className="version text-xs text-dimle-text-muted bg-dimle-surface border border-dimle-border px-2 py-0.5 rounded-full font-mono tracking-tight select-none">
-            v3.0.3
+            v3.0.4
           </span>
         </div>
       </header>

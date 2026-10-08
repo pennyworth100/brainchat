@@ -1,4 +1,5 @@
 import type { Socket } from "socket.io-client";
+import { transientJoinDelay, type JoinErrorDetails } from "./join-error";
 
 export type ConnectionState = "idle" | "reconnecting" | "syncing" | "ready" | "error";
 export interface RoomCredentials {
@@ -38,7 +39,7 @@ export function createRoomSession(
     onState: (state: ConnectionState) => void;
     onSnapshot: (snapshot: RoomSnapshot) => void;
     onJoined: () => void;
-    onError: (message: string) => void;
+    onError: (message: string, terminal?: boolean) => void;
   },
   timeoutMs = 10_000
 ) {
@@ -47,6 +48,8 @@ export function createRoomSession(
   let disposed = false;
   let epoch = 0;
   let joinTimer: ReturnType<typeof setTimeout> | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let retries = 0;
   let probe: Promise<string> | null = null;
   const waiters = new Set<{ resolve: (id: string) => void; reject: (err: Error) => void }>();
   const setState = (next: ConnectionState) => {
@@ -54,29 +57,32 @@ export function createRoomSession(
     callbacks.onState(next);
   };
   const clearJoinTimer = () => { clearTimeout(joinTimer); joinTimer = undefined; };
+  const clearRetryTimer = () => { clearTimeout(retryTimer); retryTimer = undefined; };
   const rejectWaiters = (message: string) => {
     for (const waiter of waiters) waiter.reject(new Error(message));
     waiters.clear();
   };
   const restart = () => {
-    if (disposed || !credentials) return;
+    if (disposed || !credentials || retryTimer || state === "error") return;
     socket.disconnect();
     socket.connect();
   };
   const onConnect = () => {
-    if (!credentials || disposed) return;
+    if (!credentials || disposed || retryTimer || state === "error") return;
     const generation = ++epoch;
     setState("syncing");
     clearJoinTimer();
     joinTimer = setTimeout(() => {
-      if (generation === epoch) restart();
+      if (generation === epoch) onJoinError("Server error", { code: "SERVER_ERROR" });
     }, timeoutMs);
     // Credentials stay only in memory; never persist the room password.
     socket.emit("join-room", credentials);
   };
   const onSnapshot = (snapshot: RoomSnapshot) => {
-    if (!credentials || disposed) return;
+    if (!credentials || disposed || state !== "syncing") return;
     clearJoinTimer();
+    clearRetryTimer();
+    retries = 0;
     callbacks.onSnapshot(snapshot);
     delete credentials.creationToken;
     callbacks.onJoined();
@@ -89,18 +95,38 @@ export function createRoomSession(
   const onDisconnect = () => {
     ++epoch;
     clearJoinTimer();
-    if (credentials && !disposed) setState("reconnecting");
+    if (credentials && !disposed && state !== "error") setState("reconnecting");
   };
-  const onJoinError = (message: string) => {
+  const onJoinError = (message: string, details?: JoinErrorDetails) => {
+    if (disposed || !credentials) return;
     ++epoch;
     clearJoinTimer();
-    credentials = null;
+    const delay = transientJoinDelay(message, details);
+    if (delay !== null) {
+      if (retryTimer || state === "error") return;
+      if (retries < 3) {
+        const backoff = 1000 * 2 ** retries++;
+        setState("reconnecting");
+        retryTimer = setTimeout(() => {
+          retryTimer = undefined;
+          restart();
+        }, Math.max(delay, backoff) + Math.floor(Math.random() * 250));
+        return;
+      }
+      // Keep credentials only in memory for an explicit Retry.
+      // Even an explicit retry must not bypass the last server cooldown.
+      retryTimer = setTimeout(() => { retryTimer = undefined; }, delay);
+    } else {
+      clearRetryTimer();
+      credentials = null;
+    }
     setState("error");
-    callbacks.onError(message);
+    callbacks.onError(message, delay === null);
     rejectWaiters(message);
   };
   const whenReady = (): Promise<string> => {
     if (disposed || !credentials) return Promise.reject(new Error("Join the room before sending"));
+    if (state === "error") return Promise.reject(new Error("Connection failed. Please retry."));
     if (state === "ready" && socket.connected && socket.id) return Promise.resolve(socket.id);
     return new Promise((resolve, reject) => {
       const waiter = {
@@ -150,12 +176,24 @@ export function createRoomSession(
 
   return {
     join(next: RoomCredentials) {
+      if (disposed) return;
+      ++epoch;
+      clearJoinTimer();
+      clearRetryTimer();
+      rejectWaiters("Room changed");
+      retries = 0;
+      socket.disconnect();
       credentials = { ...next };
-      if (socket.connected) onConnect();
-      else { setState("reconnecting"); socket.connect(); }
+      setState("reconnecting");
+      socket.connect();
     },
     sync,
     async reconnect() {
+      if (state === "error" && credentials) {
+        if (retryTimer) throw new Error("Please wait before retrying the connection.");
+        retries = 0;
+        setState("reconnecting");
+      }
       restart();
       return whenReady();
     },
@@ -165,6 +203,7 @@ export function createRoomSession(
       ++epoch;
       credentials = null;
       clearJoinTimer();
+      clearRetryTimer();
       rejectWaiters("Room closed");
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
