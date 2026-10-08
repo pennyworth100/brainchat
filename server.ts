@@ -330,7 +330,8 @@ async function main() {
       } catch {
         return res.status(400).end();
       }
-      if (rel.includes("..")) return res.status(403).end();
+      // Reject parent-directory segments, not ordinary names like report..pdf.
+      if (rel.split(/[\\/]/).includes("..")) return res.status(403).end();
       nxt();
     },
     express.static(UPLOAD_DIR, {
