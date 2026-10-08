@@ -36,6 +36,13 @@
       "when": 1791497873756,
       "tag": "0004_long_nighthawk",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791499083632,
+      "tag": "0005_free_blazing_skull",
+      "breakpoints": true
     }
   ]
 }

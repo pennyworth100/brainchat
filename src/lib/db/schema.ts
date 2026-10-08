@@ -53,6 +53,8 @@ export const roomResumeSessions = pgTable("room_resume_sessions", {
   username: text("username").notNull(),
   authVersion: integer("auth_version").notNull(),
   generation: integer("generation").default(0).notNull(),
+  lastOperationId: text("last_operation_id"),
+  lastTransportId: text("last_transport_id"),
   issuedAt: timestamp("issued_at", { withTimezone: true }).defaultNow().notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),

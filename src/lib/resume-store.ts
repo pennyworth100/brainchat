@@ -66,6 +66,42 @@ export class ResumeStore {
     return result.rows[0] ?? null;
   }
 
+  // Persistence CAS only; this does NOT install membership or evict a socket.
+  // transportId must be a server-owned, globally unique connection incarnation,
+  // never a client-provided value. ACK retry is valid only on that same transport.
+  // After transport loss, lookup recovers generation without granting membership;
+  // a fresh operation is needed. A CAS loser must not automatically steal it back.
+  async advanceGeneration(credential: ResumeCredential, expectedGeneration: number,
+    operationId: string, transportId: string): Promise<ResumeIdentity | null> {
+    if (!validCredential(credential) || !Number.isInteger(expectedGeneration) ||
+        expectedGeneration < 0 || expectedGeneration >= 2_147_483_647 ||
+        typeof operationId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(operationId) ||
+        typeof transportId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(transportId)) return null;
+    const tokenHash = hashResumeToken(credential.token);
+    if (!tokenHash) return null;
+    // Room share lock serializes with policy changes/deletion. UPDATE rechecks
+    // the session predicate after any competing updater commits (READ COMMITTED).
+    // Only one bounded operation receipt per session, expiring with the session.
+    const result = await this.database.query<ResumeIdentity>(`
+      WITH authorized_room AS MATERIALIZED (
+        SELECT id, auth_version FROM rooms WHERE id = $3 FOR SHARE
+      )
+      UPDATE room_resume_sessions s
+      SET generation = CASE WHEN s.generation = $4 THEN s.generation + 1 ELSE s.generation END,
+          last_operation_id = $5, last_transport_id = $6
+      FROM authorized_room r
+      WHERE s.id = $1 AND s.token_hash = $2 AND s.room_id = r.id
+        AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
+        AND s.auth_version = r.auth_version
+        AND ((s.generation = $4 AND s.last_operation_id IS DISTINCT FROM $5)
+          OR (s.generation = $4 + 1 AND s.last_operation_id = $5 AND s.last_transport_id = $6))
+      RETURNING s.id AS "sessionId", s.room_id AS "roomId", s.username,
+        s.auth_version AS "authVersion", s.generation,
+        s.issued_at AS "issuedAt", s.expires_at AS "expiresAt"
+    `, [credential.sessionId, tokenHash, credential.roomId, expectedGeneration, operationId, transportId]);
+    return result.rows[0] ?? null;
+  }
+
   // Future leave handler must additionally check the current socket binding.
   // Generation predicate prevents a stale generation from revoking its successor.
   async revoke(credential: ResumeCredential, generation: number): Promise<boolean> {

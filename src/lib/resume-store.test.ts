@@ -26,3 +26,18 @@ test("invalid credentials never reach persistence; DB failure never authorizes",
   await assert.rejects(store.issueAfterAuthenticatedJoin("candy986", "Alfred", 1), /offline/);
   assert.equal(calls, 2);
 });
+
+test("generation CAS rejects invalid inputs before DB and propagates DB failure", async () => {
+  let calls = 0;
+  const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);
+  const credential = { roomId: "candy986", sessionId: "b4b7467b-978a-4323-b151-0de94c57d598", token: randomBytes(32).toString("base64url") };
+  for (const generation of [-1, 0.5, NaN, Infinity, 2_147_483_647]) {
+    assert.equal(await store.advanceGeneration(credential, generation, "operation_123456", "transport_123456"), null);
+  }
+  assert.equal(await store.advanceGeneration(credential, 0, "short", "transport_123456"), null);
+  assert.equal(await store.advanceGeneration(credential, 0, "operation_123456", ""), null);
+  assert.equal(await store.advanceGeneration({ ...credential, token: "bad" }, 0, "operation_123456", "transport_123456"), null);
+  assert.equal(calls, 0);
+  await assert.rejects(store.advanceGeneration(credential, 0, "operation_1234567", "transport_1234567"), /offline/);
+  assert.equal(calls, 1);
+});
