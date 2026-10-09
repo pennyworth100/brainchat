@@ -373,10 +373,15 @@ try {
     options: "-c search_path=" + schema, max: 1 });
   try {
     const parallelWriter = new ResumeMessageWriter(new ResumeOperationGate(parallelPool, bindings));
-    const sameKey = await Promise.all([writer.saveOnce(retryBinding, "same-key", "text"),
-      parallelWriter.saveOnce(retryBinding, "same-key", "text")]);
+    const sameKey = await Promise.all([writer.saveOnceWithOutcome(retryBinding, "same-key", "text"),
+      parallelWriter.saveOnceWithOutcome(retryBinding, "same-key", "text")]);
     check(sameKey.every(r => r.authorized));
-    check(sameKey[0].authorized && sameKey[1].authorized && sameKey[0].value.id === sameKey[1].value.id);
+    check(sameKey[0].authorized && sameKey[1].authorized && sameKey[0].value.message.id === sameKey[1].value.message.id);
+    check(sameKey.filter(r => r.authorized && r.value.inserted).length === 1);
+    check(sameKey.filter(r => r.authorized && !r.value.inserted).length === 1);
+    const compatibleReceipt = await writer.saveOnce(retryBinding, "same-key", "text");
+    check(compatibleReceipt.authorized && sameKey[0].authorized &&
+      compatibleReceipt.value.id === sameKey[0].value.message.id);
     check(await retryCount() === 1);
     await assert.rejects(writer.saveOnce(retryBinding, "same-key", "changed"), /identity conflict/); checks++;
     check(await retryCount() === 1);
@@ -405,15 +410,16 @@ try {
       }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
     } };
     const lostAckWriter = new ResumeMessageWriter(new ResumeOperationGate(lostAckPool, bindings));
-    await assert.rejects(lostAckWriter.saveOnce(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
+    await assert.rejects(lostAckWriter.saveOnceWithOutcome(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
     check(commitAttempts === 1 && await retryCount() === 5);
     const successorIdentity = await first.advanceGeneration(retryCredential, 1, opB, "transport_" + retrySession.sessionId + "_successor");
     assert.ok(successorIdentity);
     const successor = await bindings.activate(successorIdentity, "transport_" + successorIdentity.sessionId + "_successor", async () => {}, () => true);
     assert.ok(successor);
     check(!(await writer.saveOnce(retryBinding, "lost-ack", "durable")).authorized);
-    const resolved = await writer.saveOnce(successor, "lost-ack", "durable");
-    check(resolved.authorized && resolved.value.message === "durable");
+    const resolved = await writer.saveOnceWithOutcome(successor, "lost-ack", "durable");
+    check(resolved.authorized && resolved.value.message.message === "durable");
+    check(resolved.authorized && resolved.value.inserted === false);
     check(await retryCount() === 5);
     // Receipt insertion failure rolls back its preceding message INSERT.
     await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_reject CHECK (client_message_id <> 'rollback-key')");
@@ -422,7 +428,7 @@ try {
     check(await retryCount() === 5);
     check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE client_message_id = 'rollback-key'")).rows[0].count) === 0);
     assert.ok(resolved.authorized);
-    await a.query("DELETE FROM messages WHERE id = $1", [resolved.value.id]);
+    await a.query("DELETE FROM messages WHERE id = $1", [resolved.value.message.id]);
     await assert.rejects(writer.saveOnce(successor, "lost-ack", "durable"), /no longer available/); checks++;
     check(await retryCount() === 4);
     check(await first.revoke(retryCredential, 2));

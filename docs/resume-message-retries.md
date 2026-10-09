@@ -4,6 +4,16 @@ No public handler uses this API. This is database idempotency, not exactly-once
 network publication. Plain save remains explicitly non-idempotent; retrying
 callers must use saveOnce with the same key and exact payload.
 
+Publication adapters must use `saveOnceWithOutcome`: its authorized value is
+`{ message, inserted }`, available only after acknowledged COMMIT. Exactly one
+serialized same-session/key insertion returns `inserted: true`; existing receipts
+return `false`, including resolution after a lost COMMIT acknowledgment. The
+compatible `saveOnce` API projects only `message` from that same implementation.
+Neither flag authorizes a stale socket: recheck exact ownership and membership
+before ACK/fanout. Do not rebroadcast an existing receipt, including retries after
+partial outbound failure. This is not an outbox or exactly-once publication:
+COMMIT followed by a crash can lose fanout; history reconciliation is still needed.
+
 - Namespace: immutable server session ID plus 1–128 ASCII alphanumeric, dash or
   underscore clientMessageId. Never username, socket ID, or generation.
 - The authorization gate locks room SHARE then session UPDATE. Only after
