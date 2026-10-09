@@ -1,6 +1,6 @@
 # Read-only upload reconciliation contract (3.0.11 draft)
 
-Status: private contract, bounded **ledger-only** collector and adversarial fixture
+Status: private contract, bounded **database-only** collector and adversarial fixture
 proof, NOT a complete reconciliation collector. No scheduler, public route, cleanup, refund, retry or deployment is
 enabled. The ledger remains monotonic. This contract does not grant repair authority.
 
@@ -104,8 +104,35 @@ The isolated PostgreSQL harness now verifies full/capped/exact-bound pagination,
 a real lock-wait deadline, counter mismatch and missing budget, including attempt
 provenance after session deletion. These are test-only fixture mutations.
 
-Next implementation slice: independent bounded receipt/message snapshots under
-the same transaction, followed by filesystem fault injection for permissions,
+## Implemented slice: private DB reference inventory
+
+`inventoryUploadDatabase` uses that SAME outer-owned fresh transaction, deadline
+and release lifecycle. It adds independent receipt LEFT JOIN messages and all
+file-message cursor scans. `maxRows` is a separate cap for each of the three
+collections (attempts, receipts, messages); `pageSize` is at most 1000. Exact-cap
+scans probe for one more row before claiming completion. No reset occurs between
+collections. `inventoryUploadLedger` retains its ledger-only behavior.
+
+SQL bounds provenance columns and suppresses message content over **4096 bytes**
+before driver transfer or JSON parsing. Reference reports contain only bounded
+identifiers, status and canonical storage key, never raw bodies. They retain
+tombstones and every duplicate reference; receipt/session cascades cannot hide
+independently scanned file messages. `references.complete` means the DB reference
+scan finished; `parseComplete` separately means all observed file references were
+parseable canonical local URLs. Neither validates full metadata (name, size,
+digest), ownership, room agreement, physical bytes or safe reclamation. Unknown
+legacy paths, malformed JSON and oversized records make `parseComplete=false`.
+Partial DB scans also leave it false and retain positive observations already seen.
+Overall `complete` is DB scan completion ONLY; accounting is ledger arithmetic ONLY.
+Filesystem remains unobserved and cross-store stability remains unproven.
+
+Real PostgreSQL tests additionally cover reference tombstones/cascades/duplicates,
+a concurrent commit between ledger and reference queries excluded from the pinned
+snapshot, malformed metadata, multibyte oversize, pagination caps and a genuine
+reference-table lock deadline. No runtime route or activation was added.
+
+Next implementation slice: validate bounded metadata and cross-reference identities
+without collapsing positive references, then filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.

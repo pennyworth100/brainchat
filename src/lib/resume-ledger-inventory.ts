@@ -1,18 +1,20 @@
 import type { PoolClient, QueryConfig, QueryResult } from "pg";
 import { performance } from "node:perf_hooks";
 import { isValidRoomId } from "./room-id";
+import { collectUploadReferences, type ReferenceInventory } from "./resume-reference-inventory";
 
 export type LedgerAttempt = {
   storage_key: string; session_id: string; room_id: string;
   client_message_id: string; reserved_bytes: string; created_at: string; oversized: boolean;
 };
 export type LedgerInventory = {
-  scope: "ledger-only"; complete: boolean; reasons: string[];
+  scope: "ledger-only" | "database-only"; complete: boolean; reasons: string[];
   accounting: "consistent" | "inconsistent" | "unknown";
   budget: { capacity_bytes: string; reserved_bytes: string } | null;
   attempts: LedgerAttempt[]; observedReservedBytes: string;
   startedAt: string; finishedAt: string; lastStorageKey: string | null;
-  unobserved: readonly ["receipts", "messages", "filesystem"];
+  unobserved: readonly string[];
+  references?: ReferenceInventory;
   crossStoreStability: "unproven";
   limits: { pageSize: number; maxRows: number; timeoutMs: number };
 };
@@ -24,12 +26,27 @@ export type LedgerInventory = {
 // No DML, refund, replay, available-capacity or reclaimability result.
 export async function inventoryUploadLedger(client: PoolClient,
   limits: { pageSize: number; maxRows: number; timeoutMs: number }): Promise<LedgerInventory> {
+  return inventoryDatabase(client, limits, false);
+}
+
+export async function inventoryUploadDatabase(client: PoolClient,
+  limits: { pageSize: number; maxRows: number; timeoutMs: number }): Promise<LedgerInventory> {
+  return inventoryDatabase(client, limits, true);
+}
+
+async function inventoryDatabase(client: PoolClient,
+  limits: { pageSize: number; maxRows: number; timeoutMs: number }, references: boolean): Promise<LedgerInventory> {
   limits = { ...limits };
   const report: LedgerInventory = { scope: "ledger-only", complete: false, reasons: [],
     accounting: "unknown", budget: null, attempts: [], observedReservedBytes: "0",
     startedAt: new Date().toISOString(), finishedAt: "", lastStorageKey: null,
     unobserved: ["receipts", "messages", "filesystem"], crossStoreStability: "unproven",
     limits: { ...limits } };
+  if (references) {
+    report.scope = "database-only";
+    report.unobserved = ["filesystem"];
+    report.references = { receipts: [], messages: [], complete: false, parseComplete: false, reasons: [] };
+  }
   const start = performance.now();
   let sum = BigInt(0), phase = "begin", invalid = false;
   const amount = (value: unknown): bigint => {
@@ -96,6 +113,13 @@ export async function inventoryUploadLedger(client: PoolClient,
         report.observedReservedBytes = sum.toString();
       }
       if (rows.length < count) break;
+    }
+    if (report.references) {
+      phase = "references";
+      await collectUploadReferences(query, limits, report.references);
+      if (!report.references.complete) {
+        report.reasons.push(...report.references.reasons); return report;
+      }
     }
     phase = "finish";
     await query("ROLLBACK");

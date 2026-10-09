@@ -14,7 +14,7 @@ import { ResumeFileStorage } from "../src/lib/resume-file-storage";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { ResumeUploadOperationGate } from "../src/lib/resume-operation";
-import { inventoryUploadLedger } from "../src/lib/resume-ledger-inventory";
+import { inventoryUploadLedger, inventoryUploadDatabase } from "../src/lib/resume-ledger-inventory";
 
 // Isolated fixture only: kills application workers, NEVER PostgreSQL.
 // Recovery is read-only inventory, NOT replay, deletion, refund or activation.
@@ -171,6 +171,13 @@ async function main() {
       } finally { client.release(true); }
     };
     const baseline = await snapshot();
+    const databaseInventory = (maxRows = 10) => pool.connect().then(client => inventoryUploadDatabase(client,
+      { pageSize: 1, maxRows, timeoutMs: 2000 }));
+    const initialDb = await databaseInventory();
+    check(initialDb.complete && initialDb.references?.complete && initialDb.references.parseComplete);
+    check(initialDb.scope === "database-only" && initialDb.unobserved.join() === "filesystem");
+    check(initialDb.references?.receipts[0].storageKey === committed.storage_key);
+    check(initialDb.references?.messages[0].messageId === committed.message_id);
     check(baseline.attempts.length === 2 && baseline.receipts.length === 1 && baseline.messages.length === 1);
     const missingPath = join(root, committed.storage_key, "blob");
     await rm(missingPath); // Deliberate corruption of this harness-owned fixture.
@@ -192,6 +199,9 @@ async function main() {
     const duplicate = (await pool.query(`INSERT INTO messages (room_id, username, type, content)
       VALUES ('files123', 'Other', 'file', $1) RETURNING id`, [baseline.messages[0].content])).rows[0];
     const ambiguous = await snapshot();
+    const ambiguousDb = await databaseInventory();
+    check(ambiguousDb.references?.messages.length === 2 && ambiguousDb.references.receipts.length === 1);
+    check(ambiguousDb.references?.messages.every(m => m.storageKey === committed.storage_key));
     check(ambiguous.messages.length === 2 && ambiguous.receipts.length === 1);
     check(ambiguous.messages.every(m => JSON.parse(m.content).url === "/uploads/" + committed.storage_key + "/blob"));
     check(ambiguous.charged === ceiling * 2);
@@ -201,6 +211,9 @@ async function main() {
     // Real ON DELETE SET NULL; observation uses a separate read-only transaction.
     await pool.query("DELETE FROM messages WHERE id=$1", [committed.message_id]);
     const tombstone = await snapshot();
+    const tombstoneDb = await databaseInventory();
+    check(tombstoneDb.references?.receipts[0].status === "tombstone" && tombstoneDb.references.receipts[0].messageId === null);
+    check(tombstoneDb.references?.messages.length === 0 && tombstoneDb.references.complete);
     check(tombstone.receipts.length === 1 && tombstone.receipts[0].message_id === null &&
       tombstone.receipts[0].content === null);
     check(tombstone.messages.length === 0 && tombstone.attempts.length === 2);
@@ -215,6 +228,52 @@ async function main() {
       [committed.message_id, committed.session_id]);
     await pool.query("DELETE FROM room_resume_sessions WHERE id=$1", [committed.session_id]);
     const expired = await snapshot();
+    const expiredDb = await databaseInventory();
+    check(expiredDb.references?.receipts.length === 0 && expiredDb.references.messages.length === 1);
+    check(expiredDb.references?.messages[0].storageKey === committed.storage_key);
+    // A mutation AFTER the ledger snapshot but BEFORE reference SQL must not
+    // appear in the reference inventory. One reset, one pinned DB snapshot.
+    const pinnedClient = await pool.connect();
+    const originalQuery = pinnedClient.query.bind(pinnedClient);
+    let injectedId = 0, resets = 0;
+    pinnedClient.query = (async (config: { text: string }) => {
+      if (config.text === "ROLLBACK") resets++;
+      if (config.text.startsWith("DECLARE reference_receipts")) {
+        injectedId = (await pool.query(`INSERT INTO messages (room_id,username,type,content)
+          VALUES ('files123','Concurrent','file',$1) RETURNING id`, [baseline.messages[0].content])).rows[0].id;
+      }
+      return originalQuery(config);
+    }) as typeof pinnedClient.query;
+    const pinned = await inventoryUploadDatabase(pinnedClient, { pageSize: 1, maxRows: 10, timeoutMs: 2000 });
+    check(pinned.complete && pinned.references?.messages.length === 1 && resets === 2);
+    check(!pinned.references?.messages.some(m => m.messageId === injectedId));
+    check((await databaseInventory()).references?.messages.some(m => m.messageId === injectedId));
+    await pool.query("DELETE FROM messages WHERE id=$1", [injectedId]);
+    // SQL must suppress oversized bodies BEFORE driver transfer/JSON parsing.
+    const invalidIds: number[] = [];
+    for (const content of ["PRIVATE malformed payload", JSON.stringify({ url: "/uploads/" + committed.storage_key + "/blob", secret: "界".repeat(2000) })]) {
+      invalidIds.push((await pool.query(`INSERT INTO messages (room_id,username,type,content)
+        VALUES ('files123','Invalid','file',$1) RETURNING id`, [content])).rows[0].id);
+    }
+    const invalidDb = await databaseInventory();
+    check(invalidDb.complete && invalidDb.references?.complete && !invalidDb.references.parseComplete);
+    check(invalidDb.references?.messages.map(m => m.status).join() === "reference,invalid,oversized");
+    check(!JSON.stringify(invalidDb).includes("PRIVATE") && !JSON.stringify(invalidDb).includes("界"));
+    const referenceCap = await databaseInventory(2);
+    check(!referenceCap.complete && !referenceCap.references?.complete && !referenceCap.references?.parseComplete);
+    check(referenceCap.reasons.includes("row-limit:messages") && referenceCap.references?.messages.length === 2);
+    await pool.query("DELETE FROM messages WHERE id=ANY($1::int[])", [invalidIds]);
+    const messageLocker = await pool.connect();
+    try {
+      await messageLocker.query("BEGIN");
+      await messageLocker.query("LOCK TABLE messages IN ACCESS EXCLUSIVE MODE");
+      const blockedRefs = await inventoryUploadDatabase(await pool.connect(), { pageSize: 1, maxRows: 10, timeoutMs: 50 });
+      check(!blockedRefs.complete && blockedRefs.reasons.includes("deadline"));
+      check(blockedRefs.attempts.length === 2 && !blockedRefs.references?.complete && blockedRefs.accounting === "unknown");
+    } finally { await messageLocker.query("ROLLBACK"); messageLocker.release(); }
+    evidence.push({ case: "private-db-reference-collector", checks: 20,
+      cases: "tombstone,cascade,duplicates,shared-snapshot,malformed,multibyte-oversize,row-cap,real-lock-deadline",
+      rawContentExposed: false, crossStoreStability: "unproven" });
     check(expired.receipts.length === 0 && expired.messages.length === 1);
     check(expired.attempts.length === 2 && expired.attempts.some(a => a.storage_key === committed.storage_key));
     check(JSON.parse(expired.messages[0].content).url === "/uploads/" + committed.storage_key + "/blob");
