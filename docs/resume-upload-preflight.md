@@ -47,6 +47,27 @@ and policy can change after it returns. No new grant allows live socket fanout.
 
 ## Before public activation
 
+`validateResumeUploadFraming` is a separate PRIVATE synchronous header prerequisite,
+not yet wired to this preflight or any route. It requires HTTP/1.1 POST, one positive
+canonical Content-Length (at most 100 MiB + 64 KiB envelope overhead), and one strict
+multipart/form-data boundary (1..70 ASCII characters). It scans rawHeaders, not
+Node's normalized map which can discard duplicate Content-Type. Duplicate framing
+headers, any Transfer-Encoding, Content-Encoding, Expect or Trailer fail closed.
+All header pairs (at most 64) count toward an 8192-byte application header budget;
+invalid names/control characters and non-Latin-1 request-shaped values deny.
+The accepted boundary is deliberately a narrow RFC-compatible subset; no extra
+parameters, quoted escapes or embedded spaces. The result is an immutable snapshot.
+
+No parser, body stream, authentication or filesystem is touched by this helper.
+The future HTTP adapter MUST call it before parser creation, and separately handle
+Node's checkContinue/checkExpectation (Node may otherwise send 100 Continue before
+the request handler), header timeouts and parser-level maxHeaderSize. The declared
+length is NOT body validation or a memory/disk reservation. Total streaming bytes,
+multipart syntax/parts, file bytes, actual Content-Length agreement and aborts still
+need enforcement. A loopback raw HTTP test proves Node hides duplicate Content-Type
+in normalized headers while this helper rejects the original pairs. It is NOT a
+public endpoint test or proof of zero network buffering.
+
 The current server's x-socket-id + x-room-id check is NOT bearer authentication:
 a socket ID can be learned from user presence. It must not be copied into this
 new path as proof of identity. Resolve socket/owner from an authoritative server
