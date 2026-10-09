@@ -950,12 +950,13 @@ try {
 
     // A durable successor fences the old grant even if its local binding lags.
     const staleGrant = uploads.admit(fixture.binding); assert.ok(staleGrant);
-    const next = await first.advanceGeneration(fixture.credential, 1, opB, socketB); assert.ok(next);
+    const byteTransport = "byte_" + fixture.binding.sessionId;
+    const next = await first.advanceGeneration(fixture.credential, 1, opB, byteTransport); assert.ok(next);
     const stale = await byteUpload.saveWithOutcome(staleGrant, "actual-unknown", metadata, byteSource());
     check(stale.completed && !stale.result.authorized);
     check(await countFiles() === baseline);
     check(uploads.release(staleGrant));
-    const nextBinding = await uploadBindings.activate(next, socketB, async () => {}, () => true); assert.ok(nextBinding);
+    const nextBinding = await uploadBindings.activate(next, byteTransport, async () => {}, () => true); assert.ok(nextBinding);
     const successorGrant = uploads.admit(nextBinding); assert.ok(successorGrant);
     const successor = await byteUpload.saveWithOutcome(successorGrant, "actual-unknown", metadata, byteSource());
     check(successor.completed && successor.result.authorized && !successor.result.value.inserted &&
