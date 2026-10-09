@@ -1,4 +1,4 @@
-# Private admission/membership composition (3.0.10 draft)
+# Private admission/membership composition (3.0.11 draft)
 
 The optional `memberships` dependency of `attachResumeSocket` installs logical
 membership after successful admission and before returning its binding. Share one

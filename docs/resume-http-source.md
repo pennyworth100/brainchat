@@ -1,4 +1,4 @@
-# Private HTTP request source (3.0.10 draft)
+# Private HTTP request source (3.0.11 draft)
 
 `resumeHttpSource` adapts an exclusively owned, already-admitted Node
 IncomingMessage for `consumeResumeRequest`. Factory and iterator acquisition

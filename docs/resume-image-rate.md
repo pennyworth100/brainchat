@@ -1,4 +1,4 @@
-# Private image admission budget (3.0.10 draft)
+# Private image admission budget (3.0.11 draft)
 
 `consumeResumeImageAttempt` is a prerequisite for image send composition, not a
 public handler and not yet invoked by the private writer or any server route.

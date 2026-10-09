@@ -1,4 +1,4 @@
-# Private logical presence (3.0.10 draft)
+# Private logical presence (3.0.11 draft)
 
 The shared ResumeMemberships registry projects presence(roomId) from exact current
 memberships, never raw Socket.IO room membership or transport IDs. The frozen

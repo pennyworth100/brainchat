@@ -1,4 +1,4 @@
-# Private admission limits (3.0.10 draft)
+# Private admission limits (3.0.11 draft)
 
 No public handler or deployment is enabled. Physical socket owners share a
 process-local budget of 100 unresolved admissions and a 10-second admission

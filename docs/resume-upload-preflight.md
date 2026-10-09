@@ -1,4 +1,4 @@
-# Private pre-body upload authentication (3.0.10 draft)
+# Private pre-body upload authentication (3.0.11 draft)
 
 NOT wired to HTTP or multer. No public upload behavior, version, schema or dependency
 change. This is one bounded prerequisite, not complete resume or HTTP acceptance.

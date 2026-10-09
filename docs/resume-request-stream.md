@@ -1,4 +1,4 @@
-# Private request-stream accounting (3.0.10 draft)
+# Private request-stream accounting (3.0.11 draft)
 
 This helper is not installed on an HTTP route. It must run only after strict
 raw-header framing, bearer admission and eventual disk-byte reservation.

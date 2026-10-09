@@ -1,4 +1,4 @@
-# Private resume transport ownership (3.0.10 draft)
+# Private resume transport ownership (3.0.11 draft)
 
 The single-process registry reserves each server-owned transport incarnation for
 one pending or active session before awaiting preparation. A different session

@@ -1,4 +1,4 @@
-# Private exact membership leases (3.0.10 draft)
+# Private exact membership leases (3.0.11 draft)
 
 `ResumeMemberships` is a server-owned logical membership registry, not room
 authorization. Share one registry with the process's `ResumeBindings`. Install

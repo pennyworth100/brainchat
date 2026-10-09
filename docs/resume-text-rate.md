@@ -1,4 +1,4 @@
-# Private resume text attempt budget (3.0.10 draft)
+# Private resume text attempt budget (3.0.11 draft)
 
 `sendResumeText` validates payload and exact current physical authority, reserves
 write capacity, then consumes a shared process-owned budget **before** DB dispatch.

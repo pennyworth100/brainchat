@@ -1,4 +1,4 @@
-# Private join publication (3.0.10 draft)
+# Private join publication (3.0.11 draft)
 
 Not connected to server.ts; no rollout or public resume acceptance.
 

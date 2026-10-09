@@ -4,6 +4,7 @@ import { Server, type Socket } from "socket.io";
 import next from "next";
 import path from "path";
 import multer from "multer";
+import { createUploadParser } from "./src/lib/upload-parser";
 import crypto from "crypto";
 import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
@@ -349,7 +350,11 @@ async function main() {
     destination: (req, _file, cb) => {
       const token = crypto.randomBytes(8).toString("hex");
       const dir = path.join(UPLOAD_DIR, token);
-      fs.mkdirSync(dir, { recursive: true });
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch (error) {
+        return cb(error as Error, dir);
+      }
       (req as express.Request & { _uploadToken: string })._uploadToken = token;
       cb(null, dir);
     },
@@ -363,7 +368,7 @@ async function main() {
     },
   });
 
-  const uploadMiddleware = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
+  const uploadMiddleware = createUploadParser(storage, MAX_FILE_SIZE);
 
   expressApp.post(
     "/api/upload",
@@ -397,7 +402,7 @@ async function main() {
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
     },
-    uploadMiddleware.single("file"),
+    uploadMiddleware,
     async (req, res) => {
       if (!req.file) return res.status(400).json({ error: "No file" });
       const token = (req as express.Request & { _uploadToken: string })._uploadToken;

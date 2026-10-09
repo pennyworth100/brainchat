@@ -1,4 +1,4 @@
-# Expired resume sessions (3.0.10 draft)
+# Expired resume sessions (3.0.11 draft)
 
 `ResumeStore.cleanupExpired(batchSize = 100)` is an internal primitive, not a
 scheduler or public endpoint. No live environment invokes it.

@@ -1,4 +1,4 @@
-# Private image persistence (3.0.10 draft)
+# Private image persistence (3.0.11 draft)
 
 `ResumeImageWriter` is not wired to public handlers. It stores bounded inline
 PNG/JPEG/GIF/WebP data URLs in the existing message schema, with database-owned

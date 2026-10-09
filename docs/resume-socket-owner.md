@@ -1,4 +1,4 @@
-# Private physical-socket owner (3.0.10 draft)
+# Private physical-socket owner (3.0.11 draft)
 
 `attachResumeSocket` is deliberately NOT called by `server.ts`. It creates no
 public event, token, room membership, history, presence, broadcast or DB schema change.

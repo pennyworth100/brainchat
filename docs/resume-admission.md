@@ -1,4 +1,4 @@
-# Private pre-CAS admission seam (3.0.10 draft)
+# Private pre-CAS admission seam (3.0.11 draft)
 
 Create one ResumeAdmission for each physical server-owned connection incarnation.
 Never create one per request, reuse a transport ID, or mix direct/ordinary join

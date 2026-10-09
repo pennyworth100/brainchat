@@ -1,4 +1,4 @@
-# Private authenticated-join composition (3.0.10 draft)
+# Private authenticated-join composition (3.0.11 draft)
 
 Not wired into server.ts. This is not public resume acceptance or rollout approval.
 

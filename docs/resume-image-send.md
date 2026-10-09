@@ -1,4 +1,4 @@
-# Private resumable image send composition (3.0.10)
+# Private resumable image send composition (3.0.11)
 
 `sendResumeImage` is private; no public server handler is enabled by this change.
 Text keeps its existing API and both types now use one generic send core.

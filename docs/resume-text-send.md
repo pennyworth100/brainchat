@@ -1,4 +1,4 @@
-# Private protected text adapter (3.0.10 draft)
+# Private protected text adapter (3.0.11 draft)
 
 `sendResumeText` composes the committed retry writer with exact physical owner,
 binding and membership checks before dispatch and after the awaited write.

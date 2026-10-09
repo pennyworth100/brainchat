@@ -1,4 +1,4 @@
-# Private transaction-authorized history (3.0.10 draft)
+# Private transaction-authorized history (3.0.11 draft)
 
 Compose `binding => reader.read(binding)` from `ResumeHistoryReader` with the
 existing private join/resume publication callbacks. The reader runs on

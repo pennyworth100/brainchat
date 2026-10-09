@@ -1,4 +1,4 @@
-# Private text-message retry receipts (3.0.10 draft)
+# Private text-message retry receipts (3.0.11 draft)
 
 No public handler uses this API. This is database idempotency, not exactly-once
 network publication. Plain save remains explicitly non-idempotent; retrying

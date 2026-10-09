@@ -1,4 +1,4 @@
-# Private resumed-session resynchronization (3.0.10 draft)
+# Private resumed-session resynchronization (3.0.11 draft)
 
 Not wired to server.ts. No public resume, deployment, or client acceptance claim.
 

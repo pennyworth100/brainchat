@@ -1,4 +1,4 @@
-# Private outbound fencing (3.0.10 draft)
+# Private outbound fencing (3.0.11 draft)
 
 `ResumeMemberships.send` checks the exact binding object, requested room, current
 generation, absolute expiry, connected socket and installed membership immediately
