@@ -3,6 +3,11 @@ import { ResumeBindings, type ResumeBinding } from "./resume-bindings";
 
 export type OperationResult<T> = { authorized: false } | { authorized: true; value: T };
 
+// Settled attempt only, never a timeout/cancellation result. "not-dispatched"
+// says THIS attempt did not send COMMIT, not that an earlier retry did not commit.
+export type OperationOutcome<T> = { completed: true; result: OperationResult<T> } |
+  { completed: false; commit: "not-dispatched" | "unknown"; error: unknown };
+
 // Private persistence gate; no public/socket handler imports this yet.
 // Use a dedicated pool checkout, never a caller-owned/nested transaction.
 // Work MUST use this transaction for ALL writes; no network ACK, broadcast,
@@ -15,6 +20,26 @@ export class ResumeOperationGate {
 
   async run<T>(binding: ResumeBinding,
     work: (transaction: Pick<PoolClient, "query">) => Promise<T>): Promise<OperationResult<T>> {
+    return this.execute(binding, work, () => {});
+  }
+
+  // Private upload foundation. Keep legacy run's original rejection behavior.
+  // Unknown outcomes retain potentially referenced files; a successful ROLLBACK
+  // after a failed COMMIT does NOT establish that COMMIT failed. No retries here.
+  async runWithOutcome<T>(binding: ResumeBinding,
+    work: (transaction: Pick<PoolClient, "query">) => Promise<T>): Promise<OperationOutcome<T>> {
+    let commitDispatched = false;
+    try {
+      const result = await this.execute(binding, work, () => { commitDispatched = true; });
+      return { completed: true, result };
+    } catch (error) {
+      return { completed: false, commit: commitDispatched ? "unknown" : "not-dispatched", error };
+    }
+  }
+
+  private async execute<T>(binding: ResumeBinding,
+    work: (transaction: Pick<PoolClient, "query">) => Promise<T>,
+    beforeCommit: () => void): Promise<OperationResult<T>> {
     if (!this.bindings.isCurrent(binding)) return { authorized: false };
     const client = await this.pool.connect();
     let destroy = false;
@@ -47,6 +72,8 @@ export class ResumeOperationGate {
         await client.query("ROLLBACK");
         return { authorized: false };
       }
+      // Mark BEFORE calling the driver, including synchronous driver failures.
+      beforeCommit();
       await client.query("COMMIT");
       return { authorized: true, value };
     } catch (error) {

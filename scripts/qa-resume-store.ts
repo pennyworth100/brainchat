@@ -684,6 +684,34 @@ try {
   check(uncertainCalls === 1);
   check((await first.lookup(otherCredential))?.generation === 1);
   await uncertainAdmission.close();
+  // Settled upload foundation: distinguish actual rollback from a real commit
+  // whose acknowledgement is lost. No filesystem cleanup is performed here.
+  assert.ok(recoveredBinding);
+  const outcomeGate = new ResumeOperationGate(operationPool, admissionBindings);
+  const noCommit = await outcomeGate.runWithOutcome(recoveredBinding, async tx => {
+    await insertResumeTextMessage(tx, recoveredBinding, "outcome-rollback");
+    throw new Error("after insert, before commit");
+  });
+  check(!noCommit.completed && noCommit.commit === "not-dispatched");
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'admit123'")).rowCount === 0);
+  let outcomeCommitAttempts = 0;
+  const outcomeLostAck = new ResumeOperationGate({ connect: async () => {
+    const real = await operationPool.connect();
+    return { query: async (...args: unknown[]) => {
+      const result = await (real.query as Function).apply(real, args);
+      if (args[0] === "COMMIT") { outcomeCommitAttempts++; throw new Error("lost outcome ack"); }
+      return result;
+    }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+  } }, admissionBindings);
+  const unknownCommit = await outcomeLostAck.runWithOutcome(recoveredBinding,
+    tx => insertResumeTextMessage(tx, recoveredBinding, "outcome-durable"));
+  check(!unknownCommit.completed && unknownCommit.commit === "unknown");
+  check(outcomeCommitAttempts === 1);
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'admit123' AND content = 'outcome-durable'")).rowCount === 1);
+  const deniedOutcome = await outcomeGate.runWithOutcome({ ...recoveredBinding }, async () => {
+    assert.fail("copied authority must not run");
+  });
+  check(deniedOutcome.completed && !deniedOutcome.result.authorized);
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
