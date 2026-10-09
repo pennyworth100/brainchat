@@ -34,6 +34,32 @@ blob integrity, capacity or safe reclamation. `blobs=unobserved` and
 `crossStoreStability=unproven` always; it is not joined with the DB snapshot.
 There is no runtime caller, volume audit, recovery action or public activation.
 
+### Private single-blob metadata slice
+
+`observeUploadBlob` is separate and unwired. Given one strictly canonical 64-hex
+storage key, it checks exactly root/key/blob without enumeration or recursion.
+The trusted stable root/ancestry precondition and admission-only deadline apply
+as above (1..30,000 ms, copied before awaiting). It lstat-checks each component,
+opens/holds no-follow root and keyed directory handles, and opens the regular
+blob read-only with NOFOLLOW and NONBLOCK. NONBLOCK prevents a FIFO replacement
+at open from hanging; fstat must still confirm regular-file type and identity.
+Nonregular/symlink entries and link counts other than one fail closed. A matching
+link count is NOT proof of exclusive ownership.
+
+Device/inode/mode/size/link-count/nanosecond mtime/ctime are checked before/after
+for all three held objects and paths. Exact stat size/link-count are decimal
+strings; no content read, hashing, DB query or mutation occurs. Prior positive
+metadata survives a later error, but `complete=false`. Missing/unreadable is
+unobserved, never absent/zero size. All closes are awaited; any close failure
+prevents completion. Reason codes exclude private paths and exception text.
+
+`unchanged-at-checks` means sequential metadata comparisons only, NOT a snapshot,
+hostile same-uid/ABA protection, content integrity, reference absence, ownership,
+capacity or safe reclamation. It does not authorize later access. Content stays
+unobserved and cross-store stability unproven even when complete. There is no
+public caller or live-volume audit. Hashing requires a separate byte/time budget
+and before/after identity contract; integration still requires an all-writer barrier.
+
 ### Eventual combined report
 
 A report must identify the DB/schema, storage namespace/volume, release, observation
