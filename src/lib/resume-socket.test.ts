@@ -113,6 +113,118 @@ test("sync handoff exceptions do not replay ACK and release reservation", async 
   assert.deepEqual([reads, acks], [2, 2]);
 });
 
+
+test("sync aggregate budget spans sockets and rejects before DB dispatch; probe stays cheap", async t => {
+  const first = await syncFixture(t), second = await syncFixture(t), capacity = new ResumeCapacity(1);
+  const gate = deferred<readonly unknown[]>(); let reads = 0, probes = 0;
+  const read = async () => { reads++; return gate.promise; };
+  const run = (f: typeof first, probeOnly = false) => syncResumeSocket(f.socket, f.owner, f.binding,
+    f.members, { read }, { roomId: "candy986", probeOnly }, () => { probes++; }, { capacity });
+  const pending = run(first);
+  assert.equal(await run(second), false); assert.equal(reads, 1);
+  assert.equal(await run(second, true), true); assert.equal(reads, 1);
+  gate.resolve([]); assert.equal(await pending, true);
+  assert.equal(await run(second), true); assert.equal(reads, 2); assert.equal(probes, 3);
+});
+
+test("sync timeout retains socket AND global leases until real settlement then allows fresh request", async t => {
+  const first = await syncFixture(t), second = await syncFixture(t), capacity = new ResumeCapacity(1);
+  const gate = deferred<readonly unknown[]>(); let reads = 0, acks = 0;
+  const run = (f: typeof first, cap = capacity) => syncResumeSocket(f.socket, f.owner, f.binding,
+    f.members, { read: async () => { reads++; return gate.promise; } }, { roomId: "candy986" },
+    () => { acks++; }, { capacity: cap, timeoutMs: 15 });
+  assert.equal(await run(first), false); assert.equal(acks, 0);
+  assert.equal(await run(first, new ResumeCapacity(1)), false); // per-socket cap survives timeout
+  assert.equal(await run(second), false); assert.equal(reads, 1);
+  gate.resolve([{ id: 8 }]); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(acks, 0); assert.equal(await run(first), true);
+  assert.deepEqual([reads, acks], [2, 1]);
+});
+
+test("sync close/replacement returns promptly but retains shared capacity for unresolved read", async t => {
+  for (const replace of [false, true]) {
+    const f = await syncFixture(t), capacity = new ResumeCapacity(1), gate = deferred<readonly unknown[]>();
+    let acks = 0;
+    const pending = syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+      { read: async () => gate.promise }, { roomId: "candy986" }, () => { acks++; }, { capacity });
+    if (replace) {
+      const next = await f.connect();
+      const owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+        store: { advanceGeneration: async () => identity(2) } });
+      t.after(() => owner.close()); assert.ok(await owner.admit(request(1)));
+    } else await f.owner.close();
+    assert.equal(await pending, false); assert.equal(capacity.acquire(), null);
+    gate.resolve([]); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(acks, 0); const release = capacity.acquire(); assert.ok(release); release();
+  }
+});
+
+test("sync observes late rejection once after timeout or close, even when reporter throws", async t => {
+  const reporterFailures: unknown[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => { reporterFailures.push(args); });
+  for (const close of [false, true]) {
+    const f = await syncFixture(t), capacity = new ResumeCapacity(1), gate = deferred<void>();
+    const failure = Error("late read"); const reported: unknown[] = []; let acks = 0, reads = 0;
+    const pending = syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+      { read: async () => { reads++; await gate.promise; throw failure; } }, { roomId: "candy986" },
+      () => { acks++; }, { capacity, timeoutMs: 15,
+        onLateError: error => { reported.push(error); throw Error("reporter"); } });
+    if (close) await f.owner.close();
+    assert.equal(await pending, false); assert.equal(capacity.acquire(), null);
+    gate.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(reported, [failure]); assert.deepEqual([reads, acks], [1, 0]);
+    const release = capacity.acquire(); assert.ok(release); release();
+  }
+  assert.equal(reporterFailures.length, 2);
+});
+
+test("sync monotonic deadline fences ACK and reports late failure even before timer runs", async t => {
+  for (const fail of [false, true]) {
+    const f = await syncFixture(t), errors: unknown[] = []; let acks = 0;
+    const failure = Error("expired while timer blocked");
+    assert.equal(await syncResumeSocket(f.socket, f.owner, f.binding, f.members, {
+      read: async () => {
+        const until = performance.now() + 20;
+        while (performance.now() < until) { /* deliberately block timer delivery */ }
+        if (fail) throw failure;
+        return [];
+      },
+    }, { roomId: "candy986" }, () => { acks++; },
+    { timeoutMs: 5, onLateError: error => { errors.push(error); } }), false);
+    assert.equal(acks, 0); assert.deepEqual(errors, fail ? [failure] : []);
+  }
+});
+
+test("sync invalid deadlines fail before reserving or dispatching; immediate errors release both leases", async t => {
+  const f = await syncFixture(t), capacity = new ResumeCapacity(1); let reads = 0, reports = 0;
+  const run = (timeoutMs: number) => syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+    { read: async () => { reads++; throw Error("immediate read failure"); } },
+    { roomId: "candy986" }, () => assert.fail("unexpected ACK"),
+    { capacity, timeoutMs, onLateError: () => { reports++; } });
+  for (const value of [0, -1, 0.5, NaN, Infinity, 2_147_483_648]) {
+    await assert.rejects(run(value), /Invalid sync deadline/);
+  }
+  assert.equal(reads, 0);
+  await assert.rejects(run(10_000), /immediate read failure/);
+  await assert.rejects(run(10_000), /immediate read failure/);
+  assert.deepEqual([reads, reports], [2, 0]);
+  const release = capacity.acquire(); assert.ok(release); release();
+});
+
+test("sync preserves ACK result or exception when ACK reentrantly closes owner", async t => {
+  for (const fail of [false, true]) {
+    const f = await syncFixture(t), capacity = new ResumeCapacity(1); let acks = 0, reports = 0;
+    const pending = syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+      { read: async () => [] }, { roomId: "candy986" }, () => {
+        acks++; void f.owner.close(); if (fail) throw Error("ACK closed then threw");
+      }, { capacity, onLateError: () => { reports++; } });
+    if (fail) await assert.rejects(pending, /ACK closed then threw/);
+    else assert.equal(await pending, true);
+    assert.deepEqual([acks, reports], [1, 0]);
+    const release = capacity.acquire(); assert.ok(release); release();
+  }
+});
+
 const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
 
 async function resyncFixture(t: TestContext,
