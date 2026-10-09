@@ -10,6 +10,7 @@ import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeImageWriter } from "../src/lib/resume-image";
+import { ResumeFileWriter } from "../src/lib/resume-file";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
@@ -813,6 +814,74 @@ try {
     }
     check(uploads.release(grant) === (mode !== "released"));
   }
+  // File receipt identity is independent of a new attempt's storage path.
+  // No actual filesystem or client-supplied digest is used by this DB fixture.
+  const fileFixture = await makeUpload();
+  const files = new ResumeFileWriter(uploadGate);
+  const file = { storageKey: "a".repeat(64), name: "proof.txt", size: 5,
+    mime: "text/plain", sha256: "c".repeat(64) };
+  const countFiles = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'files123' AND type = 'file'")).rows[0].count);
+  const savedFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", file);
+  check(savedFile.completed && savedFile.result.authorized && savedFile.result.value.inserted);
+  assert.ok(savedFile.completed && savedFile.result.authorized);
+  const firstFile = savedFile.result.value.message;
+  const retryFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", { ...file, storageKey: "b".repeat(64) });
+  check(retryFile.completed && retryFile.result.authorized && !retryFile.result.value.inserted &&
+    retryFile.result.value.message.id === firstFile.id && retryFile.result.value.message.url === firstFile.url);
+  for (const change of [{ name: "changed.txt" }, { size: 6 }, { mime: "application/pdf" }, { sha256: "d".repeat(64) }]) {
+    const conflict = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", { ...file, ...change });
+    check(!conflict.completed && conflict.commit === "not-dispatched");
+  }
+  const textWriter = new ResumeMessageWriter(new ResumeOperationGate(operationPool, uploadBindings));
+  await assert.rejects(textWriter.saveOnceWithOutcome(fileFixture.binding, "file-key", "collision"), /conflict/); checks++;
+  const imageWriter = new ResumeImageWriter(new ResumeOperationGate(operationPool, uploadBindings));
+  await assert.rejects(imageWriter.saveOnceWithOutcome(fileFixture.binding, "file-key", "data:image/png;base64,YQ=="), /conflict/); checks++;
+  check(await countFiles() === 1);
+  await textWriter.saveOnceWithOutcome(fileFixture.binding, "text-first", "text");
+  const reverseConflict = await files.saveOnceWithOutcome(fileFixture.grant, "text-first", file);
+  check(!reverseConflict.completed && reverseConflict.commit === "not-dispatched");
+  // Atomic receipt failure must roll back the inserted file message.
+  await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_file_reject CHECK (client_message_id <> 'file-rollback')");
+  const rolledBack = await files.saveOnceWithOutcome(fileFixture.grant, "file-rollback", file);
+  check(!rolledBack.completed && rolledBack.commit === "not-dispatched");
+  await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_file_reject");
+  check(await countFiles() === 1);
+  const uncertainFiles = new ResumeFileWriter(new ResumeUploadOperationGate({ connect: async () => {
+    const real = await operationPool.connect();
+    return { query: async (...args: unknown[]) => {
+      const result = await (real.query as Function).apply(real, args);
+      if (args[0] === "COMMIT") throw Error("lost file ACK");
+      return result;
+    }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+  } }, uploads));
+  const uncertainFile = await uncertainFiles.saveOnceWithOutcome(fileFixture.grant, "file-unknown", file);
+  check(!uncertainFile.completed && uncertainFile.commit === "unknown");
+  check(await countFiles() === 2);
+  uploadBindings.detach(fileFixture.binding);
+  const resolvedFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-unknown", { ...file, storageKey: "e".repeat(64) });
+  check(resolvedFile.completed && resolvedFile.result.authorized && !resolvedFile.result.value.inserted &&
+    resolvedFile.result.value.message.url === firstFile.url);
+  check(await countFiles() === 2);
+  await a.query("DELETE FROM messages WHERE id = $1", [firstFile.id]);
+  const tombstoneFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", file);
+  check(!tombstoneFile.completed && tombstoneFile.commit === "not-dispatched");
+  check(await countFiles() === 1);
+  // An authorized successor resolves the same durable receipt without fanout.
+  uploads.release(fileFixture.grant);
+  const nextFileIdentity = await first.advanceGeneration(fileFixture.credential, 1, opB, socketB);
+  assert.ok(nextFileIdentity);
+  const nextFileBinding = await uploadBindings.activate(nextFileIdentity, socketB, async () => {}, () => true);
+  assert.ok(nextFileBinding);
+  const nextFileGrant = uploads.admit(nextFileBinding); assert.ok(nextFileGrant);
+  const successorFile = await files.saveOnceWithOutcome(nextFileGrant, "file-unknown", { ...file, storageKey: "f".repeat(64) });
+  check(successorFile.completed && successorFile.result.authorized && !successorFile.result.value.inserted &&
+    successorFile.result.value.message.url === firstFile.url);
+  const oldFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-unknown", file);
+  check(oldFile.completed && !oldFile.result.authorized);
+  await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
+  const deniedFile = await files.saveOnceWithOutcome(nextFileGrant, "file-unknown", file);
+  check(deniedFile.completed && !deniedFile.result.authorized);
+  check(uploads.release(nextFileGrant));
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");

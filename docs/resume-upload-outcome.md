@@ -56,6 +56,30 @@ stream, file and DB settlement, including a pending COMMIT. A deadline does not
 cancel a dispatched COMMIT. Lost ACKs remain unknown; no automatic retry,
 publication or unlink follows. This is a database-only result, not a file receipt.
 
-Next: session/key-scoped durable idempotent file receipt, then exclusive file
-ownership, bounded streaming and fenced publication. No filesystem operations in
-DB callbacks; no cleanup on deadline/unknown COMMIT. This is not upload acceptance.
+## Private durable file receipt (not wired)
+
+`ResumeFileWriter` now uses the upload gate and the SAME session/key receipt
+namespace as text/image. Authorization precedes lookup. Receipt and message are
+atomic; tombstones and mismatched payloads fail without recreating a message.
+The logical hash covers room, sender, type, bounded name, size, MIME and SHA-256,
+but deliberately excludes the fresh storage attempt key. A retry returns the
+original committed URL with `inserted:false`, not the retry's newly chosen path.
+Replay validates the stored room/sender/type/id/time, bounded canonical metadata,
+digest, and strict server URL format. It never trusts a stored hash alone.
+
+`ResumeStoredFile` is SERVER-INTERNAL metadata, not an opaque storage capability.
+Validation does NOT prove file existence, ownership, MIME safety, or digest
+provenance. No HTTP input may be passed to this API. Before integration, an
+exclusive server-owned storage writer MUST calculate size/SHA-256 from settled
+bytes, bind its immutable result to its issued attempt, and produce these fields.
+There are no filesystem operations in this primitive or its DB callbacks.
+The returned client message omits the internal digest. No schema change is needed.
+
+Settled outcomes and grant ownership are preserved. Neither a prior receipt nor
+an uncertain COMMIT permits deletion of either attempt's file. No fanout occurs;
+`inserted:false` must never replay a broadcast. An acknowledged DB commit is not
+proof of network delivery or attachment durability across storage loss.
+
+Next: exclusive server-owned file lifecycle/capability, bounded multipart
+streaming, then fenced publication. No cleanup on deadline/unknown COMMIT.
+This database-only primitive is not upload acceptance.
