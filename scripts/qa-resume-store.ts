@@ -438,11 +438,11 @@ try {
     check(await retryCount() === 4); // session cleanup does not delete room history
   } finally { await parallelPool.end(); }
   // History uses the same dedicated transaction gate, never the global DB.
-  await a.query("INSERT INTO rooms (id) VALUES ('history123'), ('foreign123')");
+  await a.query("INSERT INTO rooms (id) VALUES ('histo123'), ('alien123')");
   await a.query(`INSERT INTO messages (room_id, username, content)
-    SELECT 'history123', 'History', n::text FROM generate_series(1, 105) n`);
-  await a.query("INSERT INTO messages (room_id, username, content) VALUES ('foreign123', 'Foreign', 'must not leak')");
-  const historySession = await first.issueAfterAuthenticatedJoin("history123", "History", 1);
+    SELECT 'histo123', 'History', n::text FROM generate_series(1, 105) n`);
+  await a.query("INSERT INTO messages (room_id, username, content) VALUES ('alien123', 'Foreign', 'must not leak')");
+  const historySession = await first.issueAfterAuthenticatedJoin("histo123", "History", 1);
   assert.ok(historySession);
   const historyCredential = { roomId: historySession.roomId, sessionId: historySession.sessionId, token: historySession.token };
   const historyIdentity = await first.advanceGeneration(historyCredential, 0, opA, socketA);
@@ -456,7 +456,7 @@ try {
   check(historyRows?.[0].message === "6" && historyRows.at(-1)?.message === "105");
   check(historyRows?.every((row, i) => row.username === "History" && (!i || row.id > historyRows[i - 1].id)));
   check(!JSON.stringify(historyRows).includes(historySession.token));
-  check(await reader.read({ ...historyBinding, roomId: "foreign123" }) === null);
+  check(await reader.read({ ...historyBinding, roomId: "alien123" }) === null);
   // A remote generation change is denied even before local ownership catches up.
   const nextHistory = await first.advanceGeneration(historyCredential, 1, opB, socketB);
   assert.ok(nextHistory);
@@ -472,7 +472,7 @@ try {
   // Policy wins under a real lock wait; no history escapes the new version.
   const historyPid = (await operationPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
   await a.query("BEGIN");
-  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'history123'");
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'histo123'");
   const blockedHistory = reader.read(nextHistoryBinding);
   await waitForBlockedSecond(historyPid);
   await a.query("COMMIT");
