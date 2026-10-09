@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import { ResumeBindings, type ResumeBinding } from "./resume-bindings";
+import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./resume-upload-admission";
 
 export type OperationResult<T> = { authorized: false } | { authorized: true; value: T };
 
@@ -20,7 +21,7 @@ export class ResumeOperationGate {
 
   async run<T>(binding: ResumeBinding,
     work: (transaction: Pick<PoolClient, "query">) => Promise<T>): Promise<OperationResult<T>> {
-    return this.execute(binding, work, () => {});
+    return execute(this.pool, binding, () => this.bindings.isCurrent(binding), work, () => {});
   }
 
   // Private upload foundation. Keep legacy run's original rejection behavior.
@@ -30,18 +31,44 @@ export class ResumeOperationGate {
     work: (transaction: Pick<PoolClient, "query">) => Promise<T>): Promise<OperationOutcome<T>> {
     let commitDispatched = false;
     try {
-      const result = await this.execute(binding, work, () => { commitDispatched = true; });
+      const result = await execute(this.pool, binding, () => this.bindings.isCurrent(binding), work, () => { commitDispatched = true; });
       return { completed: true, result };
     } catch (error) {
       return { completed: false, commit: commitDispatched ? "unknown" : "not-dispatched", error };
     }
   }
 
-  private async execute<T>(binding: ResumeBinding,
+}
+
+// PRIVATE admitted HTTP lifetime: disconnect alone is allowed; a successor,
+// expired/released/copied grant or durable policy change is not. This gate does
+// not release the lease: the finalizer must await ALL stream/file/DB settlement.
+// No filesystem effects in work; a durable receipt is not publication authority.
+export class ResumeUploadOperationGate {
+  constructor(private readonly pool: Pick<Pool, "connect">,
+    private readonly admissions: ResumeUploadAdmissions) {}
+
+  async runWithOutcome<T>(grant: ResumeUploadGrant,
+    work: (transaction: Pick<PoolClient, "query">) => Promise<T>): Promise<OperationOutcome<T>> {
+    let commitDispatched = false;
+    try {
+      const result = await execute(this.pool, grant.binding,
+        () => this.admissions.isCurrent(grant), work, () => { commitDispatched = true; });
+      return { completed: true, result };
+    } catch (error) {
+      return { completed: false, commit: commitDispatched ? "unknown" : "not-dispatched", error };
+    }
+  }
+}
+
+// Shared transaction mechanics only; callers supply their DISTINCT authority
+// predicate. Never substitute upload lifetime for socket-operation authority.
+async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
+    isCurrent: () => boolean,
     work: (transaction: Pick<PoolClient, "query">) => Promise<T>,
     beforeCommit: () => void): Promise<OperationResult<T>> {
-    if (!this.bindings.isCurrent(binding)) return { authorized: false };
-    const client = await this.pool.connect();
+    if (!isCurrent()) return { authorized: false };
+    const client = await pool.connect();
     let destroy = false;
     try {
       await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
@@ -59,14 +86,14 @@ export class ResumeOperationGate {
             AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
         `, [binding.sessionId, binding.roomId, binding.username, binding.authVersion,
           binding.generation, binding.transportId]);
-        return result.rowCount === 1 && this.bindings.isCurrent(binding);
+        return result.rowCount === 1 && isCurrent();
       };
       if (!await valid()) {
         await client.query("ROLLBACK");
         return { authorized: false };
       }
       const value = await work({ query: client.query.bind(client) });
-      // Roll back writes if disconnected/expired while work awaited. This is a
+      // Roll back writes if caller authority expires while work awaited. This is a
       // pre-COMMIT check, not a promise to cancel a COMMIT already dispatched.
       if (!await valid()) {
         await client.query("ROLLBACK");
@@ -84,4 +111,3 @@ export class ResumeOperationGate {
       client.release(destroy);
     }
   }
-}

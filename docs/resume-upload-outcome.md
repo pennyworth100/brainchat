@@ -38,15 +38,24 @@ expiry fence subsequent work. Rejection is latched. Deadline, disconnect and
 generation replacement do NOT release capacity: only actual settlement allows
 the server finalizer to release. A stalled lease consumes capacity and fails closed.
 
-This is accounting, NOT bounded streaming implementation or durable authorization.
+Admission alone is accounting, NOT streaming implementation or durable authorization.
 There is no timer-driven stream abort, multipart parser, file writer, HTTP route,
-database grant validator or cleanup action here. Callers must bound parser metadata
+HTTP integration or cleanup action here. Callers must bound parser metadata
 and buffering, cancel streams safely, and retain leases until all work settles.
-Before any message COMMIT a future upload-specific DB gate must revalidate the
-captured generation, transport, policy, revocation and expiry under the existing
-room/session locks; disconnect alone may be allowed, a successor may not. Do NOT
-bypass the existing socket gate or claim this local grant authorizes persistence.
+The private `ResumeUploadOperationGate.runWithOutcome` now validates the exact
+issued grant before checkout, then its captured session/room/username, generation,
+transport, policy, revocation and DB-clock expiry AFTER room FOR SHARE and session
+FOR UPDATE locks, both before and after transactional work. Ordinary disconnect
+alone is allowed; local pending/failed successors and durable successors deny.
+Grant release, latched byte denial and monotonic deadline fence pre-COMMIT work.
+The shared transaction mechanics preserve the distinct live-socket predicate of
+`ResumeOperationGate`; no existing socket authority was extended.
 
-Next: upload-specific durable gate and idempotent receipt, then exclusive file
+The upload gate never releases the admission lease. Finalizers must await ALL
+stream, file and DB settlement, including a pending COMMIT. A deadline does not
+cancel a dispatched COMMIT. Lost ACKs remain unknown; no automatic retry,
+publication or unlink follows. This is a database-only result, not a file receipt.
+
+Next: session/key-scoped durable idempotent file receipt, then exclusive file
 ownership, bounded streaming and fenced publication. No filesystem operations in
 DB callbacks; no cleanup on deadline/unknown COMMIT. This is not upload acceptance.

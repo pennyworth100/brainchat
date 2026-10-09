@@ -5,7 +5,8 @@ import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeAdmission } from "../src/lib/resume-admission";
-import { ResumeOperationGate } from "../src/lib/resume-operation";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeImageWriter } from "../src/lib/resume-image";
@@ -720,6 +721,90 @@ try {
   });
   check(deniedOutcome.completed && !deniedOutcome.result.authorized);
   await outcomeAdmission.close();
+  // Admitted HTTP lifetime: real DB checks, no public handler or file effects.
+  await a.query("INSERT INTO rooms (id) VALUES ('upload123')");
+  const uploadBindings = new ResumeBindings();
+  let uploadClock = 0;
+  const uploads = new ResumeUploadAdmissions(uploadBindings, undefined, 1024, 100, () => uploadClock);
+  const uploadGate = new ResumeUploadOperationGate(operationPool, uploads);
+  const makeUpload = async () => {
+    const policy = (await a.query("SELECT auth_version FROM rooms WHERE id = 'upload123'")).rows[0].auth_version;
+    const session = await first.issueAfterAuthenticatedJoin("upload123", "Uploader", policy);
+    assert.ok(session);
+    const credential = { roomId: session.roomId, sessionId: session.sessionId, token: session.token };
+    const transport = "upload_" + session.sessionId;
+    const identity = await first.advanceGeneration(credential, 0, opA, transport);
+    assert.ok(identity);
+    const binding = await uploadBindings.activate(identity, transport, async () => {}, () => true);
+    assert.ok(binding);
+    const grant = uploads.admit(binding);
+    assert.ok(grant);
+    return { grant, binding, credential, identity };
+  };
+  for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-work",
+    "local-successor", "durable-successor", "revoke", "expiry", "policy", "work-fails", "lost-ack"]) {
+    const fixture = await makeUpload();
+    const { grant, binding } = fixture;
+    if (mode === "released") uploads.release(grant);
+    if (mode === "deadline") uploadClock += 100;
+    uploadBindings.detach(binding);
+    let writes = 0;
+    let commits = 0;
+    const selectedGate = mode === "lost-ack" ? new ResumeUploadOperationGate({ connect: async () => {
+      const real = await operationPool.connect();
+      return { query: async (...args: unknown[]) => {
+        const result = await (real.query as Function).apply(real, args);
+        if (args[0] === "COMMIT") { commits++; throw Error("lost upload ACK"); }
+        return result;
+      }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    } }, uploads) : uploadGate;
+    // Mutations commit while the operation is demonstrably blocked on its lock.
+    const contention = ["durable-successor", "revoke", "expiry", "policy"].includes(mode);
+    // Earlier uncertain outcomes destroy checkouts; probe the CURRENT backend.
+    let uploadPid = 0;
+    if (contention) {
+      const probe = await operationPool.connect();
+      uploadPid = (await probe.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      probe.release();
+      await a.query("BEGIN");
+      if (mode === "policy") await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'upload123'");
+      else {
+        await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [binding.sessionId]);
+        if (mode === "durable-successor") await first.advanceGeneration(fixture.credential, 1, opB, socketB);
+        if (mode === "revoke") await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [binding.sessionId]);
+        if (mode === "expiry") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [binding.sessionId]);
+      }
+    }
+    const pending = selectedGate.runWithOutcome(mode === "copied" ? { ...grant } : grant, async tx => {
+      writes++;
+      await insertResumeTextMessage(tx, binding, "upload-" + mode);
+      if (mode === "deadline-work") uploadClock += 100;
+      if (mode === "local-successor") {
+        await assert.rejects(uploadBindings.activate({ ...fixture.identity, generation: 2 },
+          "successor_" + binding.sessionId, async () => { throw Error("prepare failure"); }, () => true));
+      }
+      if (mode === "work-fails") throw Error("upload work rollback");
+      return "upload receipt";
+    });
+    if (contention) { await waitForBlockedSecond(uploadPid); await a.query("COMMIT"); }
+    const result = await pending;
+    const rows = (await a.query("SELECT id FROM messages WHERE room_id = 'upload123' AND content = $1", ["upload-" + mode])).rowCount;
+    if (mode === "disconnect") {
+      check(result.completed && result.result.authorized);
+      check(rows === 1 && writes === 1);
+    } else if (mode === "lost-ack") {
+      check(!result.completed && result.commit === "unknown");
+      check(rows === 1 && commits === 1);
+    } else if (mode === "work-fails") {
+      check(!result.completed && result.commit === "not-dispatched");
+      check(rows === 0 && writes === 1);
+    } else {
+      check(result.completed && !result.result.authorized);
+      check(rows === 0);
+      if (contention || ["copied", "released", "deadline"].includes(mode)) check(writes === 0);
+    }
+    check(uploads.release(grant) === (mode !== "released"));
+  }
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
