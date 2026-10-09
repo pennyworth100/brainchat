@@ -23,6 +23,9 @@ It does not parse multipart, validate a file, publish a message or release lease
 Future composition needs an audited maintained multipart parser with field/file
 limits, a real IncomingMessage abort/closure adapter, checkContinue/checkExpectation
 handling, server header/time limits, parser/file settlement and disk reconciliation.
-The inspected lockfile pins multer 1.4.5-lts.2 and busboy 1.6.0. Do not assume
-this legacy multer is suitable: audit maintenance/security and parser lifecycle
-before composition. Do not handroll a multipart parser.
+After the 3.0.10 security re-baseline, the lockfile pins multer 2.4.0 and busboy
+1.6.0. The public parser denies all text fields before append-field; upgrading
+multer alone did not prevent the reproduced sparse-field CPU denial of service.
+This does not approve either library for private resume composition: verify
+header/resource bounds, backpressure and parser/file settlement against these
+contracts first. Do not handroll a multipart parser.
