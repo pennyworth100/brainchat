@@ -14,6 +14,7 @@ import { ResumeFileStorage } from "../src/lib/resume-file-storage";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { inventoryUploadLedger } from "../src/lib/resume-ledger-inventory";
 
 // Isolated fixture only: kills application workers, NEVER PostgreSQL.
 // Recovery is read-only inventory, NOT replay, deletion, refund or activation.
@@ -219,6 +220,39 @@ async function main() {
     check(JSON.parse(expired.messages[0].content).url === "/uploads/" + committed.storage_key + "/blob");
     check(expired.charged === ceiling * 2);
     evidence.push({ case: "session-cascade", classification: "message-reference-without-retry-receipt", charged: expired.charged });
+    const inventory = (maxRows = 10) => pool.connect().then(client => inventoryUploadLedger(client,
+      { pageSize: 1, maxRows, timeoutMs: 2000 }));
+    const full = await inventory();
+    check(full.complete && full.accounting === "consistent");
+    check(full.attempts.length === 2 && full.observedReservedBytes === "2048");
+    check(full.attempts.some(a => a.session_id === committed.session_id));
+    check(full.unobserved.join() === "receipts,messages,filesystem" && full.crossStoreStability === "unproven");
+    const capped = await inventory(1);
+    check(!capped.complete && capped.accounting === "unknown" && capped.reasons.includes("row-limit"));
+    check(capped.attempts.length === 1 && capped.lastStorageKey === full.attempts[0].storage_key);
+    const exact = await inventory(2);
+    check(exact.complete && exact.accounting === "consistent");
+    // Hold a fixture-only lock to force a genuine PostgreSQL statement deadline.
+    const locker = await pool.connect();
+    try {
+      await locker.query("BEGIN");
+      await locker.query("LOCK TABLE resume_upload_attempts IN ACCESS EXCLUSIVE MODE");
+      const timed = await pool.connect().then(client => inventoryUploadLedger(client,
+        { pageSize: 1, maxRows: 10, timeoutMs: 50 }));
+      check(!timed.complete && timed.accounting === "unknown" && timed.reasons.includes("deadline"));
+      check(timed.attempts.length === 0);
+    } finally { await locker.query("ROLLBACK"); locker.release(); }
+    await pool.query("UPDATE resume_upload_budget SET reserved_bytes=0");
+    const mismatch = await inventory();
+    check(mismatch.complete && mismatch.accounting === "inconsistent" && mismatch.reasons.includes("counter-sum-mismatch"));
+    await pool.query("DELETE FROM resume_upload_budget");
+    const absent = await inventory();
+    check(absent.complete && absent.accounting === "inconsistent" && absent.reasons.includes("missing-budget"));
+    check(absent.attempts.length === 2);
+    await pool.query("INSERT INTO resume_upload_budget VALUES (1, $1, $1)", [ceiling * 2]);
+    check((await inventory()).observedReservedBytes === "2048");
+    evidence.push({ case: "private-ledger-collector", checks: 13, pagination: "full/capped/exact",
+      deadline: "real-lock-wait", mismatch: "detected", missingBudget: "inconsistent", scope: "ledger-only" });
     console.log(JSON.stringify({ passed: checks, evidence,
       limitations: "Worker crash only; no PostgreSQL/power-loss, disk-quota, public HTTP or backup proof" }));
   } finally {
