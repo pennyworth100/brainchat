@@ -273,3 +273,31 @@ Next implementation slice: filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.
+
+## Private bounded content observation
+
+`observeUploadBlobContent` has no runtime caller. It opens only root/key/blob,
+using the same trusted stable ENTIRE-ancestry precondition as metadata observation
+(root and keyed directory included). Held handles and sequential identity checks
+are not openat, hostile same-uid/ABA protection or a filesystem snapshot.
+
+Before the first await it copies explicit maxBytes (0..64 MiB), maxReads
+(1..4096), maxMs (1..30000), and the ancestry assertion. Stat size above the
+byte ceiling is rejected before reading. One reusable buffer of at most 64 KiB,
+explicit offsets, and a read-operation ceiling bound memory, bytes and work.
+Positive short reads continue within those bounds; premature zero/EOF is
+incomplete. It reads precisely the initial stat size, without a one-byte EOF
+probe that could exceed the ceiling; post-read stat/identity checks detect growth.
+An empty regular file can be hashed with a zero byte budget and no content reads.
+Deadlines fence admission and late results, not pending kernel I/O/close latency.
+All handles are closed and awaited even on failure. Reads may update filesystem
+atime; this is not a forensic no-touch reader.
+
+Only an unchanged-at-checks, fully read, successfully closed observation exposes
+SHA-256. Any error, mutation, limit or close failure leaves sha256 null and
+complete false; positive size and valid bytes-read counts remain observations.
+No raw content, file path or exception detail is returned. The digest is only
+measured local bytes under these preconditions, not declared-metadata agreement,
+ownership, full identity, durability, current authorization or safe reclamation.
+Cross-store stability stays unproven. No DB/FS atomicity is claimed.
+No live volume was read; no repair, refund, deletion, replay or activation added.
