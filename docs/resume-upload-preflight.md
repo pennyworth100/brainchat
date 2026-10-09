@@ -61,5 +61,22 @@ Still required (NOT implemented/proven by this seam):
   path; require proof that every relevant receipt/attempt cannot reference it.
 - Public error mapping, Origin/CSRF and CORS policy, TLS, secret redaction, real
   HTTP rejection tests before parser/FS, disconnect/replacement races and fault
-  tests across all finalizers. Eight loopback lifecycle regressions added here
-  stub the DB authentication result; existing real DB lookup tests are separate.
+  tests across all finalizers.
+
+## Integration evidence
+
+The eight local loopback lifecycle regressions stub the DB authentication result.
+The isolated PostgreSQL CI harness now additionally composes real Socket.IO
+connections, actual owner admission/membership, and actual ResumeStore lookup.
+It checks an exact-binding grant; same-length forged bearer, wrong room,
+revocation, expiry, policy change and a durable successor with stale local state.
+
+An ACCESS EXCLUSIVE fixture-table lock blocks the actual lookup SELECT; observed
+pg_stat_activity lock wait (not an elapsed sleep) gates owner close/replacement.
+The controller performs the successor CAS on its own lock-holding transaction;
+membership is installed before that isolated fixture transaction commits. The old
+read must return no grant and cannot redirect to the successor. A separate close
+case preserves durable identity and physical connectivity, isolating the local
+owner fence. A fresh lookup at the successor must grant its exact generation.
+The body-boundary counter is a harness assertion, not proof about a public HTTP
+parser, network buffering or a running production route.

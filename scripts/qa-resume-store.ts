@@ -16,6 +16,12 @@ import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeFileStorage } from "../src/lib/resume-file-storage";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { claimRoomPolicy } from "../src/lib/room-policy";
+import { createServer } from "node:http";
+import { Server, type Socket as ServerSocket } from "socket.io";
+import { io, type Socket as ClientSocket } from "socket.io-client";
+import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
+import { ResumeMemberships } from "../src/lib/resume-membership";
+import { preflightResumeUpload } from "../src/lib/resume-upload-preflight";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
 async function main() {
@@ -969,7 +975,121 @@ try {
     check(uploads.release(revokedGrant));
     check((await readdir(byteRoot)).length === 9 && await countFiles() === baseline);
   } finally { await rm(byteRoot, { recursive: true, force: true }); }
-  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
+  // Real loopback owners + actual bearer lookup. No public route/parser wiring.
+  const beforePreflight = checks;
+  const http = createServer(), sockets = new Server(http);
+  const clients: ClientSocket[] = [], owners: ResumeSocketOwner[] = [];
+  const preflightBindings = new ResumeBindings();
+  const members = new ResumeMemberships(preflightBindings);
+  const preflightUploads = new ResumeUploadAdmissions(preflightBindings);
+  const cleanupErrors: unknown[] = [];
+  await new Promise<void>(resolve => http.listen(0, "127.0.0.1", resolve));
+  const address = http.address(); assert.ok(address && typeof address !== "string");
+  const connectOwner = async () => {
+    const connected = new Promise<ServerSocket>(resolve => sockets.once("connection", resolve));
+    const client = io(`http://127.0.0.1:${address.port}`, { transports: ["websocket"], reconnection: false });
+    clients.push(client);
+    const ready = new Promise<void>((resolve, reject) => {
+      client.once("connect", resolve); client.once("connect_error", reject);
+    });
+    const socket = await connected; await ready;
+    const owner = attachResumeSocket(socket, { store: first, bindings: preflightBindings,
+      memberships: members, prepare: async () => async () => {},
+      onCleanupError: error => cleanupErrors.push(error) });
+    owners.push(owner);
+    return { socket, owner };
+  };
+  let bodies = 0;
+  try {
+    await a.query("INSERT INTO rooms (id) VALUES ('prefl123'), ('other123')");
+    const fixture = async () => {
+      const issued = await first.issueAfterAuthenticatedJoin("prefl123", "Upload guest", 1);
+      assert.ok(issued);
+      const credential = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+      const physical = await connectOwner();
+      const binding = await physical.owner.admit({ credential, expectedGeneration: 0,
+        operationId: "preflight_" + issued.sessionId });
+      assert.ok(binding);
+      check(members.bindingFor(physical.socket, physical.owner, issued.roomId) === binding);
+      return { ...physical, credential, binding };
+    };
+    const run = async (f: Awaited<ReturnType<typeof fixture>>, credential = f.credential) => {
+      const grant = await preflightResumeUpload(f.socket, f.owner, members, second,
+        preflightUploads, credential);
+      // This counter represents the caller's source/file boundary, NOT an HTTP
+      // parser assertion. No source or filesystem object is created on denial.
+      if (grant) bodies++;
+      return grant;
+    };
+    const valid = await fixture();
+    const grant = await run(valid); assert.ok(grant);
+    check(grant.binding === valid.binding && preflightUploads.isCurrent(grant));
+    check(bodies === 1); check(preflightUploads.release(grant)); bodies = 0;
+    const forged = randomBytes(32).toString("base64url");
+    check(forged.length === valid.credential.token.length);
+    check(await run(valid, { ...valid.credential, token: forged }) === null);
+    check(await run(valid, { ...valid.credential, roomId: "other123" }) === null);
+    const revoked = await fixture();
+    check(await first.revoke(revoked.credential, 1));
+    check(await run(revoked) === null);
+    const expiredFixture = await fixture();
+    await a.query("UPDATE room_resume_sessions SET expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
+      [expiredFixture.binding.sessionId]);
+    check(await run(expiredFixture) === null);
+    const remote = await fixture();
+    assert.ok(await first.advanceGeneration(remote.credential, 1, "remote_preflight_123", "remote_transport_123"));
+    check(members.isCurrent(remote.binding, remote.binding.roomId)); // intentionally stale local state
+    check(await run(remote) === null);
+
+    for (const loss of ["close", "replace"] as const) {
+      const old = await fixture();
+      const next = loss === "replace" ? await connectOwner() : null;
+      // ACCESS EXCLUSIVE blocks the actual SELECT (row locks do not). The
+      // controller can still perform a CAS on its own connection/transaction.
+      await a.query("BEGIN");
+      let flight: ReturnType<typeof run> | undefined;
+      try {
+        await a.query("LOCK TABLE room_resume_sessions IN ACCESS EXCLUSIVE MODE");
+        flight = run(old);
+        await waitForBlockedSecond();
+        check(bodies === 0);
+        if (next) {
+          const successor = await next.owner.admit({ credential: old.credential,
+            expectedGeneration: 1, operationId: "replacement_" + old.binding.sessionId });
+          assert.ok(successor);
+          check(members.bindingFor(next.socket, next.owner, old.binding.roomId) === successor);
+          check(!old.socket.connected);
+        } else {
+          await old.owner.close();
+          check(old.socket.connected); // close fences even a physically connected socket
+        }
+        check(members.bindingFor(old.socket, old.owner, old.binding.roomId) === null);
+        await a.query("COMMIT");
+        check(await flight === null); check(bodies === 0);
+        if (next) {
+          const successorGrant = await preflightResumeUpload(next.socket, next.owner, members,
+            second, preflightUploads, old.credential);
+          assert.ok(successorGrant);
+          check(successorGrant.binding.generation === 2 && successorGrant.binding !== old.binding);
+          check(preflightUploads.release(successorGrant));
+        }
+      } finally {
+        await a.query("ROLLBACK");
+        await flight; // release the DB barrier before awaiting any pending read
+      }
+    }
+    // Policy invalidation comes last so each earlier fixture uses authVersion 1.
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'prefl123'");
+    check(await run(valid) === null); check(bodies === 0);
+  } finally {
+    await Promise.all(owners.map(owner => owner.close()));
+    for (const client of clients) client.disconnect();
+    await new Promise<void>(resolve => sockets.close(() => resolve()));
+  }
+  check(cleanupErrors.length === 0);
+  console.log(JSON.stringify({ suite: "resume-upload-preflight-postgresql-loopback", checks: checks - beforePreflight,
+    result: "PASS", scope: "real bearer lookup, physical owners, durable denials and observed DB lock races; no public HTTP parser" }));
+  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts, expiry cleanup and private preflight loopback; not full socket resume" }));
 } finally {
   await a.query("ROLLBACK");
   await a.query('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE');
