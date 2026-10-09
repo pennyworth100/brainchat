@@ -18,6 +18,86 @@ const savedText = (inserted = true): OperationResult<ResumeTextWrite> => ({ auth
   value: { inserted, message: { id: 71, type: "message", username: "Alice", message: "hello", ts: 123 } } });
 const textPayload = () => ({ roomId: "candy986", clientMessageId: "request_1", message: "hello" });
 
+test("text deadline returns uncertain identity, retains both leases and suppresses late commit publication", async t => {
+  const first = await syncFixture(t), second = await syncFixture(t);
+  const cap = new ResumeCapacity(1), gate = deferred<OperationResult<ResumeTextWrite>>();
+  let writes = 0, acks = 0;
+  const fanout = t.mock.method(first.members, "broadcastExcept", () => assert.fail("late fanout"));
+  const run = (f: typeof first, capacity = cap) => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; return gate.promise; } }, textPayload(),
+    () => { acks++; }, { capacity, timeoutMs: 15 });
+  assert.deepEqual(await run(first), { committed: null, reason: "deadline", clientMessageId: "request_1" });
+  assert.deepEqual(await run(first, new ResumeCapacity(1)), { committed: false });
+  assert.deepEqual(await run(second), { committed: false });
+  assert.deepEqual([writes, acks], [1, 0]);
+  gate.resolve(savedText()); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(acks, 0); assert.equal(fanout.mock.callCount(), 0);
+  assert.equal((await run(second)).committed, true); assert.equal(writes, 2);
+});
+
+test("text timeout observes late COMMIT rejection once even if reporter fails, without retry", async t => {
+  const f = await syncFixture(t), cap = new ResumeCapacity(1), gate = deferred<void>();
+  const error = Error("unknown COMMIT"), reports: unknown[] = [];
+  const failures = t.mock.method(console, "error", () => {});
+  let writes = 0;
+  const pending = sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; await gate.promise; throw error; } }, textPayload(),
+    () => assert.fail("late ACK"), { capacity: cap, timeoutMs: 15,
+      onLateError: error => { reports.push(error); throw Error("reporter failed"); } });
+  assert.equal((await pending).committed, null); assert.equal(cap.acquire(), null);
+  await f.owner.close(); assert.equal(cap.acquire(), null);
+  gate.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(reports, [error]); assert.equal(writes, 1); assert.equal(failures.mock.callCount(), 1);
+  const release = cap.acquire(); assert.ok(release); release();
+});
+
+test("text monotonic deadline handles success, denial and rejection before delayed timer delivery", async t => {
+  for (const outcome of ["success", "denial", "error"]) {
+    const f = await syncFixture(t), reports: unknown[] = [], error = Error("late COMMIT");
+    const fanout = t.mock.method(f.members, "broadcastExcept", () => assert.fail("late fanout"));
+    const result = await sendResumeText(f.socket, f.owner, f.binding, f.members, {
+      saveOnceWithOutcome: async () => {
+        const until = performance.now() + 20;
+        while (performance.now() < until) { /* block timer delivery deliberately */ }
+        if (outcome === "error") throw error;
+        return outcome === "denial" ? { authorized: false } : savedText();
+      },
+    }, textPayload(), () => assert.fail("late ACK"), { timeoutMs: 5, onLateError: e => { reports.push(e); } });
+    assert.deepEqual(result, { committed: null, reason: "deadline", clientMessageId: "request_1" });
+    assert.deepEqual(reports, outcome === "error" ? [error] : []); assert.equal(fanout.mock.callCount(), 0);
+  }
+});
+
+test("text invalid deadlines fail before dispatch and early COMMIT errors remain explicit", async t => {
+  const f = await syncFixture(t), cap = new ResumeCapacity(1); let writes = 0, reports = 0;
+  const run = (timeoutMs: number) => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; throw Error("uncertain COMMIT"); } }, textPayload(),
+    () => assert.fail("ACK"), { capacity: cap, timeoutMs, onLateError: () => { reports++; } });
+  for (const value of [0, -1, 0.5, NaN, Infinity, 2_147_483_648]) {
+    await assert.rejects(run(value), /Invalid send deadline/);
+  }
+  assert.equal(writes, 0);
+  await assert.rejects(run(10_000), /uncertain COMMIT/);
+  await assert.rejects(run(10_000), /uncertain COMMIT/);
+  assert.deepEqual([writes, reports], [2, 0]);
+  const release = cap.acquire(); assert.ok(release); release();
+});
+
+test("text slow synchronous ACK preserves committed result but deadline fences subsequent fanout", async t => {
+  const f = await syncFixture(t);
+  t.mock.method(f.members, "broadcastExcept", () => assert.fail("overdue fanout"));
+  const result = await sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedText() }, textPayload(), () => {
+      const until = performance.now() + 20;
+      while (performance.now() < until) { /* ACK already started before deadline */ }
+      void f.owner.close();
+      throw Error("slow ACK failure");
+    }, { timeoutMs: 5 });
+  assert.ok(result.committed); assert.equal(result.ack, "failed"); assert.equal(result.fanout, "skipped");
+  assert.equal(result.errors[0].stage, "ack");
+});
+
+
 test("text send shares per-socket exclusion even with distinct capacity objects", async t => {
   const f = await syncFixture(t), gate = deferred<OperationResult<ResumeTextWrite>>();
   let writes = 0, acks = 0;

@@ -25,6 +25,18 @@ Leases remain held through synchronous publication and release on settlement,
 including denial, uncertain COMMIT errors and post-commit handoff failures.
 This is concurrency control, NOT a rate limit, cancellation or retry permission.
 
-This remains PRIVATE and unregistered. Send deadline/rate controls,
+The server-owned monotonic deadline defaults to 10 seconds. Timeout returns
+`{ committed: null, reason: "deadline", clientMessageId }`, NOT a negative ACK:
+the caller must preserve the original ID/content and treat the write as pending
+or uncertain. It must not automatically retry or mint a replacement ID. This
+invocation never hands off late ACK/fanout; history reconciliation is required.
+Both leases remain occupied until actual write settlement, even after timeout
+and owner loss. Late rejection is observed once through the server-owned error
+reporter (default console error), without turning it into an unhandled rejection.
+Early errors still propagate and a COMMIT error must also be treated as uncertain.
+A synchronous handoff started before deadline preserves its committed outcome;
+the deadline is rechecked before subsequent fanout. This is NOT DB cancellation.
+
+This remains PRIVATE and unregistered. Send rate controls,
 image/upload/integration broadcasts, DM guards, UI reconciliation and the full
 acceptance matrix must precede coherent public-handler migration. No deployment.
