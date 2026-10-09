@@ -126,3 +126,9 @@ verified at the exact commit before claiming these integration checks passed.
 Next: cancellation during delayed writes/closes, bounded
 multipart/HTTP ownership, then fenced publication and durable reconciliation.
 No public handler imports this module. This is not full upload acceptance.
+
+The separate [private reservation ledger](resume-upload-reservation.md) persists
+an attempt key and byte ceiling atomically before callers may create files. It is
+not yet composed here: storage still chooses its own key. Connecting the SAME
+opaque reservation to the storage key/ceiling is a required next gate, not a
+completed end-to-end guarantee. No budget was provisioned and no path activated.

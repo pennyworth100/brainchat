@@ -1,4 +1,6 @@
+import { sql } from "drizzle-orm";
 import {
+  check,
   bigint,
   integer,
   index,
@@ -72,3 +74,21 @@ export const resumeMessageReceipts = pgTable("resume_message_receipts", {
   primaryKey({ columns: [table.sessionId, table.clientMessageId] }),
   index("resume_receipts_message_idx").on(table.messageId),
 ]);
+
+// PRIVATE: absent budget row denies all uploads. Provision only after a real
+// volume/headroom audit. No automatic seed, refund, cleanup or cascading delete.
+export const resumeUploadBudget = pgTable("resume_upload_budget", {
+  id: integer("id").primaryKey(),
+  capacityBytes: bigint("capacity_bytes", { mode: "number" }).notNull(),
+  reservedBytes: bigint("reserved_bytes", { mode: "number" }).default(0).notNull(),
+}, t => [check("resume_upload_budget_bounds", sql`${t.id} = 1 AND ${t.capacityBytes} > 0 AND ${t.capacityBytes} <= 9007199254740991 AND ${t.reservedBytes} >= 0 AND ${t.reservedBytes} <= ${t.capacityBytes}`)]);
+
+// Provenance intentionally survives session/room/receipt expiry and deletion.
+export const resumeUploadAttempts = pgTable("resume_upload_attempts", {
+  storageKey: varchar("storage_key", { length: 64 }).primaryKey(),
+  sessionId: text("session_id").notNull(),
+  roomId: text("room_id").notNull(),
+  clientMessageId: varchar("client_message_id", { length: 128 }).notNull(),
+  reservedBytes: bigint("reserved_bytes", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [check("resume_upload_attempt_bounds", sql`${t.reservedBytes} > 0 AND ${t.reservedBytes} <= 104857600 AND ${t.storageKey} ~ '^[0-9a-f]{64}$'`)]);
