@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
+import { ResumeAdmission } from "../src/lib/resume-admission";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { claimRoomPolicy } from "../src/lib/room-policy";
@@ -520,6 +521,60 @@ try {
   check(await first.cleanupExpired() === 1);
   check(await first.cleanupExpired() === 0);
   await b.query("RESET statement_timeout");
+  // Real CAS blocked inside PostgreSQL: conflicting admission must not reach DB,
+  // and disconnect must fence activation without pretending to cancel the CAS.
+  await a.query("INSERT INTO rooms (id) VALUES ('admit123')");
+  const admissionSession = await first.issueAfterAuthenticatedJoin("admit123", "Admission", 1);
+  const otherSession = await first.issueAfterAuthenticatedJoin("admit123", "Other", 1);
+  assert.ok(admissionSession && otherSession);
+  const admissionCredential = { roomId: admissionSession.roomId, sessionId: admissionSession.sessionId, token: admissionSession.token };
+  const otherCredential = { roomId: otherSession.roomId, sessionId: otherSession.sessionId, token: otherSession.token };
+  const request = { credential: admissionCredential, expectedGeneration: 0, operationId: opA };
+  const admissionBindings = new ResumeBindings();
+  let admissionCalls = 0, admissionPrepares = 0;
+  const admission = new ResumeAdmission({ advanceGeneration: async (...args) => {
+    admissionCalls++; return second.advanceGeneration(...args);
+  } }, admissionBindings, "admission_transport_1", () => true, async () => {
+    admissionPrepares++; return async () => {};
+  });
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [admissionSession.sessionId]);
+  const pendingAdmission = admission.admit(request);
+  await waitForBlockedSecond();
+  check(admission.admit(request) === pendingAdmission);
+  check(await admission.admit({ ...request, credential: otherCredential }) === null);
+  check(await admission.admit({ ...request, operationId: opB }) === null);
+  check((await first.lookup(otherCredential))?.generation === 0);
+  check(admissionCalls === 1);
+  const admissionClosing = admission.close();
+  await a.query("COMMIT");
+  check(await pendingAdmission === null);
+  await admissionClosing;
+  check(admissionPrepares === 0);
+  check((await first.lookup(admissionCredential))?.generation === 1);
+  check(await admission.admit(request) === null);
+  const replacement = new ResumeAdmission(second, admissionBindings, "admission_transport_2", () => true,
+    async () => async () => {});
+  const recoveredBinding = await replacement.admit({ ...request, expectedGeneration: 1, operationId: opB });
+  check(recoveredBinding?.generation === 2 && admissionBindings.isCurrent(recoveredBinding));
+  check(await replacement.admit({ ...request, expectedGeneration: 1, operationId: opB }) === recoveredBinding);
+  check((await first.lookup(admissionCredential))?.generation === 2);
+  await replacement.close();
+  check(!admissionBindings.isCurrent(recoveredBinding!));
+  // A real successful autocommit with a lost response remains terminal locally.
+  let uncertainCalls = 0;
+  const uncertainAdmission = new ResumeAdmission({ advanceGeneration: async (...args) => {
+    uncertainCalls++; assert.ok(await second.advanceGeneration(...args));
+    throw Error("simulated lost CAS acknowledgment");
+  } }, admissionBindings, "admission_transport_3", () => true, async () => {
+    throw Error("must not prepare after uncertain CAS");
+  });
+  const uncertainRequest = { ...request, credential: otherCredential };
+  await assert.rejects(uncertainAdmission.admit(uncertainRequest), /lost CAS/);
+  await assert.rejects(uncertainAdmission.admit(uncertainRequest), /lost CAS/);
+  check(uncertainCalls === 1);
+  check((await first.lookup(otherCredential))?.generation === 1);
+  await uncertainAdmission.close();
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
