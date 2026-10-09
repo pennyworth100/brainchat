@@ -16,6 +16,15 @@ replaying earlier recipients. Handoff is NOT network delivery. The caller must
 observe these errors and reconcile history; this is not a transactional outbox.
 Crash or sender loss after COMMIT can leave a stored row without live fanout.
 
-This remains PRIVATE and unregistered. Send capacity/deadline/rate controls,
+Unresolved writes share one lease per physical socket and a process budget of
+100. Busy requests return `committed: false` before DB dispatch; this says only
+that THIS invocation did not write, never that a same-key outstanding write did
+not commit. The server may inject a shared smaller capacity; client payloads
+cannot control it. Disconnect/replacement does not release unresolved leases.
+Leases remain held through synchronous publication and release on settlement,
+including denial, uncertain COMMIT errors and post-commit handoff failures.
+This is concurrency control, NOT a rate limit, cancellation or retry permission.
+
+This remains PRIVATE and unregistered. Send deadline/rate controls,
 image/upload/integration broadcasts, DM guards, UI reconciliation and the full
 acceptance matrix must precede coherent public-handler migration. No deployment.

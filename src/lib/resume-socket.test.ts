@@ -18,6 +18,72 @@ const savedText = (inserted = true): OperationResult<ResumeTextWrite> => ({ auth
   value: { inserted, message: { id: 71, type: "message", username: "Alice", message: "hello", ts: 123 } } });
 const textPayload = () => ({ roomId: "candy986", clientMessageId: "request_1", message: "hello" });
 
+test("text send shares per-socket exclusion even with distinct capacity objects", async t => {
+  const f = await syncFixture(t), gate = deferred<OperationResult<ResumeTextWrite>>();
+  let writes = 0, acks = 0;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return gate.promise; } };
+  const run = () => sendResumeText(f.socket, f.owner, f.binding, f.members, writer,
+    textPayload(), () => { acks++; }, { capacity: new ResumeCapacity(1) });
+  const first = run();
+  assert.deepEqual(await run(), { committed: false }); assert.equal(writes, 1);
+  gate.resolve(savedText()); assert.ok((await first).committed);
+  assert.ok((await run()).committed); assert.equal(writes, 2); assert.equal(acks, 2);
+});
+
+test("text send aggregate capacity rejects before DB and releases on actual settlement", async t => {
+  const first = await syncFixture(t), second = await syncFixture(t);
+  const cap = new ResumeCapacity(1), gate = deferred<OperationResult<ResumeTextWrite>>();
+  let writes = 0;
+  const run = (f: typeof first) => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; return gate.promise; } }, textPayload(), () => {}, { capacity: cap });
+  const pending = run(first);
+  assert.deepEqual(await run(second), { committed: false }); assert.equal(writes, 1);
+  gate.resolve(savedText()); assert.ok((await pending).committed);
+  assert.ok((await run(second)).committed); assert.equal(writes, 2);
+});
+
+test("text send owner close and replacement cannot free unresolved COMMIT capacity", async t => {
+  const f = await syncFixture(t), cap = new ResumeCapacity(1), gate = deferred<OperationResult<ResumeTextWrite>>();
+  let writes = 0;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return gate.promise; } };
+  const pending = sendResumeText(f.socket, f.owner, f.binding, f.members, writer,
+    textPayload(), () => assert.fail("stale ACK"), { capacity: cap });
+  await f.owner.close(); assert.equal(cap.acquire(), null);
+  const next = await f.connect(), owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => identity(2) } });
+  t.after(() => owner.close()); const binding = await owner.admit(request(1)); assert.ok(binding);
+  const run = () => sendResumeText(next.socket, owner, binding, f.members, writer,
+    textPayload(), () => {}, { capacity: cap });
+  assert.deepEqual(await run(), { committed: false }); assert.equal(writes, 1);
+  gate.resolve(savedText()); const result = await pending; assert.ok(result.committed);
+  assert.equal(result.ack, "skipped"); assert.equal(result.fanout, "skipped");
+  assert.ok((await run()).committed); assert.equal(writes, 2);
+});
+
+test("text send denial and uncertain COMMIT errors release leases without automatic retry", async t => {
+  const f = await syncFixture(t), cap = new ResumeCapacity(1); let writes = 0;
+  const run = (fail: boolean) => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; if (fail) throw Error("uncertain COMMIT"); return { authorized: false }; } },
+    textPayload(), () => assert.fail("denied ACK"), { capacity: cap });
+  assert.deepEqual(await run(false), { committed: false });
+  await assert.rejects(run(true), /uncertain COMMIT/);
+  assert.deepEqual(await run(false), { committed: false }); assert.equal(writes, 3);
+  const release = cap.acquire(); assert.ok(release); release();
+});
+
+test("text send reentrant ACK cannot start another write before first handoff settles", async t => {
+  const f = await syncFixture(t), cap = new ResumeCapacity(1); let writes = 0;
+  let nested: Promise<unknown> | undefined;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return savedText(); } };
+  const run = () => sendResumeText(f.socket, f.owner, f.binding, f.members, writer, textPayload(), () => {
+    nested = sendResumeText(f.socket, f.owner, f.binding, f.members, writer, textPayload(), () => {}, { capacity: cap });
+    throw Error("ACK failed");
+  }, { capacity: cap });
+  const result = await run(); assert.ok(result.committed); assert.equal(result.ack, "failed");
+  assert.deepEqual(await nested, { committed: false }); assert.equal(writes, 1);
+  assert.ok((await run()).committed); assert.equal(writes, 2);
+});
+
 test("text adapter rejects invalid payload and copied/wrong physical authority before DB", async t => {
   const f = await syncFixture(t), other = await f.connect(); let writes = 0;
   const writer = { saveOnceWithOutcome: async () => { writes++; return savedText(); } };
