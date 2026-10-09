@@ -23,6 +23,8 @@ async function fixture(t: TestContext, mode = "ok") {
   const grant = admissions.admit(binding)!;
   let unblock!: () => void;
   const blocked = new Promise<void>(r => { unblock = r; });
+  let enteredCommit!: () => void;
+  const commitEntered = new Promise<void>(r => { enteredCommit = r; });
   const writer = new ResumeFileWriter(new ResumeUploadOperationGate({ connect: async () => {
     connects++;
     return { query: async (sql: string, args: unknown[] = []) => {
@@ -39,6 +41,7 @@ async function fixture(t: TestContext, mode = "ok") {
       }
       if (sql === "COMMIT") {
         commits++;
+        enteredCommit();
         if (mode === "delayed") await blocked;
         if (mode === "unknown") throw Error("lost ACK");
       }
@@ -48,7 +51,7 @@ async function fixture(t: TestContext, mode = "ok") {
   const storage = new ResumeFileStorage(root, admissions);
   const upload = new ResumeFileUpload(storage, writer);
   return { root, grant, binding, admissions, bindings, storage, writer, upload,
-    stats: () => ({ connects, inserts, commits }), time: (n: number) => { now = n; }, unblock };
+    stats: () => ({ connects, inserts, commits }), time: (n: number) => { now = n; }, unblock, commitEntered };
 }
 const metadata = { name: "report.txt", mime: "text/plain" };
 async function* bytes() { yield Buffer.from("abc"); }
@@ -108,7 +111,7 @@ test("pending COMMIT and duplicate remain pending through expiry; capacity is no
   const first = f.upload.saveWithOutcome(f.grant, "key", metadata, bytes());
   let duplicateDone = false;
   const duplicate = f.upload.saveWithOutcome(f.grant, "another", metadata, bytes()).then(r => { duplicateDone = true; return r; });
-  for (let i = 0; i < 1000 && f.stats().commits === 0; i++) await new Promise(r => setImmediate(r));
+  await f.commitEntered;
   assert.equal(f.stats().commits, 1);
   f.time(100); await new Promise(r => setImmediate(r));
   assert.equal(duplicateDone, false); assert.equal(f.admissions.admit(f.binding), null);
