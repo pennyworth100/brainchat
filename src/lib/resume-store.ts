@@ -27,6 +27,27 @@ function validCredential(value: ResumeCredential) {
 export class ResumeStore {
   constructor(private readonly database: Database) {}
 
+  // Internal, explicitly invoked maintenance only; no live scheduler yet.
+  // Bound session rows, not cascade cost: receipt volume still needs operational
+  // budgeting before rollout. Never prune receipts of a still-live session.
+  // Lock only sessions (no reverse room-lock order); busy sessions are skipped.
+  async cleanupExpired(batchSize = 100): Promise<number> {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100) {
+      throw new Error("Invalid resume cleanup batch size");
+    }
+    const result = await this.database.query(`
+      WITH expired AS MATERIALIZED (
+        SELECT id FROM room_resume_sessions
+        WHERE expires_at <= statement_timestamp()
+        ORDER BY expires_at, id
+        LIMIT $1 FOR UPDATE SKIP LOCKED
+      )
+      DELETE FROM room_resume_sessions s USING expired e
+      WHERE s.id = e.id AND s.expires_at <= clock_timestamp()
+    `, [batchSize]);
+    return result.rowCount ?? 0;
+  }
+
   // Caller must authenticate a normal join first and pass the authVersion
   // observed during that authentication. Never accept it from a client.
   // SHARE serializes issuance with policy updates; READ COMMITTED rechecks the

@@ -31,6 +31,7 @@ try {
     .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"');
   await a.query(sql);
   await a.query(await readFile("drizzle/0005_free_blazing_skull.sql", "utf8"));
+  await a.query(await readFile("drizzle/0007_motionless_wolfpack.sql", "utf8"));
   await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
     .replaceAll('"public".', '"' + schema + '".'));
   await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
@@ -429,7 +430,92 @@ try {
     check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [[retrySession.sessionId, peer.sessionId]])).rows[0].count) === 0);
     check(await retryCount() === 4); // session cleanup does not delete room history
   } finally { await parallelPool.end(); }
-  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable message retry receipts; not socket resume" }));
+  // Cleanup is opt-in and uses database time; fixtures never touch a live room.
+  while (await first.cleanupExpired(100)) { /* remove earlier expired fixtures */ }
+  await a.query("INSERT INTO rooms (id) VALUES ('clean123')");
+  const fixtures = [];
+  for (let i = 0; i < 5; i++) {
+    const session = await first.issueAfterAuthenticatedJoin("clean123", "Cleanup " + i, 1);
+    assert.ok(session); fixtures.push(session);
+  }
+  const ids = fixtures.map(s => s.sessionId);
+  const history = (await a.query("INSERT INTO messages (room_id, username, content) VALUES ('clean123', 'Cleanup', 'retained') RETURNING id")).rows[0].id;
+  for (const id of ids) {
+    await a.query("INSERT INTO resume_message_receipts (session_id, client_message_id, payload_hash, message_id) VALUES ($1, 'saved', $2, $3), ($1, 'tombstone', $2, NULL)", [id, "a".repeat(64), history]);
+  }
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() - interval '1 hour' WHERE id = ANY($1)", [ids.slice(0, 3)]);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [ids[4]]);
+  const remaining = async () => (await a.query("SELECT id FROM room_resume_sessions WHERE room_id = 'clean123'")).rowCount;
+  const receiptCount = async () => Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [ids])).rows[0].count);
+  check(await first.cleanupExpired(1) === 1);
+  check(await remaining() === 4 && await receiptCount() === 8);
+  // Hold every remaining expired row: SKIP LOCKED must return without waiting.
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE room_id = 'clean123' AND expires_at <= clock_timestamp() FOR UPDATE");
+  await b.query("SET statement_timeout = '2s'");
+  check(await second.cleanupExpired(100) === 0);
+  await a.query("COMMIT");
+  check(await second.cleanupExpired(100) === 2);
+  check(await remaining() === 2 && await receiptCount() === 4);
+  check(await first.cleanupExpired(100) === 0);
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // Expired-row deletion holds a lock: pending CAS rechecks after COMMIT and
+  // cannot resurrect the deleted session, even with a valid bearer.
+  const target = fixtures[3];
+  const targetCredential = { roomId: target.roomId, sessionId: target.sessionId, token: target.token };
+  const targetIdentity = await first.advanceGeneration(targetCredential, 0, opA, socketA);
+  assert.ok(targetIdentity);
+  const targetBinding = await bindings.activate(targetIdentity, socketA, async () => {}, () => true);
+  assert.ok(targetBinding);
+  await a.query("BEGIN");
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [target.sessionId]);
+  check(await first.cleanupExpired(100) === 1);
+  const afterCleanupCas = second.advanceGeneration(targetCredential, 1, opB, socketB);
+  await waitForBlockedSecond();
+  const gatePid = (await operationPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  let ranAfterCleanup = false;
+  const afterCleanupGate = gate.run(targetBinding, async () => { ranAfterCleanup = true; });
+  await waitForBlockedSecond(gatePid);
+  await a.query("COMMIT");
+  check(await afterCleanupCas === null);
+  check(!(await afterCleanupGate).authorized);
+  check(!ranAfterCleanup);
+  check(await remaining() === 1 && await receiptCount() === 2); // unexpired revoked receipts retained too
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // Two independent workers partition the expired rows; no double deletion.
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [ids[4]]);
+  const cleaned = await Promise.all([first.cleanupExpired(1), second.cleanupExpired(1)]);
+  check(cleaned[0] + cleaned[1] === 1);
+  check(await remaining() === 0 && await receiptCount() === 0);
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // A gate that owns the row can cross its TTL while doing work. Cleanup skips
+  // it, then the gate itself rejects and rolls back before publication.
+  const busy = await first.issueAfterAuthenticatedJoin("clean123", "Busy", 1);
+  assert.ok(busy);
+  const busyIdentity = await first.advanceGeneration({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token }, 0, opA, socketA);
+  assert.ok(busyIdentity);
+  const busyBinding = await bindings.activate(busyIdentity, socketA, async () => {}, () => true);
+  assert.ok(busyBinding);
+  const busyResult = await gate.run(busyBinding, async transaction => {
+    // Change the fixture expiry within the owning transaction. Another worker
+    // still sees the old expiry, so also assert skip using a separate already-
+    // expired row lock above. This proves the pre-COMMIT fence and safe cleanup.
+    await transaction.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [busy.sessionId]);
+    await transaction.query("INSERT INTO messages (room_id, username, content) VALUES ('clean123', 'Busy', 'must rollback')");
+    check(await second.cleanupExpired(100) === 0);
+  });
+  check(!busyResult.authorized);
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'clean123'")).rowCount === 1);
+  check((await first.lookup({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token })) !== null); // expiry mutation rolled back too
+  // Default cap is exercised on more than a full batch, not inferred from SQL.
+  await a.query(`INSERT INTO room_resume_sessions (id, token_hash, room_id, username, auth_version, expires_at)
+    SELECT 'cleanup-fixture-' || n, 'cleanup-hash-' || n, 'clean123', 'Batch', 1,
+      clock_timestamp() - interval '1 hour' FROM generate_series(1, 101) n`);
+  check(await first.cleanupExpired() === 100);
+  check(await first.cleanupExpired() === 1);
+  check(await first.cleanupExpired() === 0);
+  await b.query("RESET statement_timeout");
+  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
   await a.query('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE');

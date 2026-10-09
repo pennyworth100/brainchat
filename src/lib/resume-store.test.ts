@@ -4,6 +4,17 @@ import { randomBytes } from "node:crypto";
 import { hashResumeToken, ResumeStore } from "./resume-store";
 import { claimRoomPolicy } from "./room-policy";
 
+test("cleanup bounds are strict and database failure propagates", async () => {
+  let calls = 0;
+  const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);
+  for (const size of [0, -1, 101, 1.5, NaN, Infinity]) {
+    await assert.rejects(store.cleanupExpired(size), /Invalid resume cleanup batch size/);
+  }
+  assert.equal(calls, 0);
+  await assert.rejects(store.cleanupExpired(), /offline/);
+  assert.equal(calls, 1);
+});
+
 test("issuance preserves the existing 64-character username boundary", async () => {
   let calls = 0;
   const store = new ResumeStore({ query: async () => { calls++; return { rowCount: 0, rows: [] }; } } as never);

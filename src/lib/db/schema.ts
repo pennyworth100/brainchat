@@ -60,7 +60,7 @@ export const roomResumeSessions = pgTable("room_resume_sessions", {
   issuedAt: timestamp("issued_at", { withTimezone: true }).defaultNow().notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
-});
+}, table => [index("resume_sessions_expiry_idx").on(table.expiresAt, table.id)]);
 
 // Receipt survives message deletion (NULL is a tombstone), but not session deletion.
 export const resumeMessageReceipts = pgTable("resume_message_receipts", {
