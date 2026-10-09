@@ -686,10 +686,17 @@ try {
   await uncertainAdmission.close();
   // Settled upload foundation: distinguish actual rollback from a real commit
   // whose acknowledgement is lost. No filesystem cleanup is performed here.
-  assert.ok(recoveredBinding);
+  // The replacement fixture above was deliberately closed. Recover a fresh
+  // generation; never weaken the gate to make a detached fixture authorize.
+  const outcomeAdmission = new ResumeAdmission(second, admissionBindings,
+    "admission_transport_4", () => true, async () => async () => {});
+  const outcomeBinding = await outcomeAdmission.admit({ ...request, expectedGeneration: 2,
+    operationId: "outcome_operation_123456" });
+  assert.ok(outcomeBinding);
+  check(outcomeBinding.generation === 3 && admissionBindings.isCurrent(outcomeBinding));
   const outcomeGate = new ResumeOperationGate(operationPool, admissionBindings);
-  const noCommit = await outcomeGate.runWithOutcome(recoveredBinding, async tx => {
-    await insertResumeTextMessage(tx, recoveredBinding, "outcome-rollback");
+  const noCommit = await outcomeGate.runWithOutcome(outcomeBinding, async tx => {
+    await insertResumeTextMessage(tx, outcomeBinding, "outcome-rollback");
     throw new Error("after insert, before commit");
   });
   check(!noCommit.completed && noCommit.commit === "not-dispatched");
@@ -703,15 +710,16 @@ try {
       return result;
     }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
   } }, admissionBindings);
-  const unknownCommit = await outcomeLostAck.runWithOutcome(recoveredBinding,
-    tx => insertResumeTextMessage(tx, recoveredBinding, "outcome-durable"));
+  const unknownCommit = await outcomeLostAck.runWithOutcome(outcomeBinding,
+    tx => insertResumeTextMessage(tx, outcomeBinding, "outcome-durable"));
   check(!unknownCommit.completed && unknownCommit.commit === "unknown");
   check(outcomeCommitAttempts === 1);
   check((await a.query("SELECT id FROM messages WHERE room_id = 'admit123' AND content = 'outcome-durable'")).rowCount === 1);
-  const deniedOutcome = await outcomeGate.runWithOutcome({ ...recoveredBinding }, async () => {
+  const deniedOutcome = await outcomeGate.runWithOutcome({ ...outcomeBinding }, async () => {
     assert.fail("copied authority must not run");
   });
   check(deniedOutcome.completed && !deniedOutcome.result.authorized);
+  await outcomeAdmission.close();
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
