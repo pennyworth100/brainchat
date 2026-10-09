@@ -104,7 +104,25 @@ the future bounded HTTP parser must implement safe stream cancellation. This
 sink does not bound upstream buffers or metadata parser memory, validate MIME
 contents, prove malware safety, or authorize durable DB policy by itself.
 
-Next: checked composition of this capability with the private structural DB
-primitive, cancellation during delayed writes/reads, bounded
+`ResumeFileUpload` privately composes storage with the database writer. It captures
+the logical key and bounded metadata before filesystem effects; callers supply
+bytes, never stored paths/digests. Only the exact grant-bound storage result is
+resolved into the DB primitive. One attempt per grant is installed before work
+starts. All duplicate calls (including changed keys) await the original settlement
+and deny, never repeat dispatch or return another `inserted:true` result.
+Rollback/unknown outcomes are not retried; a deliberate retry needs a fresh grant
+and byte attempt, with the existing durable receipt preserving the original URL.
+No release, unlink or broadcast occurs, including after unexpected writer errors
+(conservatively unknown). The original caller remains the settlement/finalizer owner.
+Local composition tests use real temporary files and a simulated SQL connection;
+they are NOT a real-PostgreSQL composition or HTTP acceptance claim.
+
+The isolated PostgreSQL CI fixture additionally exercises actual stored bytes,
+new-path retries preserving the original URL, real committed-but-lost ACKs,
+receipt rollback, tombstones, durable successors and policy denial. It retains
+all attempts until the fixture-only temporary-root finalizer. CI results must be
+verified at the exact commit before claiming these integration checks passed.
+
+Next: cancellation during delayed writes/closes, bounded
 multipart/HTTP ownership, then fenced publication and durable reconciliation.
 No public handler imports this module. This is not full upload acceptance.

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
@@ -11,6 +13,8 @@ import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeImageWriter } from "../src/lib/resume-image";
 import { ResumeFileWriter } from "../src/lib/resume-file";
+import { ResumeFileStorage } from "../src/lib/resume-file-storage";
+import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
@@ -882,6 +886,88 @@ try {
   const deniedFile = await files.saveOnceWithOutcome(nextFileGrant, "file-unknown", file);
   check(deniedFile.completed && !deniedFile.result.authorized);
   check(uploads.release(nextFileGrant));
+  // Actual byte storage + exact capability + real PostgreSQL composition.
+  // Only this fixture's isolated temporary root is removed by its finalizer.
+  const byteRoot = await mkdtemp(join(tmpdir(), "dimle-pg-file-"));
+  try {
+    const byteStorage = new ResumeFileStorage(byteRoot, uploads);
+    const byteUpload = new ResumeFileUpload(byteStorage, files);
+    const metadata = { name: "actual.txt", mime: "text/plain" };
+    async function* byteSource() { yield Buffer.from("actual bytes"); }
+    const fixture = await makeUpload();
+    const firstBytes = await byteUpload.saveWithOutcome(fixture.grant, "actual-key", metadata, byteSource());
+    check(firstBytes.completed && firstBytes.result.authorized && firstBytes.result.value.inserted);
+    assert.ok(firstBytes.completed && firstBytes.result.authorized);
+    const original = firstBytes.result.value.message;
+    check((await readFile(join(byteRoot, original.url.split("/")[2], "blob"))).toString() === "actual bytes");
+    const baseline = await countFiles();
+    const sameAttempt = await byteUpload.saveWithOutcome(fixture.grant, "different-key", metadata, byteSource());
+    check(sameAttempt.completed && !sameAttempt.result.authorized);
+    check(await countFiles() === baseline && (await readdir(byteRoot)).length === 1);
+    check(uploads.release(fixture.grant));
+    const retryGrant = uploads.admit(fixture.binding); assert.ok(retryGrant);
+    const retry = await byteUpload.saveWithOutcome(retryGrant, "actual-key", metadata, byteSource());
+    check(retry.completed && retry.result.authorized && !retry.result.value.inserted &&
+      retry.result.value.message.url === original.url && retry.result.value.message.id === original.id);
+    check((await readdir(byteRoot)).length === 2 && await countFiles() === baseline);
+    check(uploads.release(retryGrant));
+
+    // Real COMMIT succeeds, its ACK is lost; no automatic replay or deletion.
+    const uncertainUpload = new ResumeFileUpload(byteStorage, uncertainFiles);
+    const unknownGrant = uploads.admit(fixture.binding); assert.ok(unknownGrant);
+    const unknown = await uncertainUpload.saveWithOutcome(unknownGrant, "actual-unknown", metadata, byteSource());
+    check(!unknown.completed && unknown.commit === "unknown");
+    check(await countFiles() === baseline + 1);
+    const unknownPath = (await a.query(`SELECT m.content FROM resume_message_receipts r
+      JOIN messages m ON m.id = r.message_id WHERE r.session_id = $1 AND r.client_message_id = 'actual-unknown'`,
+      [fixture.binding.sessionId])).rows[0].content;
+    const duplicateUnknown = await uncertainUpload.saveWithOutcome(unknownGrant, "actual-unknown", metadata, byteSource());
+    check(duplicateUnknown.completed && !duplicateUnknown.result.authorized);
+    check((await readdir(byteRoot)).length === 3 && await countFiles() === baseline + 1);
+    check(uploads.release(unknownGrant));
+    const resolutionGrant = uploads.admit(fixture.binding); assert.ok(resolutionGrant);
+    const resolved = await byteUpload.saveWithOutcome(resolutionGrant, "actual-unknown", metadata, byteSource());
+    check(resolved.completed && resolved.result.authorized && !resolved.result.value.inserted &&
+      resolved.result.value.message.url === JSON.parse(unknownPath).url);
+    check((await readdir(byteRoot)).length === 4 && await countFiles() === baseline + 1);
+    check(uploads.release(resolutionGrant));
+
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_bytes_reject CHECK (client_message_id <> 'actual-rollback')");
+    const rollbackGrant = uploads.admit(fixture.binding); assert.ok(rollbackGrant);
+    const rollback = await byteUpload.saveWithOutcome(rollbackGrant, "actual-rollback", metadata, byteSource());
+    check(!rollback.completed && rollback.commit === "not-dispatched");
+    check(await countFiles() === baseline + 1 && (await readdir(byteRoot)).length === 5);
+    check(uploads.release(rollbackGrant));
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_bytes_reject");
+
+    await a.query("DELETE FROM messages WHERE id = $1", [original.id]);
+    const tombstoneGrant = uploads.admit(fixture.binding); assert.ok(tombstoneGrant);
+    const tombstone = await byteUpload.saveWithOutcome(tombstoneGrant, "actual-key", metadata, byteSource());
+    check(!tombstone.completed && tombstone.commit === "not-dispatched");
+    check(await countFiles() === baseline && (await readdir(byteRoot)).length === 6);
+    check((await readFile(join(byteRoot, original.url.split("/")[2], "blob"))).toString() === "actual bytes");
+    check(uploads.release(tombstoneGrant));
+
+    // A durable successor fences the old grant even if its local binding lags.
+    const staleGrant = uploads.admit(fixture.binding); assert.ok(staleGrant);
+    const next = await first.advanceGeneration(fixture.credential, 1, opB, socketB); assert.ok(next);
+    const stale = await byteUpload.saveWithOutcome(staleGrant, "actual-unknown", metadata, byteSource());
+    check(stale.completed && !stale.result.authorized);
+    check(await countFiles() === baseline);
+    check(uploads.release(staleGrant));
+    const nextBinding = await uploadBindings.activate(next, socketB, async () => {}, () => true); assert.ok(nextBinding);
+    const successorGrant = uploads.admit(nextBinding); assert.ok(successorGrant);
+    const successor = await byteUpload.saveWithOutcome(successorGrant, "actual-unknown", metadata, byteSource());
+    check(successor.completed && successor.result.authorized && !successor.result.value.inserted &&
+      successor.result.value.message.url === JSON.parse(unknownPath).url);
+    check(uploads.release(successorGrant));
+    const revokedGrant = uploads.admit(nextBinding); assert.ok(revokedGrant);
+    await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
+    const revoked = await byteUpload.saveWithOutcome(revokedGrant, "actual-unknown", metadata, byteSource());
+    check(revoked.completed && !revoked.result.authorized);
+    check(uploads.release(revokedGrant));
+    check((await readdir(byteRoot)).length === 9 && await countFiles() === baseline);
+  } finally { await rm(byteRoot, { recursive: true, force: true }); }
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts and bounded expiry cleanup; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
