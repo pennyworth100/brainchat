@@ -34,8 +34,11 @@ export async function observeUploadBlob(root: string, storageKey: string,
     report.reasons.push("invalid-contract"); return report;
   }
   const started = now(), deadline = started + maxMs;
+  let last = started;
   const check = () => { const time = now();
-    if (!Number.isFinite(started) || !Number.isFinite(time) || time < started || time >= deadline) throw Error("deadline"); };
+    if (!Number.isFinite(started) || !Number.isFinite(time) || time < last || time >= deadline) throw Error("deadline");
+    last = time;
+  };
   const held: { path: string; handle: FileHandle; before: BigIntStats }[] = [];
   const handles: FileHandle[] = [];
   try {
@@ -70,9 +73,10 @@ export async function observeUploadBlob(root: string, storageKey: string,
     report.reasons.push(reason);
     if (reason === "path-unstable") report.stability = "unstable";
   } finally {
-    const closed = await Promise.allSettled(handles.map(handle => handle.close()));
+    const closed = await Promise.allSettled(handles.map(handle => Promise.resolve().then(() => handle.close())));
     if (closed.some(x => x.status === "rejected")) report.reasons.push("close-unobserved");
   }
+  try { check(); } catch { if (!report.reasons.includes("deadline")) report.reasons.push("deadline"); }
   report.complete = report.stability === "unchanged-at-checks" && report.reasons.length === 0;
   // Earlier metadata is only an observation; never discard it on later failure
   // and never promote it to measured content integrity, ownership or capacity.

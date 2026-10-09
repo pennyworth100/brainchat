@@ -356,3 +356,18 @@ deduplicated or selected as winners. `allKeysAttempted` only describes this inpu
 list, not successful content verification, volume/DB completeness or aggregate
 PASS. Non-admitted keys remain unobserved, not absent. Cross-store stability stays
 unproven. No runtime caller, repair, refund, deletion, replay or deployment added.
+
+## Completion boundary for root and metadata observations
+
+Root enumeration and metadata-only observation now reject any observed monotonic
+clock regression, including a regression that remains above the initial time.
+Their completion check includes awaited cleanup: a close settling at or after the
+deadline, or with an invalid/regressing final clock, cannot yield complete evidence.
+Earlier positive keys/metadata and unchanged-at-checks facts remain observations,
+not an absence verdict. This matches the content observer's completion boundary.
+
+Every close is independently scheduled and settled, including when an injected
+adapter throws synchronously. One close failure cannot skip other handles or
+expose raw exception details. No retry or claim of successfully closing a failed
+handle is made. Pending kernel I/O/close still has no hard wall-time bound and is
+not cancelled. No runtime integration or live volume access is added.

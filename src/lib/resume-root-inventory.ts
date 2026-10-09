@@ -31,8 +31,11 @@ export async function inventoryUploadRoot(root: string,
     report.reasons.push("invalid-contract"); return report;
   }
   const started = now(), deadline = started + maxMs;
+  let last = started;
   const check = () => { const time = now();
-    if (!Number.isFinite(started) || !Number.isFinite(time) || time < started || time >= deadline) throw Error("deadline"); };
+    if (!Number.isFinite(started) || !Number.isFinite(time) || time < last || time >= deadline) throw Error("deadline");
+    last = time;
+  };
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   let directory: Awaited<ReturnType<typeof fs.opendir>> | undefined;
   let exhausted = false;
@@ -82,9 +85,11 @@ export async function inventoryUploadRoot(root: string,
     report.reasons.push(reason);
     if (reason === "root-unstable") report.rootStability = "unstable";
   } finally {
-    const closed = await Promise.allSettled([directory, handle].filter(x => x !== undefined).map(x => x.close()));
+    const closed = await Promise.allSettled([directory, handle].filter(x => x !== undefined)
+      .map(x => Promise.resolve().then(() => x.close())));
     if (closed.some(x => x.status === "rejected")) report.reasons.push("close-unobserved");
   }
+  try { check(); } catch { if (!report.reasons.includes("deadline")) report.reasons.push("deadline"); }
   report.enumerationComplete = exhausted && report.rootStability === "unchanged-at-checks" &&
     report.reasons.length === 0;
   report.reasons = [...new Set(report.reasons)];
