@@ -8,6 +8,7 @@ import { ResumeAdmission } from "../src/lib/resume-admission";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
+import { ResumeImageWriter } from "../src/lib/resume-image";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
@@ -442,6 +443,67 @@ try {
     await a.query("DELETE FROM room_resume_sessions WHERE room_id = 'retry123'");
     check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [[retrySession.sessionId, peer.sessionId]])).rows[0].count) === 0);
     check(await retryCount() === 4); // session cleanup does not delete room history
+
+    // Private inline images: real transactions share text's durable keyspace.
+    await a.query("INSERT INTO rooms (id) VALUES ('image123')");
+    const imageSession = await first.issueAfterAuthenticatedJoin("image123", "Image writer", 1);
+    assert.ok(imageSession);
+    const imageCredential = { roomId: imageSession.roomId, sessionId: imageSession.sessionId, token: imageSession.token };
+    const imageIdentity = await first.advanceGeneration(imageCredential, 0, opA, "transport_image_initial");
+    assert.ok(imageIdentity);
+    const imageBinding = await bindings.activate(imageIdentity, "transport_image_initial", async () => {}, () => true);
+    assert.ok(imageBinding);
+    const images = new ResumeImageWriter(gate);
+    const parallelImages = new ResumeImageWriter(new ResumeOperationGate(parallelPool, bindings));
+    const imageData = "data:image/png;base64,aGVsbG8=";
+    const imageCount = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'image123'")).rows[0].count);
+    const imageRace = await Promise.all([images.saveOnceWithOutcome(imageBinding, "image-key", imageData),
+      parallelImages.saveOnceWithOutcome(imageBinding, "image-key", imageData)]);
+    check(imageRace.every(r => r.authorized));
+    check(imageRace.filter(r => r.authorized && r.value.inserted).length === 1);
+    check(imageRace[0].authorized && imageRace[1].authorized && imageRace[0].value.message.id === imageRace[1].value.message.id);
+    check(await imageCount() === 1);
+    const storedImage = (await a.query("SELECT * FROM messages WHERE room_id = 'image123'")).rows[0];
+    check(storedImage.username === "Image writer" && storedImage.type === "image" &&
+      storedImage.client_message_id === null && JSON.parse(storedImage.content).dataUrl === imageData);
+    const canonicalRetry = await images.saveOnceWithOutcome(imageBinding, "image-key", "DATA:IMAGE/PNG;BASE64,aGVsbG8=");
+    check(canonicalRetry.authorized && !canonicalRetry.value.inserted);
+    await assert.rejects(writer.saveOnce(imageBinding, "image-key", imageData), /identity conflict/); checks++;
+    await assert.rejects(images.saveOnceWithOutcome(imageBinding, "image-key", "data:image/png;base64,YQ=="), /identity conflict/); checks++;
+    const mixedRace = await Promise.allSettled([writer.saveOnce(imageBinding, "mixed-key", "text"),
+      parallelImages.saveOnceWithOutcome(imageBinding, "mixed-key", imageData)]);
+    check(mixedRace.filter(r => r.status === "fulfilled" && r.value.authorized).length === 1);
+    check(mixedRace.filter(r => r.status === "rejected" && /identity conflict/.test(String(r.reason))).length === 1);
+    check(await imageCount() === 2);
+    await writer.saveOnce(imageBinding, "text-key", "text");
+    await assert.rejects(images.saveOnceWithOutcome(imageBinding, "text-key", imageData), /identity conflict/); checks++;
+    check(await imageCount() === 3);
+    const lostImageAck = new ResumeImageWriter(new ResumeOperationGate(lostAckPool, bindings));
+    await assert.rejects(lostImageAck.saveOnceWithOutcome(imageBinding, "lost-image", imageData), /lost COMMIT ack/); checks++;
+    check(commitAttempts === 2 && await imageCount() === 4);
+    const imageNext = await first.advanceGeneration(imageCredential, 1, opB, "transport_image_successor");
+    assert.ok(imageNext);
+    const imageSuccessor = await bindings.activate(imageNext, "transport_image_successor", async () => {}, () => true);
+    assert.ok(imageSuccessor);
+    check(!(await images.saveOnceWithOutcome(imageBinding, "lost-image", imageData)).authorized);
+    const resolvedImage = await images.saveOnceWithOutcome(imageSuccessor, "lost-image", imageData);
+    check(resolvedImage.authorized && !resolvedImage.value.inserted && resolvedImage.value.message.dataUrl === imageData);
+    check(await imageCount() === 4);
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_image_reject CHECK (client_message_id <> 'image-rollback')");
+    await assert.rejects(images.saveOnceWithOutcome(imageSuccessor, "image-rollback", imageData)); checks++;
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_image_reject");
+    check(await imageCount() === 4);
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE client_message_id = 'image-rollback'")).rows[0].count) === 0);
+    assert.ok(resolvedImage.authorized);
+    await a.query("DELETE FROM messages WHERE id = $1", [resolvedImage.value.message.id]);
+    await assert.rejects(images.saveOnceWithOutcome(imageSuccessor, "lost-image", imageData), /no longer available/); checks++;
+    check(await imageCount() === 3);
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'image123'");
+    check(!(await images.saveOnceWithOutcome(imageSuccessor, "image-key", imageData)).authorized);
+    check(!(await images.saveOnceWithOutcome(imageSuccessor, "new-denied", imageData)).authorized);
+    check(await imageCount() === 3);
+    await a.query("DELETE FROM messages WHERE room_id = 'image123'");
+    await a.query("DELETE FROM rooms WHERE id = 'image123'");
   } finally { await parallelPool.end(); }
   // History uses the same dedicated transaction gate, never the global DB.
   await a.query("INSERT INTO rooms (id) VALUES ('histo123'), ('alien123')");
