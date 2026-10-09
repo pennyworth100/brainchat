@@ -6,6 +6,18 @@ import type { ResumeMemberships } from "./resume-membership";
 // invoke this directly from a client or replay it after a partial handoff.
 export function resumeJoinPublication(members: ResumeMemberships,
   readAuthorizedHistory: (binding: ResumeBinding) => Promise<readonly unknown[] | null>) {
+  return publication(members, readAuthorizedHistory, true);
+}
+
+// PRIVATE: use only as publishResume; same guarded resynchronization, but a
+// resumed logical session must not appear to be a newly joined participant.
+export function resumeResyncPublication(members: ResumeMemberships,
+  readAuthorizedHistory: (binding: ResumeBinding) => Promise<readonly unknown[] | null>) {
+  return publication(members, readAuthorizedHistory, false);
+}
+
+function publication(members: ResumeMemberships,
+  readAuthorizedHistory: (binding: ResumeBinding) => Promise<readonly unknown[] | null>, joined: boolean) {
   return async (binding: ResumeBinding, live: () => boolean): Promise<boolean> => {
     const roomId = binding.roomId;
     const current = () => live() && members.isCurrent(binding, roomId);
@@ -15,7 +27,7 @@ export function resumeJoinPublication(members: ResumeMemberships,
     const history = await readAuthorizedHistory(binding);
     if (!current() || history === null) return false;
     if (!members.send(binding, roomId, "chat-history", history) || !current()) return false;
-    members.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
+    if (joined) members.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
     if (!current()) return false;
     // Compatibility payloads: public user-list remains usernames, not tokens or
     // logical IDs. Recompute between event handoffs; these are not atomic snapshots.

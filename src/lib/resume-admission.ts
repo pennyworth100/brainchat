@@ -25,7 +25,10 @@ export class ResumeAdmission {
     private readonly connected: () => boolean,
     // Preparation must not publish history/presence or grant outbound access.
     // It returns an EXACT lease cleanup; if it throws it must clean partial work.
-    private readonly prepare: (identity: ResumeIdentity) => Promise<Cleanup>, limits?: Limits) {
+    private readonly prepare: (identity: ResumeIdentity) => Promise<Cleanup>, limits?: Limits,
+    // Trusted one-shot installation/publication within the ORIGINAL deadline and
+    // capacity lease. No independent retry or detached background publication.
+    private readonly finalize?: (binding: ResumeBinding, live: () => boolean) => Promise<boolean>) {
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(transportId)) throw Error("Invalid transport incarnation");
     if (limits) {
       if (!Number.isSafeInteger(limits.timeoutMs) || limits.timeoutMs < 1 || limits.timeoutMs > 2_147_483_647) {
@@ -84,11 +87,18 @@ export class ResumeAdmission {
           return null;
         }
         this.binding = binding;
-        return binding;
       } catch (error) {
+        if (this.binding) this.bindings.detach(this.binding);
         await this.dispose();
         throw error;
       }
+      const binding = this.binding;
+      // Finalizer owns synchronous failure fencing. Its owner closes/disposes
+      // independently, so slow cleanup cannot delay rejection/disconnection.
+      if ((this.finalize && !await this.finalize(binding,
+        () => this.live() && this.bindings.isCurrent(binding))) ||
+          !this.live() || !this.bindings.isCurrent(binding)) return null;
+      return binding;
     });
     if (!this.limits) return this.flight = this.work;
     const limits = this.limits;

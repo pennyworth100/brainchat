@@ -7,10 +7,118 @@ import { attachResumeSocket } from "./resume-socket";
 import { ResumeBindings } from "./resume-bindings";
 import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
-import { resumeJoinPublication } from "./resume-join-publication";
+import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
 import type { ResumeIdentity } from "./resume-store";
 
 const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
+
+async function resyncFixture(t: TestContext,
+  read: (binding: import("./resume-bindings").ResumeBinding) => Promise<readonly unknown[] | null>,
+  extra: { timeoutMs?: number; capacity?: ResumeCapacity; onCleanupError?: (error: unknown) => void } = {}) {
+  const f = await fixture(t), transport = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), events: [string, unknown][] = [];
+  let calls = 0;
+  transport.socket.onAnyOutgoing((event, payload) => { events.push([event, payload]); });
+  const owner = attachResumeSocket(transport.socket, { ...opts, ...extra, memberships: members,
+    store: { advanceGeneration: async () => { calls++; return identity(); } },
+    publishResume: resumeResyncPublication(members, read) });
+  t.after(() => owner.close());
+  return { ...f, ...transport, opts, members, events, owner, calls: () => calls };
+}
+
+test("resume resync shares CAS/read/publication and never announces a new join", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>(); let reads = 0;
+  const f = await resyncFixture(t, async () => { reads++; entered.resolve(); return gate.promise; });
+  const peer = await f.connect(), peerEvents: string[] = [];
+  const other = attachResumeSocket(peer.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "peer" }) } });
+  const req = request(); req.credential.sessionId = "peer"; assert.ok(await other.admit(req));
+  t.after(() => other.close()); peer.socket.onAnyOutgoing(event => { peerEvents.push(event); });
+  const flight = f.owner.admit(request()); await entered.promise;
+  assert.equal(f.owner.admit(request()), flight); assert.equal(await f.owner.admit(request(1)), null);
+  assert.deepEqual(f.events, []); gate.resolve([{ id: 3 }]); assert.ok(await flight);
+  assert.equal(f.owner.admit(request()), flight); assert.equal(f.calls(), 1); assert.equal(reads, 1);
+  assert.deepEqual(f.events, [["chat-history", [{ id: 3 }]], ["user-list", ["Alice", "Alice"]], ["user-count", 2]]);
+  assert.deepEqual(peerEvents, ["user-list", "user-count"]);
+});
+
+test("replacement during resync drops old history without redirecting to successor", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>();
+  const f = await resyncFixture(t, async () => { entered.resolve(); return gate.promise; });
+  const flight = f.owner.admit(request()); await entered.promise;
+  const next = await f.connect(), events: string[] = [];
+  next.socket.onAnyOutgoing(event => { events.push(event); });
+  const owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => identity(2) } });
+  assert.ok(await owner.admit(request(1))); t.after(() => owner.close());
+  gate.resolve([]); assert.equal(await flight, null);
+  assert.deepEqual(events, []); assert.deepEqual(f.events, []); assert.equal(f.members.presence("candy986").count, 1);
+});
+
+test("close and transport disconnect during resync prevent late handoff", async t => {
+  for (const physical of [false, true]) {
+    const gate = deferred<readonly unknown[]>(), entered = deferred<void>();
+    const f = await resyncFixture(t, async () => { entered.resolve(); return gate.promise; });
+    const flight = f.owner.admit(request()); await entered.promise;
+    if (physical) f.socket.disconnect(true);
+    const closing = f.owner.close();
+    assert.equal(f.members.presence("candy986").count, 0);
+    gate.resolve([]); await closing; assert.equal(await flight, null);
+    assert.deepEqual(f.events, []); assert.equal(await f.owner.admit(request()), null);
+  }
+});
+
+test("resync deadline retains original capacity until late read actually settles", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>(), capacity = new ResumeCapacity(1);
+  const f = await resyncFixture(t, async () => { entered.resolve(); return gate.promise; }, { timeoutMs: 30, capacity });
+  const flight = f.owner.admit(request()); await entered.promise;
+  assert.equal(capacity.acquire(), null); assert.equal(await flight, null);
+  assert.equal(f.socket.connected, false); assert.equal(capacity.acquire(), null);
+  gate.resolve([]); await f.owner.close(); await new Promise<void>(resolve => setImmediate(resolve));
+  const release = capacity.acquire(); assert.ok(release); release(); assert.deepEqual(f.events, []);
+});
+
+test("denied/rejected resync is terminal with no CAS or publication replay", async t => {
+  for (const reject of [false, true]) {
+    let reads = 0;
+    const f = await resyncFixture(t, async () => { reads++; if (reject) throw Error("resync denied"); return null; });
+    const flight = f.owner.admit(request());
+    if (reject) await assert.rejects(flight, /resync denied/); else assert.equal(await flight, null);
+    assert.equal(await f.owner.admit(request()), null); assert.equal(f.calls(), 1);
+    assert.equal(reads, 1); assert.deepEqual(f.events, []); assert.equal(f.socket.connected, false);
+  }
+});
+
+test("reentrant close and partial resync failure never replay handed-off history", async t => {
+  for (const fail of [false, true]) {
+    const f = await resyncFixture(t, async () => []);
+    f.socket.onAnyOutgoing(event => {
+      if (event === (fail ? "user-list" : "chat-history")) {
+        if (fail) throw Error("resync handoff");
+        void f.owner.close();
+      }
+    });
+    const flight = f.owner.admit(request());
+    if (fail) await assert.rejects(flight, /resync handoff/); else assert.equal(await flight, null);
+    assert.equal(await f.owner.admit(request()), null);
+    assert.deepEqual(f.events.map(([event]) => event), fail ? ["chat-history", "user-list"] : ["chat-history"]);
+    assert.equal(f.members.presence("candy986").count, 0);
+  }
+});
+
+test("late resync failure reports once and join does not invoke resume publication", async t => {
+  const gate = deferred<void>(), entered = deferred<void>(), errors: unknown[] = [];
+  const f = await resyncFixture(t, async () => { entered.resolve(); await gate.promise; throw Error("late read"); },
+    { timeoutMs: 30, onCleanupError: error => { errors.push(error); } });
+  const flight = f.owner.admit(request()); await entered.promise; assert.equal(await flight, null);
+  gate.resolve(); await f.owner.close(); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(errors.length, 1); assert.match(String(errors[0]), /late read/);
+  const transport = await f.connect(), opts = options(); let resumes = 0;
+  const owner = attachResumeSocket(transport.socket, { ...opts, memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => issuedJoin(), publishResume: async () => { resumes++; return true; } });
+  assert.ok(await owner.join(authenticatedJoin)); assert.equal(resumes, 0); await owner.close();
+});
+
 
 async function publicationFixture(t: TestContext,
   read: (binding: import("./resume-bindings").ResumeBinding) => Promise<readonly unknown[] | null>,

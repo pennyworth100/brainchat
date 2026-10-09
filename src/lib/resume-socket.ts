@@ -22,6 +22,8 @@ type Options = {
   memberships?: Pick<ResumeMemberships, "install">;
   // Private, trusted one-shot publication; part of the same join deadline/flight.
   publishJoin?: (binding: ResumeBinding, live: () => boolean) => Promise<boolean>;
+  // No new joined notice. Runs after membership install, inside admission limits.
+  publishResume?: (binding: ResumeBinding, live: () => boolean) => Promise<boolean>;
 };
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
@@ -61,7 +63,9 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     return previous.owner;
   }
   const { store, bindings, prepare, onCleanupError } = options;
+  if (options.publishResume && !options.memberships) throw Error("Resume publication requires memberships");
   const incarnation = randomUUID();
+  let mode: "join" | "resume" | undefined;
   let closed = false;
   let closing: Promise<void> | undefined;
   const releases = new Set<() => void>();
@@ -69,7 +73,15 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     () => !closed && socket.connected, prepare, {
       capacity: options.capacity ?? capacity, timeoutMs: options.timeoutMs ?? 10_000,
       onLateError: onCleanupError,
-    });
+    }, options.memberships ? async (binding, live) => {
+      try {
+        if (live() && options.memberships!.install(socket, owner, binding) &&
+            (mode === "join" || !options.publishResume || await options.publishResume(binding, live)) && live()) {
+          return true;
+        }
+      } catch (error) { terminate(); throw error; }
+      terminate(); return false;
+    } : undefined);
   const close = () => {
     closed = true; // synchronous permanent fence, even if CAS/prepare never settles
     socket.off("disconnecting", onDisconnect);
@@ -106,7 +118,6 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     closeAutomatically();
     socket.disconnect(true);
   };
-  let mode: "join" | "resume" | undefined;
   const admitInternal: ResumeSocketOwner["admit"] = request => {
     const flight = admission.admit(request);
     if (!mode && admission.ownsAttempt(flight)) mode = "resume";
@@ -115,7 +126,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     if (previous) return previous;
     const result = flight.then(binding => {
       try {
-        if (binding && memberships.install(socket, owner, binding)) return binding;
+        if (binding && !closed && socket.connected && bindings.isCurrent(binding)) return binding;
       } catch (error) {
         terminate();
         throw error;
