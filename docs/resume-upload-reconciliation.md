@@ -49,8 +49,24 @@ Invalid metadata, extra/duplicate JSON fields, or oversized provenance never
 erase a bounded positive URL. Bodies above 4096 UTF-8 bytes are suppressed by SQL
 before driver transfer; truncated/unread bodies supply no URL evidence.
 Metadata validity does not imply room/session/logical identity agreement,
-ownership, integrity, or safe deletion. Cross-reference identity classification
-and filesystem observation remain unimplemented.
+ownership, integrity, or safe deletion. The private `referenceFacts` slice counts
+independent messages, receipts and attempts per observed storage key without
+collapsing duplicate references. It reports observed room and receipt
+session/clientMessageId conflicts against a unique, untruncated attempt. It never
+selects among duplicate attempts or compares truncated provenance. Tombstones
+remain in the original receipt inventory; separately charged retry keys stay
+distinct. Zero counts are observations, never proof of absence, even on a complete
+scan (unknown/unparsed bodies may still contain references).
+Conflict counters count per-source observations: one mismatching message seen
+independently through both scans contributes two room-conflict observations,
+not two distinct messages. Multiple receipts/messages are flagged separately.
+
+`fullIdentity` is always `unobserved`: session state/room, message username,
+receipt payload hash and full logical agreement are not validated. Zero detected
+conflicts are NOT an agreement verdict. Counts/conflicts on partial scans remain
+positive evidence only; original references and completeness flags are retained.
+This linear, row-bounded classification uses only the same DB snapshot; it adds
+no query, reset, runtime caller, mutation or filesystem observation.
 
 | Observation | Classification / consequence |
 | --- | --- |
@@ -149,8 +165,8 @@ Bounded metadata is now classified independently as described above. Real driver
 instrumentation verifies an exact 4096-byte body is transferred and a 4097-byte
 body is NULL before parsing. Invalid-but-positive references remain in the report.
 
-Next implementation slice: classify cross-reference identities without collapsing
-positive references, then filesystem fault injection for permissions,
+Next implementation slice: bounded session/username/payload-hash evidence for
+full cross-reference identity (currently unobserved), then filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.

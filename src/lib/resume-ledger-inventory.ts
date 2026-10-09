@@ -2,6 +2,7 @@ import type { PoolClient, QueryConfig, QueryResult } from "pg";
 import { performance } from "node:perf_hooks";
 import { isValidRoomId } from "./room-id";
 import { collectUploadReferences, type ReferenceInventory } from "./resume-reference-inventory";
+import { classifyReferenceFacts, type ReferenceFacts } from "./resume-reference-facts";
 
 export type LedgerAttempt = {
   storage_key: string; session_id: string; room_id: string;
@@ -15,6 +16,7 @@ export type LedgerInventory = {
   startedAt: string; finishedAt: string; lastStorageKey: string | null;
   unobserved: readonly string[];
   references?: ReferenceInventory;
+  referenceFacts?: ReferenceFacts;
   crossStoreStability: "unproven";
   limits: { pageSize: number; maxRows: number; timeoutMs: number };
 };
@@ -117,6 +119,7 @@ async function inventoryDatabase(client: PoolClient,
     if (report.references) {
       phase = "references";
       await collectUploadReferences(query, limits, report.references);
+      report.referenceFacts = classifyReferenceFacts(report.attempts, report.references);
       if (!report.references.complete) {
         report.reasons.push(...report.references.reasons); return report;
       }

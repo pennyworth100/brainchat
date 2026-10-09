@@ -179,6 +179,18 @@ async function main() {
     check(initialDb.references?.receipts[0].storageKey === committed.storage_key);
     check(initialDb.references?.messages[0].messageId === committed.message_id);
     check(initialDb.references?.metadataComplete && initialDb.references.messages[0].metadataStatus === "valid");
+    const initialFacts = initialDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key);
+    check(initialFacts?.messages === 1 && initialFacts.receipts === 1 && initialFacts.attempts === 1);
+    check(initialFacts?.roomConflicts === 0 && initialFacts.receiptIdentityConflicts === 0);
+    check(initialDb.referenceFacts?.fullIdentity === "unobserved");
+    // Same canonical URL, conflicting durable provenance: observe, never repair.
+    await pool.query("UPDATE resume_upload_attempts SET room_id='other123', client_message_id='other' WHERE storage_key=$1", [committed.storage_key]);
+    const conflictDb = await databaseInventory();
+    const conflictFacts = conflictDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key);
+    check(conflictFacts?.roomConflicts === 2 && conflictFacts.receiptIdentityConflicts === 1);
+    check(conflictDb.complete && conflictDb.accounting === "consistent"); // arithmetic is not identity
+    await pool.query("UPDATE resume_upload_attempts SET room_id=$2, client_message_id=$3 WHERE storage_key=$1",
+      [committed.storage_key, committed.room_id, committed.client_message_id]);
     check(baseline.attempts.length === 2 && baseline.receipts.length === 1 && baseline.messages.length === 1);
     const missingPath = join(root, committed.storage_key, "blob");
     await rm(missingPath); // Deliberate corruption of this harness-owned fixture.
@@ -203,6 +215,8 @@ async function main() {
     const ambiguousDb = await databaseInventory();
     check(ambiguousDb.references?.messages.length === 2 && ambiguousDb.references.receipts.length === 1);
     check(ambiguousDb.references?.messages.every(m => m.storageKey === committed.storage_key));
+    const duplicateFacts = ambiguousDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key);
+    check(duplicateFacts?.multipleMessages && !duplicateFacts.multipleReceipts);
     check(ambiguous.messages.length === 2 && ambiguous.receipts.length === 1);
     check(ambiguous.messages.every(m => JSON.parse(m.content).url === "/uploads/" + committed.storage_key + "/blob"));
     check(ambiguous.charged === ceiling * 2);
@@ -215,6 +229,7 @@ async function main() {
     const tombstoneDb = await databaseInventory();
     check(tombstoneDb.references?.receipts[0].status === "tombstone" && tombstoneDb.references.receipts[0].messageId === null);
     check(tombstoneDb.references?.messages.length === 0 && tombstoneDb.references.complete);
+    check(tombstoneDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key)?.receipts === 0);
     check(tombstone.receipts.length === 1 && tombstone.receipts[0].message_id === null &&
       tombstone.receipts[0].content === null);
     check(tombstone.messages.length === 0 && tombstone.attempts.length === 2);
@@ -232,6 +247,8 @@ async function main() {
     const expiredDb = await databaseInventory();
     check(expiredDb.references?.receipts.length === 0 && expiredDb.references.messages.length === 1);
     check(expiredDb.references?.messages[0].storageKey === committed.storage_key);
+    const expiredFacts = expiredDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key);
+    check(expiredFacts?.messages === 1 && expiredFacts.receipts === 0 && expiredFacts.attempts === 1);
     // A mutation AFTER the ledger snapshot but BEFORE reference SQL must not
     // appear in the reference inventory. One reset, one pinned DB snapshot.
     const pinnedClient = await pool.connect();
@@ -263,6 +280,10 @@ async function main() {
     const referenceCap = await databaseInventory(2);
     check(!referenceCap.complete && !referenceCap.references?.complete && !referenceCap.references?.parseComplete);
     check(referenceCap.reasons.includes("row-limit:messages") && referenceCap.references?.messages.length === 2);
+    check(referenceCap.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key)?.messages === 1);
+    evidence.push({ case: "observed-reference-facts", checks: 9,
+      cases: "independent-counts,room-and-logical-conflict,arithmetic-separation,multiplicity,tombstone,cascade,partial-positive",
+      fullIdentity: "unobserved", repairAuthority: false });
     await pool.query("DELETE FROM messages WHERE id=ANY($1::int[])", [invalidIds]);
     // Exercise actual driver payloads at the UTF-8 byte cap, not just the
     // returned report. A positive URL survives invalid metadata/provenance.
