@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
+import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 
 // Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
@@ -21,7 +22,10 @@ const check = (value: unknown) => { assert.ok(value); checks++; };
 try {
   await a.query('CREATE SCHEMA "' + schema + '"');
   for (const client of [a, b]) await client.query('SET search_path TO "' + schema + '"');
-  await a.query("CREATE TABLE rooms (id text PRIMARY KEY, password_hash text, creation_token_hash text)");
+  await a.query((await readFile("drizzle/0000_thin_stardust.sql", "utf8"))
+    .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"'));
+  await a.query("ALTER TABLE rooms ADD COLUMN creation_token_hash text");
+  await a.query(await readFile("drizzle/0003_spotty_zombie.sql", "utf8"));
   // Apply the actual generated additive migration, scoped to our private fixture.
   const sql = (await readFile("drizzle/0004_long_nighthawk.sql", "utf8"))
     .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"');
@@ -131,7 +135,6 @@ try {
   check(await policyPending === null);
   check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [policy.sessionId])).rows[0].generation === 0);
   // Durable operation gate: real competing clients, actual writes and rollback.
-  await a.query("CREATE TABLE operation_probe (label text NOT NULL)");
   const probeClient = await operationPool.connect();
   const operationPid = (await probeClient.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
   probeClient.release();
@@ -147,11 +150,11 @@ try {
     assert.ok(binding);
     return { credential, binding };
   };
-  const count = async () => Number((await a.query("SELECT count(*) FROM operation_probe")).rows[0].count);
+  const count = async () => Number((await a.query("SELECT count(*) FROM messages")).rows[0].count);
   let calls = 0;
-  const write = async (tx: Pick<typeof a, "query">) => {
+  const write = async (tx: Pick<typeof a, "query">, binding = happy.binding) => {
     calls++;
-    await tx.query("INSERT INTO operation_probe VALUES ('committed')");
+    await insertResumeTextMessage(tx, binding, "committed");
     return "receipt";
   };
   const happy = await makeBinding();
@@ -179,7 +182,7 @@ try {
   const ready = new Promise<void>(resolve => { entered = resolve; });
   const release = new Promise<void>(resolve => { finish = resolve; });
   const heldWrite = gate.run(winnerWrite.binding, async tx => {
-    await write(tx); entered(); await release; return "serialized";
+    await write(tx, winnerWrite.binding); entered(); await release; return "serialized";
   });
   await ready;
   const waitingCas = second.advanceGeneration(winnerWrite.credential, 1, opB, socketB);
@@ -211,24 +214,24 @@ try {
 
   const disconnected = await makeBinding();
   check(!(await gate.run(disconnected.binding, async tx => {
-    await write(tx); bindings.detach(disconnected.binding);
+    await write(tx, disconnected.binding); bindings.detach(disconnected.binding);
   })).authorized);
   check(await count() === 2); // mutation rolled back after local disconnect
   const failed = await makeBinding();
   await assert.rejects(gate.run(failed.binding, async tx => {
-    await write(tx); throw new Error("controlled callback failure");
+    await write(tx, failed.binding); throw new Error("controlled callback failure");
   }));
   checks++;
   check(await count() === 2);
   const failingSql = await makeBinding();
   await assert.rejects(gate.run(failingSql.binding, async tx => {
-    await write(tx); await tx.query("SELECT 1 / 0");
+    await write(tx, failingSql.binding); await tx.query("SELECT 1 / 0");
   }));
   checks++;
   check(await count() === 2);
   const expiresDuringWork = await makeBinding();
   check(!(await gate.run(expiresDuringWork.binding, async tx => {
-    await write(tx);
+    await write(tx, expiresDuringWork.binding);
     await tx.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1",
       [expiresDuringWork.binding.sessionId]);
   })).authorized);
@@ -246,6 +249,63 @@ try {
   await a.query("COMMIT");
   check(!(await afterPolicy).authorized);
   check(await count() === 2);
+  // Actual writer uses the same gate and exact binding identity, not caller room/name.
+  const currentSession = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
+  assert.ok(currentSession);
+  const currentIdentity = await first.advanceGeneration({ roomId: currentSession.roomId,
+    sessionId: currentSession.sessionId, token: currentSession.token }, 0, opA, socketA);
+  assert.ok(currentIdentity);
+  const currentBinding = await bindings.activate(currentIdentity, socketA, async () => {}, () => true);
+  assert.ok(currentBinding);
+  const writer = new ResumeMessageWriter(gate);
+  const saved = await writer.save(currentBinding, "  literal ' $1 text  ");
+  check(saved.authorized && saved.value.username === "Writer" &&
+    saved.value.message === "  literal ' $1 text  " && Number.isFinite(saved.value.ts));
+  check(await count() === 3);
+  const stored = (await a.query("SELECT * FROM messages ORDER BY id DESC LIMIT 1")).rows[0];
+  check(saved.authorized && stored.id === saved.value.id && stored.room_id === "candy986" &&
+    stored.username === "Writer" && stored.client_message_id === null);
+  check(!(await writer.save({ ...currentBinding }, "forged")).authorized);
+  await assert.rejects(writer.save(currentBinding, " ")); checks++;
+  await assert.rejects(writer.save(currentBinding, "x".repeat(10001))); checks++;
+  check(await count() === 3);
+  // Same-username sessions do not accidentally collide with the agent unique key.
+  const agent = await a.query("INSERT INTO messages (room_id, username, content, client_message_id) VALUES ('candy986', 'Writer', 'agent', 'key') RETURNING id");
+  const secondSaved = await writer.save(currentBinding, "agent");
+  check(secondSaved.authorized && secondSaved.value.id !== agent.rows[0].id);
+  check(await count() === 5); // no durable retry/deduplication claim
+  const sibling = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
+  assert.ok(sibling);
+  const siblingIdentity = await first.advanceGeneration({ roomId: sibling.roomId,
+    sessionId: sibling.sessionId, token: sibling.token }, 0, opA, socketB);
+  assert.ok(siblingIdentity);
+  const siblingBinding = await bindings.activate(siblingIdentity, socketB, async () => {}, () => true);
+  assert.ok(siblingBinding);
+  const siblingSaved = await writer.save(siblingBinding, "agent");
+  check(siblingSaved.authorized && secondSaved.authorized &&
+    siblingSaved.value.id !== secondSaved.value.id);
+  check(await count() === 6);
+  check((await writer.save(siblingBinding, "x".repeat(10000))).authorized);
+  check(await count() === 7);
+  // Write wins first: real room-policy mutation waits until message COMMIT.
+  let messageEntered!: () => void, messageFinish!: () => void;
+  const messageReady = new Promise<void>(r => { messageEntered = r; });
+  const messageRelease = new Promise<void>(r => { messageFinish = r; });
+  const beforePolicy = gate.run(currentBinding, async tx => {
+    const receipt = await insertResumeTextMessage(tx, currentBinding, "before policy");
+    messageEntered(); await messageRelease; return receipt;
+  });
+  await messageReady;
+  const pendingPolicy = b.query("UPDATE rooms SET auth_version = 5 WHERE id = 'candy986'");
+  await waitForBlockedSecond();
+  messageFinish();
+  check((await beforePolicy).authorized);
+  await pendingPolicy;
+  check(await count() === 8);
+  check(!(await writer.save(currentBinding, "after policy")).authorized);
+  check(!(await writer.save(siblingBinding, "after policy")).authorized);
+  check(await count() === 8);
+  await a.query("DELETE FROM messages WHERE room_id = 'candy986'");
   await a.query("DELETE FROM rooms WHERE id = 'candy986'");
   check(Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count) === 0);
   // A claim consumes the token and increments policy in ONE write. A second
