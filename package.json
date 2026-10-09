@@ -1,6 +1,6 @@
 {
   "name": "dimle",
-  "version": "3.0.9",
+  "version": "3.0.10",
   "description": "Dimle — chat rooms, now on Next.js",
   "private": true,
   "scripts": {
@@ -15,7 +15,7 @@
     "argon2": "^0.45.1",
     "drizzle-orm": "^0.45.1",
     "express": "^4.21.0",
-    "multer": "^1.4.5-lts.1",
+    "multer": "2.4.0",
     "next": "^15.3.0",
     "pg": "^8.20.0",
     "rate-limiter-flexible": "^11.2.1",
@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/multer": "^1.4.12",
+    "@types/multer": "2.3.0",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.18.0",
     "@types/react": "^19.0.0",

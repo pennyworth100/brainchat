@@ -211,6 +211,24 @@ async function main() {
     console.log("PASS dotted attachment names round-trip; raw/encoded traversal and malformed paths rejected");
 
     // A rejected upload must not close the room socket.
+    const fileEvents: unknown[] = [];
+    const recordRejected = (event: unknown) => fileEvents.push(event);
+    desktop.on("chat-file", recordRejected);
+    for (const extra of ["a[999999999]", "second-file"]) {
+      const malicious = new FormData();
+      if (extra !== "second-file") {
+        malicious.append(extra, "x");
+        malicious.append("a[key]", "x");
+      }
+      malicious.append("file", new Blob(["first"]), "first.txt");
+      if (extra === "second-file") malicious.append("file", new Blob(["second"]), "second.txt");
+      const denied = await fetch(`${base}/api/upload`, { method: "POST", headers: { "x-room-id": roomId, "x-socket-id": mobile.id! }, body: malicious, signal: AbortSignal.timeout(3000) });
+      assert.equal(denied.status, 400);
+    }
+    await session.sync();
+    assert.equal(fileEvents.length, 0);
+    desktop.off("chat-file", recordRejected);
+    console.log("PASS adversarial text fields and second file denied without file broadcast; socket remains usable");
     const broken = await fetch(`${base}/api/upload`, { method: "POST", headers: { "x-room-id": roomId, "x-socket-id": mobile.id! }, body: new FormData() });
     assert.equal(broken.status, 400);
     const idBeforeFailure = mobile.id;
