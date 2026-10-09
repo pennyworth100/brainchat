@@ -22,12 +22,21 @@ export type ResumeSocketOwner = Readonly<{
 
 // Key by the actual server Socket object, NEVER socket.id, handshake or client ID.
 // Keep closed owners until the socket is collected: reattachment cannot reopen it.
-const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner }>();
+const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner;
+  subscribe: (release: () => void) => (() => void) | null }>();
 const capacity = new ResumeCapacity(100);
 
 // Server-object identity check; never accept a copied owner or a different socket.
 export function ownsResumeSocket(socket: Socket, owner: ResumeSocketOwner): boolean {
   return owners.get(socket)?.owner === owner;
+}
+
+// Private exact-owner lifecycle hook. Closed owners cannot acquire new leases.
+// Releases are synchronous; async preparation cleanup stays in admission.
+export function onResumeSocketClose(socket: Socket, owner: ResumeSocketOwner,
+  release: () => void): (() => void) | null {
+  const record = owners.get(socket);
+  return record?.owner === owner ? record.subscribe(release) : null;
 }
 
 // PRIVATE, not registered by server.ts. One module instance in one server process.
@@ -43,6 +52,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   const incarnation = randomUUID();
   let closed = false;
   let closing: Promise<void> | undefined;
+  const releases = new Set<() => void>();
   const admission = new ResumeAdmission(store, bindings, incarnation,
     () => !closed && socket.connected, prepare, {
       capacity: options.capacity ?? capacity, timeoutMs: options.timeoutMs ?? 10_000,
@@ -51,7 +61,18 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   const close = () => {
     closed = true; // synchronous permanent fence, even if CAS/prepare never settles
     socket.off("disconnecting", onDisconnect);
-    return closing ??= admission.close();
+    const result = closing ??= admission.close();
+    // Publish the promise before callbacks, allowing reentrant close.
+    const callbacks = [...releases];
+    releases.clear();
+    for (const release of callbacks) {
+      try { release(); }
+      catch (error) {
+        try { onCleanupError(error); }
+        catch (reportError) { console.error("Resume cleanup error reporter failed", reportError); }
+      }
+    }
+    return result;
   };
   const onDisconnect = () => {
     void close().catch(error => {
@@ -61,7 +82,11 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     });
   };
   const owner = Object.freeze({ incarnation, admit: admission.admit.bind(admission), close });
-  owners.set(socket, { options, owner });
+  owners.set(socket, { options, owner, subscribe: release => {
+    if (closed) return null;
+    releases.add(release);
+    return () => { releases.delete(release); };
+  } });
   // Fence before Socket.IO removes rooms and emits its later disconnect event.
   socket.once("disconnecting", onDisconnect);
   if (!socket.connected) onDisconnect();

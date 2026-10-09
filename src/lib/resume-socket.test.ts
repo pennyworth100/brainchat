@@ -133,6 +133,64 @@ test("failed physical eviction fences candidate without reviving old authority",
   await old.close(); await next.close();
 });
 
+
+test("owner close releases membership capacity before pending cleanup settles", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const cleanup = deferred<void>(); let cleanups = 0;
+  opts.prepare = async () => async () => { cleanups++; await cleanup.promise; };
+  const members = new ResumeMemberships(opts.bindings, 1);
+  const owner = attachResumeSocket(first.socket, opts);
+  const binding = await owner.admit(request()); assert.ok(binding);
+  const lease = members.install(first.socket, owner, binding); assert.ok(lease);
+  const closing = owner.close();
+  assert.equal(owner.close(), closing);
+  assert.equal(first.socket.connected, true);
+  assert.equal(lease.isCurrent(), false);
+  assert.equal(lease.release(), false); // already released synchronously
+  assert.equal(first.socket.listenerCount("disconnecting"), 0);
+  const next = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "session-b" }) },
+    prepare: async () => async () => {} });
+  const otherRequest = request(); otherRequest.credential.sessionId = "session-b";
+  const other = await next.admit(otherRequest); assert.ok(other);
+  const successor = members.install(second.socket, next, other); assert.ok(successor);
+  cleanup.resolve(); await closing;
+  assert.equal(cleanups, 1); assert.equal(successor.isCurrent(), true);
+  first.socket.disconnect(true);
+  assert.equal(successor.isCurrent(), true); await next.close();
+});
+
+test("close between admission and installation cannot acquire membership", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings, 1);
+  const owner = attachResumeSocket(socket, opts);
+  const binding = await owner.admit(request()); assert.ok(binding);
+  const closing = owner.close();
+  assert.equal(members.install(socket, owner, binding), null);
+  assert.equal(socket.listenerCount("disconnecting"), 0); await closing;
+});
+
+test("reentrant owner close during replacement frees candidate capacity", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings, 1), old = attachResumeSocket(first.socket, opts);
+  const before = await old.admit(request()); assert.ok(before);
+  assert.ok(members.install(first.socket, old, before));
+  const next = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => identity(2) } });
+  const binding = await next.admit(request(1)); assert.ok(binding);
+  first.socket.once("disconnect", () => { void next.close(); });
+  assert.equal(members.install(second.socket, next, binding), null);
+  assert.equal(second.socket.connected, true);
+  assert.equal(second.socket.listenerCount("disconnecting"), 0);
+  const third = await f.connect();
+  const otherOwner = attachResumeSocket(third.socket, { ...opts,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "session-b" }) } });
+  const otherRequest = request(); otherRequest.credential.sessionId = "session-b";
+  const other = await otherOwner.admit(otherRequest); assert.ok(other);
+  assert.ok(members.install(third.socket, otherOwner, other));
+  await old.close(); await next.close(); await otherOwner.close();
+});
+
 test("real socket has one immutable owner, server incarnation and no public resume handler", async t => {
   const f = await fixture(t), { socket } = await f.connect(), opts = options();
   const owner = attachResumeSocket(socket, opts);

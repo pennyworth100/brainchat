@@ -27,3 +27,9 @@ The registry independently caps retained memberships at 10,000 (configurable).
 Expired yet connected leases count until released or disconnected; overload
 rejects installation without evicting unrelated members. Admission success alone
 does not imply membership success: composition must close a rejected owner.
+
+Explicit owner close synchronously releases the exact membership and registry
+capacity even while asynchronous preparation cleanup is pending or fails. It
+does not physically disconnect that socket. Close subscriptions reject closed
+owners and are removed by lease release; late old-owner cleanup cannot release
+a successor. Admission-plus-install composition remains a separate next step.

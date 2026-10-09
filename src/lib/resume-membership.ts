@@ -1,6 +1,6 @@
 import type { Socket } from "socket.io";
 import type { ResumeBinding, ResumeBindings } from "./resume-bindings";
-import { ownsResumeSocket, type ResumeSocketOwner } from "./resume-socket";
+import { onResumeSocketClose, ownsResumeSocket, type ResumeSocketOwner } from "./resume-socket";
 
 export type ResumeMembership = Readonly<{
   binding: ResumeBinding;
@@ -30,9 +30,11 @@ export class ResumeMemberships {
     // registry independently; never evict arbitrary members to admit more work.
     if (!previous && this.sessions.size >= this.capacity) return null;
     let released = false;
+    let unsubscribe: (() => void) | null = null;
     const release = () => {
       if (released) return false;
       released = true;
+      unsubscribe?.();
       socket.off("disconnecting", release);
       this.bindings.detach(binding); // exact binding; cannot detach a successor
       if (this.sockets.get(socket) === slot) this.sockets.delete(socket);
@@ -45,6 +47,8 @@ export class ResumeMemberships {
         this.sessions.get(binding.sessionId) === slot && this.bindings.isCurrent(binding),
     });
     const slot: Slot = { socket, lease };
+    unsubscribe = onResumeSocketClose(socket, owner, release);
+    if (!unsubscribe) return null;
     // Publish exact successor ownership before synchronous disconnect callbacks.
     this.sessions.set(binding.sessionId, slot);
     this.sockets.set(socket, slot);
