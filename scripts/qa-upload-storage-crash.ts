@@ -243,6 +243,56 @@ async function main() {
     evidence.push({ case: "receipt-session-state", checks: 9,
       cases: "unexpired,expired,revoked,policy-changed,infinite-expiry,invalid-version,pinned-state-and-clock,fresh-state,no-secret-projection",
       authorization: "unproven", clock: "database-transaction-start" });
+    // Real SQL boundaries, not mocked flags. Preserve historical references.
+    const boundaryStart = checks;
+    const unknownState = { expiry: "unobserved", revocation: "unobserved", roomAuthVersion: "unobserved" };
+    for (const length of [128, 129]) {
+      const sessionId = "s".repeat(length);
+      await pool.query(`INSERT INTO room_resume_sessions
+        (id, token_hash, room_id, username, auth_version, expires_at)
+        SELECT $2, $3, room_id, username, auth_version, expires_at
+        FROM room_resume_sessions WHERE id=$1`, [committed.session_id, sessionId,
+        createHash("sha256").update(sessionId).digest("hex")]);
+      await pool.query("UPDATE resume_message_receipts SET session_id=$2 WHERE session_id=$1", [committed.session_id, sessionId]);
+      const observed = await databaseInventory(), receipt = observed.references?.receipts[0];
+      check(JSON.stringify(state(observed)) === JSON.stringify(length === 128 ? state(initialDb) : unknownState));
+      check(receipt?.status === (length === 128 ? "reference" : "oversized") && receipt.sessionId?.length === 128);
+      check(receipt?.storageKey === committed.storage_key && receipt?.metadataStatus === "valid" && identity(observed)?.payloadHash === "match");
+      check(observed.complete && observed.accounting === "consistent" && observed.referenceFacts?.fullIdentity === "unobserved");
+      await pool.query("UPDATE resume_message_receipts SET session_id=$2 WHERE session_id=$1", [sessionId, committed.session_id]);
+      await pool.query("DELETE FROM room_resume_sessions WHERE id=$1", [sessionId]);
+      const roomId = "r".repeat(length);
+      await pool.query("INSERT INTO rooms (id) VALUES ($1)", [roomId]);
+      await pool.query("UPDATE room_resume_sessions SET room_id=$2 WHERE id=$1", [committed.session_id, roomId]);
+      const roomObserved = await databaseInventory();
+      check(JSON.stringify(state(roomObserved)) === JSON.stringify(length === 128 ? state(initialDb) : unknownState));
+      check(identity(roomObserved)?.sessionRoom === (length === 128 ? "conflict" : "unobserved"));
+      check(roomObserved.references?.receipts[0].storageKey === committed.storage_key && !JSON.stringify(roomObserved).includes(roomId));
+      await pool.query("UPDATE room_resume_sessions SET room_id='files123' WHERE id=$1", [committed.session_id]);
+      await pool.query("DELETE FROM rooms WHERE id=$1", [roomId]);
+    }
+    // Cross real expiry while the SAME read-only snapshot remains pinned.
+    const clockClient = await pool.connect(), clockQuery = clockClient.query.bind(clockClient);
+    clockClient.query = (async (config: { text: string }) => {
+      if (config.text.startsWith("BEGIN ISOLATION"))
+        await pool.query("UPDATE room_resume_sessions SET expires_at=clock_timestamp()+interval '1 second' WHERE id=$1", [committed.session_id]);
+      if (config.text.startsWith("DECLARE reference_receipts")) {
+        await clockQuery("SELECT pg_sleep(1.05)");
+        const clocks = (await clockQuery(`SELECT expires_at>transaction_timestamp() AS future_at_start,
+          expires_at<=clock_timestamp() AS expired_now FROM room_resume_sessions WHERE id=$1`, [committed.session_id])).rows[0];
+        check(clocks.future_at_start && clocks.expired_now);
+      }
+      return clockQuery(config);
+    }) as typeof clockClient.query;
+    const elapsed = await inventoryUploadDatabase(clockClient, { pageSize: 1, maxRows: 10, timeoutMs: 5000 });
+    check(elapsed.complete && state(elapsed)?.expiry === "unexpired" && elapsed.referenceFacts?.fullIdentity === "unobserved");
+    const afterExpiry = await databaseInventory();
+    check(afterExpiry.complete && state(afterExpiry)?.expiry === "expired");
+    check(afterExpiry.references?.receipts[0].storageKey === committed.storage_key && identity(afterExpiry)?.payloadHash === "match");
+    await pool.query("UPDATE room_resume_sessions SET expires_at=$2 WHERE id=$1", [committed.session_id, originalExpiry]);
+    evidence.push({ case: "receipt-session-boundaries-and-elapsed-expiry", checks: checks - boundaryStart,
+      cases: "128-vs-129-session-id,128-vs-129-session-room,positive-reference-retained,expiry-crossed-during-scan,fresh-snapshot-expired",
+      clock: "database-transaction-start-not-completion", mutations: "isolated-fixture-only" });
     check(JSON.stringify(identity(initialDb)) === JSON.stringify({ sessionRoom: "match", sessionUsername: "match", payloadHash: "match" }));
     const originalHash = (await pool.query("SELECT payload_hash FROM resume_message_receipts WHERE session_id=$1", [committed.session_id])).rows[0].payload_hash;
     await pool.query("INSERT INTO rooms (id) VALUES ('other123')");

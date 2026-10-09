@@ -201,6 +201,15 @@ does not join sessions or gain this field. Real PostgreSQL regressions cover bot
 directions of room mismatch, oversized provenance, deletion, and a concurrent
 commit observed only by a fresh inventory. No runtime caller or schema changes.
 
+Real PostgreSQL boundary tests cover 128- versus 129-character session IDs and
+session-room IDs. Oversized joined provenance leaves all three session-state
+facts unobserved while preserving the positive file reference and its independent
+message payload hash. A separate fixture lets expiry pass during a pinned scan:
+the report retains `unexpired` at transaction start even though the database wall
+clock has passed expiry before receipt collection. A fresh scan reports `expired`.
+This is deliberately NOT current-at-completion authorization. These tests mutate
+only their isolated fixture; no production inspection or repair is performed.
+
 Next implementation slice: filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
