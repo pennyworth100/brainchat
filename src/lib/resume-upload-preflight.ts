@@ -4,6 +4,7 @@ import type { ResumeMemberships } from "./resume-membership";
 import { hashResumeToken, type ResumeStore } from "./resume-store";
 import type { ResumeUploadAdmissions, ResumeUploadGrant } from "./resume-upload-admission";
 import { ResumeCapacity } from "./resume-capacity";
+import { resumeUploadRate } from "./resume-upload-rate";
 
 const capacity = new ResumeCapacity(100);
 const pending = new WeakSet<Socket>();
@@ -17,11 +18,15 @@ type Limits = { capacity?: ResumeCapacity; timeoutMs?: number; now?: () => numbe
 export async function preflightResumeUpload(socket: Socket, owner: ResumeSocketOwner,
   members: ResumeMemberships, store: Pick<ResumeStore, "lookup">,
   uploads: ResumeUploadAdmissions, request: Request, limits: Limits = {}): Promise<ResumeUploadGrant | null> {
+  // Charge every call globally, including malformed/unowned requests. Scope
+  // session debt ONLY by current server-owned identity, before payload checks.
+  if (!resumeUploadRate.consumeAggregate()) return null;
+  const binding = members.currentBindingFor(socket, owner);
+  if (!binding || !resumeUploadRate.consumeSession(binding.sessionId)) return null;
   const roomId = request?.roomId, sessionId = request?.sessionId, token = request?.token;
   if (typeof roomId !== "string" || typeof sessionId !== "string" ||
       typeof token !== "string" || !hashResumeToken(token)) return null;
-  const binding = members.bindingFor(socket, owner, roomId);
-  if (!binding || binding.sessionId !== sessionId || pending.has(socket)) return null;
+  if (binding.roomId !== roomId || binding.sessionId !== sessionId || pending.has(socket)) return null;
   const timeoutMs = limits.timeoutMs ?? 10_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10_000) {
     throw Error("Invalid upload preflight deadline");

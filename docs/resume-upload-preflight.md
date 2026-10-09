@@ -23,6 +23,23 @@ late results; lookup errors propagate. Lookup is NOT cancelled or released at th
 deadline/close. It stays pending until actual settlement, retaining both permits.
 The HTTP layer must reject/close its transport without claiming cancelled DB work.
 
+Separate shared fixed-window attempt budgets now run before durable lookup:
+1200 calls/minute process-wide and 60 calls/minute per authoritative logical
+session, with at most 10,000 session debt records. Aggregate quota is charged
+even for malformed/unowned calls. A session key comes ONLY from the exact current
+physical owner/membership, before checking request room/session/token. Wrong-room,
+malformed, forged bearer, pending/capacity denial and DB errors do not refund debt.
+No request, wrapper, admission object, reconnect or generation change resets it.
+Expired windows are pruned without live-debt eviction; clock rollback is clamped,
+non-finite readings fail closed. These are fixed windows, not rolling limits:
+adjacent window boundaries can allow two bursts. No timers or automatic retry.
+
+These private defaults are process-local and reset on process restart. They do
+not protect against distributed/IP abuse or allocation before this seam. A caller
+who knows a victim socket ID can consume its local quota even without a valid
+bearer; upstream network/IP controls remain required. A closed/unowned socket
+consumes only aggregate quota. No upload grant lifetime or disk accounting changes.
+
 A successful grant retains the existing bounded upload lifetime after ordinary
 disconnect. Disconnect BEFORE admission denies. Successor/policy/expiry checks in
 the durable upload transaction remain mandatory: preflight lookup is not a lock,
@@ -50,8 +67,8 @@ Still required (NOT implemented/proven by this seam):
   sink, request/body deadlines and tested abort/finalization semantics. An HTTP
   framework or proxy may receive/buffer bytes before application authentication;
   rejection before parser/source/FS does not mean zero network bytes received.
-- Aggregate and per-session rate limits, including denied auth attempts. The
-  lookup capacity is concurrency control, not a request-rate limit.
+- Upstream connection/IP/header-abuse controls and distributed rate policy. The
+  private process/session attempt budgets do not replace those protections.
 - Disk-byte reservation/quota and headroom checks before parser/staging, accounting
   for concurrent attempts, metadata/inodes and retained uncertain files. A 100
   slot count times 100 MiB is not a disk quota. Reservation cannot be refunded on

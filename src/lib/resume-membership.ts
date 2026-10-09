@@ -45,10 +45,16 @@ export class ResumeMemberships {
   // Server-owned physical lookup, never a binding reconstructed from headers.
   // This does not authenticate an HTTP caller who merely knows socket.id.
   bindingFor(socket: Socket, owner: ResumeSocketOwner, roomId: string): ResumeBinding | null {
+    const binding = this.currentBindingFor(socket, owner);
+    return binding?.roomId === roomId ? binding : null;
+  }
+
+  // Rate scope comes from physical authority even for wrong-room credentials.
+  currentBindingFor(socket: Socket, owner: ResumeSocketOwner): ResumeBinding | null {
     const slot = this.sockets.get(socket);
     if (!ownsResumeSocket(socket, owner) || !slot ||
         slot.lease.binding.transportId !== owner.incarnation ||
-        !this.isCurrent(slot.lease.binding, roomId)) return null;
+        !this.isCurrent(slot.lease.binding, slot.lease.binding.roomId)) return null;
     return slot.lease.binding;
   }
 

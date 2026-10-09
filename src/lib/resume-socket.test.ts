@@ -2,6 +2,41 @@ import assert from "node:assert/strict";
 import { preflightResumeUpload } from "./resume-upload-preflight";
 import { ResumeUploadAdmissions } from "./resume-upload-admission";
 
+test("upload preflight charges malformed credentials to physical session, not attacker keys", async t => {
+  const sessionId = "upload-rate-malformed", f = await syncFixture(t, sessionId);
+  let lookups = 0;
+  const run = (payload: Parameters<typeof preflightResumeUpload>[5]) => preflightResumeUpload(
+    f.socket, f.owner, f.members, { lookup: async () => { lookups++; return null; } },
+    new ResumeUploadAdmissions(f.opts.bindings), payload, { capacity: new ResumeCapacity(100) });
+  for (let i = 0; i < 60; i++) {
+    assert.equal(await run(i % 2 ? null : { ...request().credential,
+      roomId: "wrong123", sessionId: `attacker-${i}` }), null);
+  }
+  assert.equal(await run({ ...request().credential, sessionId }), null);
+  assert.equal(lookups, 0);
+});
+
+test("upload preflight denial/error debt survives wrapper and physical owner replacement", async t => {
+  const sessionId = "upload-rate-replacement", f = await syncFixture(t, sessionId);
+  const credential = { ...request().credential, sessionId };
+  let lookups = 0;
+  for (let i = 0; i < 60; i++) {
+    const flight = preflightResumeUpload(f.socket, f.owner, f.members,
+      { lookup: async () => { lookups++; if (i % 2) throw Error("denied DB"); return null; } },
+      new ResumeUploadAdmissions(f.opts.bindings), credential);
+    if (i % 2) await assert.rejects(flight, /denied DB/);
+    else assert.equal(await flight, null);
+  }
+  const next = await f.connect(), owner = attachResumeSocket(next.socket, { ...f.opts,
+    memberships: f.members, store: { advanceGeneration: async () => ({ ...identity(2), sessionId }) } });
+  t.after(() => owner.close());
+  assert.ok(await owner.admit({ ...request(1), credential }));
+  assert.equal(await preflightResumeUpload(next.socket, owner, f.members,
+    { lookup: async () => { lookups++; return { ...identity(2), sessionId }; } },
+    new ResumeUploadAdmissions(f.opts.bindings), credential), null);
+  assert.equal(lookups, 60);
+});
+
 test("upload preflight rejects wrong room/session/token and forged physical owner before DB/body", async t => {
   const f = await syncFixture(t), other = await f.connect();
   const uploads = new ResumeUploadAdmissions(f.opts.bindings);
