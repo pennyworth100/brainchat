@@ -38,8 +38,11 @@ There is no runtime caller, volume audit, recovery action or public activation.
 
 `observeUploadBlob` is separate and unwired. Given one strictly canonical 64-hex
 storage key, it checks exactly root/key/blob without enumeration or recursion.
-The trusted stable root/ancestry precondition and admission-only deadline apply
-as above (1..30,000 ms, copied before awaiting). It lstat-checks each component,
+The caller's `trustedStableAncestry` attestation covers the blob's ENTIRE ancestry,
+including the keyed directory, root and ancestors. Held handles and path checks
+are NOT openat-relative resolution and cannot prevent intermediate path substitution
+outside that trust precondition. The admission-only deadline applies as above
+(1..30,000 ms, copied before awaiting). It lstat-checks each component,
 opens/holds no-follow root and keyed directory handles, and opens the regular
 blob read-only with NOFOLLOW and NONBLOCK. NONBLOCK prevents a FIFO replacement
 at open from hanging; fstat must still confirm regular-file type and identity.

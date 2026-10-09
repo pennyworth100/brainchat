@@ -14,8 +14,10 @@ const same = (a: BigIntStats, b: BigIntStats) =>
   a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.size === b.size &&
   a.nlink === b.nlink && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 
-// PRIVATE, no runtime caller. Trusted stable root AND ancestors are a caller
-// precondition, not proven here. No hostile same-uid/ABA protection. Fixed-depth
+// PRIVATE, no runtime caller. The blob's ENTIRE ancestry (including root/key)
+// must be trusted and stable: a caller precondition, not proven here. Held
+// handles do not implement openat or prevent intermediate path substitution.
+// No hostile same-uid/ABA protection. Fixed-depth
 // metadata only: never reads/hashes content, enumerates a directory or mutates.
 // maxMs bounds I/O admission, NOT pending kernel I/O or close latency.
 export async function observeUploadBlob(root: string, storageKey: string,
