@@ -184,6 +184,40 @@ async function main() {
     check(initialFacts?.roomConflicts === 0 && initialFacts.receiptIdentityConflicts === 0);
     check(initialDb.referenceFacts?.fullIdentity === "unobserved");
     const identity = (db: typeof initialDb) => db.references?.receipts[0].identityEvidence;
+    const state = (db: typeof initialDb) => db.references?.receipts[0].sessionState;
+    check(JSON.stringify(state(initialDb)) === JSON.stringify({ expiry: "unexpired", revocation: "not-revoked", roomAuthVersion: "match" }));
+    const originalExpiry = (await pool.query("SELECT expires_at FROM room_resume_sessions WHERE id=$1", [committed.session_id])).rows[0].expires_at;
+    await pool.query("UPDATE room_resume_sessions SET expires_at=transaction_timestamp()-interval '1 second', revoked_at=transaction_timestamp() WHERE id=$1", [committed.session_id]);
+    await pool.query("UPDATE rooms SET auth_version=auth_version+1 WHERE id='files123'");
+    const inactive = await databaseInventory();
+    check(JSON.stringify(state(inactive)) === JSON.stringify({ expiry: "expired", revocation: "revoked", roomAuthVersion: "conflict" }));
+    check(inactive.complete && inactive.referenceFacts?.fullIdentity === "unobserved");
+    check(identity(inactive)?.payloadHash === "match"); // Historical evidence survives expired authority.
+    await pool.query("UPDATE room_resume_sessions SET expires_at='infinity', auth_version=0 WHERE id=$1", [committed.session_id]);
+    const invalidState = state(await databaseInventory());
+    check(invalidState?.expiry === "unobserved" && invalidState.roomAuthVersion === "unobserved" && invalidState.revocation === "revoked");
+    await pool.query("UPDATE room_resume_sessions SET expires_at=$2, revoked_at=NULL, auth_version=1 WHERE id=$1", [committed.session_id, originalExpiry]);
+    await pool.query("UPDATE rooms SET auth_version=1 WHERE id='files123'");
+    const stateClient = await pool.connect(), stateQuery = stateClient.query.bind(stateClient);
+    let transactionClock: string | undefined;
+    stateClient.query = (async (config: { text: string }) => {
+      if (config.text.startsWith("DECLARE reference_receipts")) {
+        transactionClock = (await stateQuery("SELECT transaction_timestamp()::text AS clock")).rows[0].clock;
+        await pool.query("UPDATE room_resume_sessions SET revoked_at=transaction_timestamp(), expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1", [committed.session_id]);
+        await pool.query("UPDATE rooms SET auth_version=2 WHERE id='files123'");
+        check((await stateQuery("SELECT transaction_timestamp()::text AS clock")).rows[0].clock === transactionClock);
+      }
+      return stateQuery(config);
+    }) as typeof stateClient.query;
+    const pinnedState = await inventoryUploadDatabase(stateClient, { pageSize: 1, maxRows: 10, timeoutMs: 2000 });
+    check(JSON.stringify(state(pinnedState)) === JSON.stringify(state(initialDb)));
+    check(JSON.stringify(state(await databaseInventory())) === JSON.stringify(state(inactive)));
+    check(!JSON.stringify(pinnedState).includes("token_hash") && !JSON.stringify(pinnedState).includes("expires_at"));
+    await pool.query("UPDATE room_resume_sessions SET expires_at=$2, revoked_at=NULL WHERE id=$1", [committed.session_id, originalExpiry]);
+    await pool.query("UPDATE rooms SET auth_version=1 WHERE id='files123'");
+    evidence.push({ case: "receipt-session-state", checks: 9,
+      cases: "unexpired,expired,revoked,policy-changed,infinite-expiry,invalid-version,pinned-state-and-clock,fresh-state,no-secret-projection",
+      authorization: "unproven", clock: "database-transaction-start" });
     check(JSON.stringify(identity(initialDb)) === JSON.stringify({ sessionRoom: "match", sessionUsername: "match", payloadHash: "match" }));
     const originalHash = (await pool.query("SELECT payload_hash FROM resume_message_receipts WHERE session_id=$1", [committed.session_id])).rows[0].payload_hash;
     await pool.query("INSERT INTO rooms (id) VALUES ('other123')");
@@ -266,6 +300,7 @@ async function main() {
     const tombstoneDb = await databaseInventory();
     check(tombstoneDb.references?.receipts[0].status === "tombstone" && tombstoneDb.references.receipts[0].messageId === null);
     check(Object.values(identity(tombstoneDb)!).every(value => value === "unobserved"));
+    check(state(tombstoneDb)?.revocation === "not-revoked" && state(tombstoneDb)?.roomAuthVersion === "match"); // Session facts do not require a message.
     check(tombstoneDb.references?.messages.length === 0 && tombstoneDb.references.complete);
     check(tombstoneDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key)?.receipts === 0);
     check(tombstone.receipts.length === 1 && tombstone.receipts[0].message_id === null &&

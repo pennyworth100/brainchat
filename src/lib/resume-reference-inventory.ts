@@ -13,6 +13,9 @@ export type ReferenceObservation = {
   declaredSize?: number; declaredSha256?: string;
   // Receipt-local observations, NOT authorization, ownership or full identity.
   identityEvidence?: { sessionRoom: Comparison; sessionUsername: Comparison; payloadHash: Comparison };
+  // Facts at the DB transaction clock/snapshot, never an authorization verdict.
+  sessionState?: { expiry: "expired" | "unexpired" | "unobserved";
+    revocation: "revoked" | "not-revoked" | "unobserved"; roomAuthVersion: Comparison };
 };
 export type ReferenceInventory = {
   receipts: ReferenceObservation[]; messages: ReferenceObservation[];
@@ -38,8 +41,16 @@ export async function collectUploadReferences(query: Query,
           CASE WHEN length(s.username)<=128 AND length(m.username)<=128 THEN s.username=m.username END AS session_username_match,
           CASE WHEN length(m.username)<=128 THEN m.username END AS message_username,
           CASE WHEN length(r.payload_hash)=64 THEN r.payload_hash END AS payload_hash,
+          CASE WHEN length(s.id)<=128 AND length(s.room_id)<=128 AND isfinite(s.expires_at)
+            THEN s.expires_at<=transaction_timestamp() END AS session_expired,
+          CASE WHEN length(s.id)<=128 AND length(s.room_id)<=128
+            THEN s.revoked_at IS NOT NULL END AS session_revoked,
+          CASE WHEN length(s.id)<=128 AND length(s.room_id)<=128
+            AND s.auth_version>0 AND sr.auth_version>0
+            THEN s.auth_version=sr.auth_version END AS session_auth_match,
           ${projection} FROM resume_message_receipts r LEFT JOIN messages m ON m.id=r.message_id
           LEFT JOIN room_resume_sessions s ON s.id=r.session_id
+          LEFT JOIN rooms sr ON sr.id=s.room_id
           ORDER BY r.session_id,r.client_message_id`
       : `SELECT ${projection} FROM messages m WHERE m.type='file' ORDER BY m.id`;
     await query(`DECLARE reference_${source} NO SCROLL CURSOR FOR ${sql}`);
@@ -59,6 +70,11 @@ export async function collectUploadReferences(query: Query,
           const comparison = (value: unknown): Comparison => value === true ? "match" : value === false ? "conflict" : "unobserved";
           observation.identityEvidence = { sessionRoom: comparison(row.session_room_match),
             sessionUsername: comparison(row.session_username_match), payloadHash: "unobserved" };
+          observation.sessionState = {
+            expiry: row.session_expired === true ? "expired" : row.session_expired === false ? "unexpired" : "unobserved",
+            revocation: row.session_revoked === true ? "revoked" : row.session_revoked === false ? "not-revoked" : "unobserved",
+            roomAuthVersion: comparison(row.session_auth_match),
+          };
         }
         if (row.oversized || row.receipt_oversized) observation.status = "oversized";
         else if (row.message_id === null) { observation.status = "tombstone"; observation.metadataStatus = "not-applicable"; }

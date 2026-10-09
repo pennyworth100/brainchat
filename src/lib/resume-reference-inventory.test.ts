@@ -10,6 +10,29 @@ const key = "a".repeat(64);
 const validMetadata = { url: `/uploads/${key}/blob`, name: "safe.txt", size: 3,
   mime: "text/plain", sha256: "b".repeat(64) };
 
+test("session facts are independent, unknown by default and retained for tombstones", async () => {
+  for (const [input, expected] of [
+    [{}, { expiry: "unobserved", revocation: "unobserved", roomAuthVersion: "unobserved" }],
+    [{ session_expired: true, session_revoked: false, session_auth_match: false },
+      { expiry: "expired", revocation: "not-revoked", roomAuthVersion: "conflict" }],
+    [{ session_expired: false, session_revoked: true, session_auth_match: true },
+      { expiry: "unexpired", revocation: "revoked", roomAuthVersion: "match" }],
+    [{ session_expired: "false", session_revoked: 0, session_auth_match: null },
+      { expiry: "unobserved", revocation: "unobserved", roomAuthVersion: "unobserved" }],
+  ] as const) {
+    const report: ReferenceInventory = { receipts: [], messages: [], complete: false,
+      parseComplete: false, metadataComplete: false, reasons: [] };
+    let fetched = false;
+    await collectUploadReferences(async text => ({ rows:
+      text.startsWith("FETCH") && text.includes("reference_receipts") && !fetched
+        ? (fetched = true, [{ message_id: null, room_id: null, ...input }]) : [],
+    } as QueryResult), { pageSize: 10, maxRows: 10 }, report);
+    assert.deepEqual(report.receipts[0].sessionState, expected);
+    assert.equal(report.receipts[0].status, "tombstone");
+    assert.equal(report.receipts[0].storageKey, null);
+  }
+});
+
 test("receipt identity keeps independent unknowns, conflicts and private bounded inputs", async () => {
   const payload = createHash("sha256").update(JSON.stringify(["files123", "PRIVATE", "file",
     validMetadata.name, validMetadata.size, validMetadata.mime, validMetadata.sha256])).digest("hex");

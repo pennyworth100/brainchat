@@ -177,7 +177,21 @@ to each receipt, never a winner among duplicate references. Even all matches
 prove neither current session authorization nor ownership, filesystem integrity,
 uniqueness or full identity; `fullIdentity` remains `unobserved`.
 
-Next implementation slice: session state/attempt cross-reference evidence before
+Receipt-local `sessionState` now records expiry (`expired`, `unexpired`,
+`unobserved`), revocation (`revoked`, `not-revoked`, `unobserved`) and room auth
+version (`match`, `conflict`, `unobserved`) independently. Expiry uses PostgreSQL
+`transaction_timestamp()` (transaction-start clock, NOT application wall time or
+time of completion); expiry at that clock is expired. The same pinned read-only
+snapshot supplies sessions and their own rooms. Nonfinite expiry, absent joins,
+oversized session/room identifiers and invalid auth versions leave the affected
+facts unobserved. No timestamp, version, credential or token hash is projected.
+Tombstones retain session facts despite having no comparable message identity.
+Historical references and hashes survive expiry/revocation/policy changes: these
+facts neither authorize a new write nor establish original authorization,
+current-at-completion validity, attempt/session agreement, ownership or full identity.
+The existing independent `identityEvidence` and `fullIdentity` semantics are unchanged.
+
+Next implementation slice: attempt/session cross-reference evidence before
 any full identity verdict, then filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
