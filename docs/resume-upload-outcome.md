@@ -22,7 +22,31 @@ an arbitrary client path or a reused attachment. A process crash requires durabl
 reconciliation, not guessing based on file age. Filesystem work remains outside
 the database callback, which must not control transactions or leak queries.
 
-Next: generation-preserving HTTP admission with bounded streaming, exclusive
-file ownership and durable receipt resolution. Explicitly reconcile the desired
-HTTP lifetime with the current gate (disconnect currently denies before COMMIT),
-then add a file writer and fenced publication. This is not upload acceptance.
+## Private admission accounting (not wired)
+
+`ResumeUploadAdmissions` captures an exact live server-owned binding in an opaque,
+immutable grant. Ordinary socket disconnect does not invalidate this already
+admitted HTTP lifetime. Any successor generation, including pending or failed
+preparation, fences it permanently. Copied bindings/grants cannot acquire authority.
+This does not change `ResumeOperationGate`: that gate still requires a live socket.
+
+One unresolved lease per session per registry and a shared process capacity of
+100 bound admission. Instantiate one registry per server. Each raw chunk must be
+accounted before forwarding; the cumulative limit is at most 100 MiB, independent
+of Content-Length. A monotonic deadline of at most 120 seconds and absolute session
+expiry fence subsequent work. Rejection is latched. Deadline, disconnect and
+generation replacement do NOT release capacity: only actual settlement allows
+the server finalizer to release. A stalled lease consumes capacity and fails closed.
+
+This is accounting, NOT bounded streaming implementation or durable authorization.
+There is no timer-driven stream abort, multipart parser, file writer, HTTP route,
+database grant validator or cleanup action here. Callers must bound parser metadata
+and buffering, cancel streams safely, and retain leases until all work settles.
+Before any message COMMIT a future upload-specific DB gate must revalidate the
+captured generation, transport, policy, revocation and expiry under the existing
+room/session locks; disconnect alone may be allowed, a successor may not. Do NOT
+bypass the existing socket gate or claim this local grant authorizes persistence.
+
+Next: upload-specific durable gate and idempotent receipt, then exclusive file
+ownership, bounded streaming and fenced publication. No filesystem operations in
+DB callbacks; no cleanup on deadline/unknown COMMIT. This is not upload acceptance.

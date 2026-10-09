@@ -96,6 +96,15 @@ export class ResumeBindings {
       binding.expiresAt > this.now();
   }
 
+  // PRIVATE upload admission only. Capture while live; ordinary disconnect may
+  // outlive HTTP admission, but even a pending/failed successor fences it.
+  // This predicate is NOT database authorization or permission to publish.
+  captureUploadGeneration(binding: ResumeBinding): (() => boolean) | null {
+    if (!this.isCurrent(binding)) return null;
+    return () => this.slots.get(binding.sessionId)?.binding === binding &&
+      binding.expiresAt > this.now();
+  }
+
   // Exact object identity prevents copied/client-built bindings from authorizing.
   // A delayed disconnect from an old socket cannot remove its successor.
   detach(binding: ResumeBinding): boolean {
