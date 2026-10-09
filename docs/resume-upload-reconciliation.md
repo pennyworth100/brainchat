@@ -1,10 +1,40 @@
 # Read-only upload reconciliation contract (3.0.11 draft)
 
-Status: private contract, bounded **database-only** collector and adversarial fixture
+Status: private contract, bounded database collector, separate root-entry observer and adversarial fixture
 proof, NOT a complete reconciliation collector. No scheduler, public route, cleanup, refund, retry or deployment is
 enabled. The ledger remains monotonic. This contract does not grant repair authority.
 
 ## Evidence sources and completeness
+
+### Private root-entry slice
+
+`inventoryUploadRoot` is a separate, unwired observer. Its caller must attest that
+the root and ALL ancestors are trusted, stable, server-owned directories; it does
+not establish that precondition itself. The root is opened with `O_DIRECTORY |
+O_NOFOLLOW`, held throughout the scan and compared via bigint device/inode/mode/
+size/link-count/mtime/ctime against path `lstat` before/after enumeration. An observed
+change is `unstable`; unchanged checks are NOT a race-free snapshot or defense
+against hostile same-uid replacement/ABA. Atime is deliberately not compared.
+
+The scan admits at most 10,000 observations, one extra read to distinguish an
+exact cap from truncation, and 30 seconds of I/O admission budget. Directory
+bufferSize is 1. Deadline checks surround awaited operations; pending kernel I/O
+and handle close cannot be cancelled by this API, so this is NOT a hard wall-time
+or hung-filesystem guarantee. Limits are copied before awaiting. Handles are
+closed on success/failure; close errors prevent completion.
+
+Only immediate entries receive `lstat`; no child is opened or traversed, no blob
+is read/hashed. A kind is a point-in-time observation, not stable child identity.
+Unknown names are omitted from the result (storageKey=null), not normalized or
+deleted. Symlink/other/unknown/failed entries, duplicates, scan caps, elapsed
+deadlines, root changes and I/O errors leave enumeration incomplete with bounded,
+non-sensitive reason codes. A missing root is unobserved, never observed empty.
+Even `enumerationComplete` proves neither ownership nor absence of references,
+blob integrity, capacity or safe reclamation. `blobs=unobserved` and
+`crossStoreStability=unproven` always; it is not joined with the DB snapshot.
+There is no runtime caller, volume audit, recovery action or public activation.
+
+### Eventual combined report
 
 A report must identify the DB/schema, storage namespace/volume, release, observation
 start/end and limits. Never include bearer tokens, credentials or message bodies.
