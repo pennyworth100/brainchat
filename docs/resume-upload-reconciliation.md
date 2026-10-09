@@ -327,3 +327,32 @@ snapshot. Even two matches do not establish ownership, full logical identity,
 current authorization, durability or safe reclamation. Cross-store stability
 always stays unproven and full identity unobserved. No runtime integration,
 filesystem/DB access, repair, refund, deletion, replay or deployment is added.
+
+## Private total-budget content batch
+
+`observeUploadContentBatch` observes only a caller-supplied array of canonical
+keys. It does not enumerate a volume or join/select DB references. Before I/O it
+validates the full array (at most 1000 entries), copies keys and contract, and
+requires explicit namespace identity, trusted root-to-namespace binding and stable
+entire ancestry assertions. Those assertions are caller preconditions, not proof;
+the caller must independently bind original DB references to the same namespace.
+Original references and their source/scan completeness remain with the caller.
+
+The first conservative slice reserves the FULL per-key byte and read-operation
+allowance before each observation, with no refund for unused bytes, missing files,
+failed reads or cleanup failures. Reservation totals are NOT measured usage.
+The total caps are 64 MiB and 4096 reads; a zero-byte allowance permits empty-file
+observations but still reserves the positive per-key operation allowance. If the
+next complete reservation cannot fit, no I/O for that key is admitted. Oversized
+input arrays fail before copying/collection instead of silently truncating.
+
+Concurrency is one, including awaited cleanup, with one monotonic global deadline
+(at most 30 seconds). Every child I/O admission and result is fenced by that clock;
+invalid/regressing clocks latch failure. Pending kernel I/O/close may exceed the
+deadline and must settle before return. No cancellation or hard latency bound is
+claimed. Reads may update atime. All admitted observations, including partial or
+failed ones, retain their supplied index and namespace; duplicate keys are never
+deduplicated or selected as winners. `allKeysAttempted` only describes this input
+list, not successful content verification, volume/DB completeness or aggregate
+PASS. Non-admitted keys remain unobserved, not absent. Cross-store stability stays
+unproven. No runtime caller, repair, refund, deletion, replay or deployment added.
