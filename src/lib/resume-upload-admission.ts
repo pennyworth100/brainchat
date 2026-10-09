@@ -49,6 +49,10 @@ export class ResumeUploadAdmissions {
     return !lease.denied;
   }
 
+  byteLimit(grant: ResumeUploadGrant): number | null {
+    return this.isCurrent(grant) ? this.maxBytes : null;
+  }
+
   // Account each raw chunk BEFORE forwarding to a file writer. Never trust
   // Content-Length. This does not bound upstream buffering/multipart metadata.
   acceptChunk(grant: ResumeUploadGrant, byteLength: number): boolean {

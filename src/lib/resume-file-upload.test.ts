@@ -49,12 +49,12 @@ async function fixture(t: TestContext, mode = "ok") {
       return { rows: [], rowCount: mode === "denied" ? 0 : 1 };
     }, release() {} } as unknown as PoolClient;
   } }, admissions));
-  const storage = new ResumeFileStorage(root, admissions);
+  const storage = new ResumeFileStorage(root, admissions, { reserve: async input => ({ status: "reserved", attempt: Object.freeze({ ...input, storageKey: (await import("node:crypto")).randomBytes(32).toString("hex") }) }) });
   const upload = new ResumeFileUpload(storage, writer);
   return { root, grant, binding, admissions, bindings, storage, writer, upload,
     stats: () => ({ connects, inserts, commits }), time: (n: number) => { now = n; }, unblock, commitEntered };
 }
-const metadata = { name: "report.txt", mime: "text/plain" };
+const metadata = { name: "report.txt", mime: "text/plain", clientMessageId: "key" };
 async function* bytes() { yield Buffer.from("abc"); }
 
 function barrier() {

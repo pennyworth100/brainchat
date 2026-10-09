@@ -95,8 +95,9 @@ Still required (NOT implemented/proven by this seam):
   slot count times 100 MiB is not a disk quota. Reservation cannot be refunded on
   timeout alone or before settlement/reconciliation.
   The separate [durable reservation ledger](resume-upload-reservation.md) now
-  provides atomic byte accounting and attempt provenance, but is NOT connected
-  to this preflight, admission or storage. Actual headroom remains unproven.
+  provides atomic byte accounting and attempt provenance and is now required
+  by private storage, bound to its exact grant/key/ceiling. It is NOT connected
+  to this HTTP preflight. Actual headroom remains unproven.
 - Durable attempt provenance plus reconciliation across process crashes, COMMIT
   uncertainty and retries. Never delete by age or blindly unlink a retry/original
   path; require proof that every relevant receipt/attempt cannot reference it.

@@ -128,7 +128,15 @@ multipart/HTTP ownership, then fenced publication and durable reconciliation.
 No public handler imports this module. This is not full upload acceptance.
 
 The separate [private reservation ledger](resume-upload-reservation.md) persists
-an attempt key and byte ceiling atomically before callers may create files. It is
-not yet composed here: storage still chooses its own key. Connecting the SAME
-opaque reservation to the storage key/ceiling is a required next gate, not a
-completed end-to-end guarantee. No budget was provisioned and no path activated.
+an attempt key and byte ceiling atomically before callers may create files.
+Storage now requires this ledger, reserves once per exact opaque grant, rechecks
+the grant after the await, validates all returned identity fields, and uses the
+SAME durable storage key and server byte ceiling. It does not consume a source or
+open any path for pending/denied/unknown reservations. A charge remains after a
+late owner/deadline fence, without staging. No capacity refund or automatic retry.
+The composition's not-dispatched outcome refers to the FILE RECEIPT transaction,
+not proof that the earlier reservation transaction did not commit. Never reclaim
+that charge based on the file outcome. Ledger provenance is the recovery authority.
+The real PostgreSQL fixture verifies path-to-ledger identity, lost reservation ACK,
+post-COMMIT owner fence and quota denial; unit faults also check zero filesystem
+opens and source pulls. No live budget was provisioned and no path activated.

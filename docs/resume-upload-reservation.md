@@ -1,7 +1,8 @@
 # Private durable upload reservation (3.0.11 draft)
 
-`ResumeUploadReservations` is a DB-only prerequisite, NOT wired to storage, HTTP,
-parser, admission, publication or any public handler. No deployment is authorized
+`ResumeUploadReservations` is a private DB primitive, now composed by
+ResumeFileStorage with exact upload admission. NOT wired to HTTP, parser,
+publication or any public handler. No deployment is authorized
 by this slice. Migration 0008 creates two empty additive tables; an absent singleton
 budget denies reservations. Production/staging budgets are NOT provisioned.
 
@@ -20,10 +21,17 @@ retains its transaction/checkout: callers must not equate a deadline with rollba
 An acknowledged reservation is accounting, NOT an authentication/storage capability.
 Only trusted server code may call this primitive, after bearer preflight/admission.
 
-Before activation: bind the reservation to the exact opaque admission grant and
-make storage use this SAME key and ceiling before any filesystem/source effects;
-revalidate owner after asynchronous reservation; audit/provision actual volume
-headroom, metadata/inodes and legacy writers. One DB budget assumes one audited
+The private storage constructor now REQUIRES the ledger. Each exact grant may
+attempt storage once. Bounded metadata/logical key are captured synchronously,
+then the full server admission byte ceiling is reserved, never Content-Length.
+Only acknowledged reservation plus a post-await current-grant check allows the
+first filesystem open or source read. Session, room, logical key and byte ceiling
+must match; storage uses the SAME durable key and enforces that ceiling on actual
+chunks. Denied/unknown/thrown/pending outcomes cannot stage, retry or refund.
+An acknowledged charge followed by expiry/replacement is retained without files.
+
+Before activation: audit/provision actual volume headroom, metadata/inodes and
+legacy writers. One DB budget assumes one audited
 storage namespace. Raw request/envelope bytes require separate streaming limits.
 No freeing capacity until durable reconciliation proves all references and work
 settled. The monotonic ledger currently exhausts permanently by design.

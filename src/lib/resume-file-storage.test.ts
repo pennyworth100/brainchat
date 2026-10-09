@@ -10,7 +10,11 @@ import { ResumeBindings } from "./resume-bindings";
 import { ResumeUploadAdmissions } from "./resume-upload-admission";
 import { ResumeFileStorage, writeResumeChunk } from "./resume-file-storage";
 
-const metadata = { name: "report.txt", mime: "text/plain" };
+const metadata = { name: "report.txt", mime: "text/plain", clientMessageId: "key" };
+const reservations: Pick<import("./resume-upload-reservation").ResumeUploadReservations, "reserve"> = {
+  reserve: async input => ({ status: "reserved", attempt: Object.freeze({
+    ...input, storageKey: crypto.randomBytes(32).toString("hex") }) }),
+};
 async function fixture(t: TestContext, maxBytes = 10) {
   const root = await mkdtemp(join(tmpdir(), "dimle-file-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -21,7 +25,7 @@ async function fixture(t: TestContext, maxBytes = 10) {
     issuedAt: new Date(0), expiresAt: new Date(1000) }, "storage-transport-01", async () => {}, () => true))!;
   const admissions = new ResumeUploadAdmissions(bindings, undefined, maxBytes, 100, () => now);
   const grant = admissions.admit(binding)!;
-  const storage = new ResumeFileStorage(root, admissions);
+  const storage = new ResumeFileStorage(root, admissions, reservations);
   return { root, bindings, binding, admissions, grant, storage, time: (v: number) => { now = v; } };
 }
 async function* bytes(...chunks: string[]) { for (const c of chunks) yield Buffer.from(c); }
@@ -39,7 +43,7 @@ test("exclusive storage derives bytes/digest, restrictive modes and exact grant 
   assert.equal(f.storage.resolve(f.grant, result), result.file);
   assert.equal(f.storage.resolve({ ...f.grant }, result), null);
   assert.equal(f.storage.resolve(f.grant, { ...result }), null);
-  assert.equal(new ResumeFileStorage(f.root, f.admissions).resolve(f.grant, result), null);
+  assert.equal(new ResumeFileStorage(f.root, f.admissions, reservations).resolve(f.grant, result), null);
   await assert.rejects(f.storage.stage(f.grant, metadata, bytes("again")), /denied/);
   assert.equal(f.admissions.admit(f.binding), null); // storage never releases
   f.admissions.release(f.grant);
@@ -93,7 +97,7 @@ test("root symlink is rejected without writing through it", async t => {
   const f = await fixture(t), parent = await mkdtemp(join(tmpdir(), "dimle-link-test-"));
   t.after(() => rm(parent, { recursive: true, force: true }));
   const link = join(parent, "link"); await symlink(f.root, link);
-  await assert.rejects(new ResumeFileStorage(link, f.admissions).stage(f.grant, metadata, bytes("abc")));
+  await assert.rejects(new ResumeFileStorage(link, f.admissions, reservations).stage(f.grant, metadata, bytes("abc")));
   assert.deepEqual(await readdir(f.root), []);
 });
 
@@ -166,3 +170,77 @@ test("random path collision never overwrites an existing attachment", async t =>
   assert.equal((await readFile(join(f.root, result.file.storageKey, "blob"))).toString(), "original");
   assert.equal((await readdir(f.root)).length, 1);
 });
+
+for (const mode of ["denied", "unknown", "not-dispatched", "throws"] as const) {
+  test(`reservation ${mode} prevents all filesystem/source effects and retry`, async t => {
+    const f = await fixture(t); let reads = 0, opens = 0, calls = 0;
+    t.mock.method(fs, "open", async () => { opens++; throw Error("unexpected open"); });
+    t.mock.method(reservations, "reserve", async (input: Omit<import("./resume-upload-reservation").UploadAttempt, "storageKey">) => {
+      calls++;
+      if (mode === "throws") throw Error("reservation checkout failed");
+      return mode === "denied" ? { status: "denied" } :
+        { status: "failed", commit: mode, attempt: { ...input, storageKey: "a".repeat(64) } };
+    });
+    async function* input() { reads++; yield Buffer.from("abc"); }
+    await assert.rejects(f.storage.stage(f.grant, metadata, input()));
+    await assert.rejects(f.storage.stage(f.grant, metadata, input()), /denied/);
+    assert.equal(calls, 1); assert.equal(opens, 0); assert.equal(reads, 0);
+    assert.deepEqual(await readdir(f.root), []);
+    assert.equal(f.admissions.admit(f.binding), null);
+  });
+}
+
+for (const fence of ["deadline", "release", "successor"] as const) {
+  test(`pending reservation retains attempt; acknowledged charge then ${fence} denies before IO`, async t => {
+    const f = await fixture(t); let resume!: () => void, entered!: () => void;
+    const pending = new Promise<void>(r => { resume = r; });
+    const ready = new Promise<void>(r => { entered = r; });
+    let charged = 0, reads = 0, opens = 0, settled = false;
+    t.after(() => resume());
+    t.mock.method(fs, "open", async () => { opens++; throw Error("unexpected open"); });
+    t.mock.method(reservations, "reserve", async (input: Omit<import("./resume-upload-reservation").UploadAttempt, "storageKey">) => {
+      charged += input.reservedBytes; entered(); await pending;
+      return { status: "reserved", attempt: Object.freeze({ ...input, storageKey: "b".repeat(64) }) };
+    });
+    async function* input() { reads++; yield Buffer.from("abc"); }
+    const work = f.storage.stage(f.grant, metadata, input()).finally(() => { settled = true; });
+    await ready;
+    await assert.rejects(f.storage.stage(f.grant, metadata, input()), /denied/);
+    assert.equal(settled, false); assert.equal(reads, 0); assert.equal(opens, 0);
+    assert.equal(f.admissions.admit(f.binding), null);
+    if (fence === "deadline") f.time(100);
+    if (fence === "release") f.admissions.release(f.grant); // Defensive misuse fence, NOT supported finalization.
+    if (fence === "successor") await f.bindings.activate({ ...f.binding, generation: 2,
+      issuedAt: new Date(0), expiresAt: new Date(1000) },
+      "storage-successor-01", async () => {}, () => true);
+    resume();
+    await assert.rejects(work, /denied/);
+    assert.equal(charged, 10); assert.equal(reads, 0); assert.equal(opens, 0);
+    assert.deepEqual(await readdir(f.root), []);
+  });
+}
+
+test("durable attempt key, exact identity and byte ceiling govern stored bytes", async t => {
+  const f = await fixture(t, 4); let captured: unknown;
+  t.mock.method(reservations, "reserve", async (input: Omit<import("./resume-upload-reservation").UploadAttempt, "storageKey">) => {
+    captured = { ...input };
+    return { status: "reserved", attempt: Object.freeze({ ...input, storageKey: "c".repeat(64) }) };
+  });
+  const file = await f.storage.stage(f.grant, metadata, bytes("ab", "cd"));
+  assert.deepEqual(captured, { sessionId: f.binding.sessionId, roomId: f.binding.roomId,
+    clientMessageId: "key", reservedBytes: 4 });
+  assert.equal(file.file.storageKey, "c".repeat(64));
+  assert.equal((await readFile(join(f.root, "c".repeat(64), "blob"))).toString(), "abcd");
+});
+
+for (const change of [{ sessionId: "other" }, { roomId: "other123" },
+    { clientMessageId: "other" }, { reservedBytes: 9 }, { storageKey: "../escape" }]) {
+  test(`reservation identity mismatch ${Object.keys(change)[0]} denies before IO`, async t => {
+    const f = await fixture(t); let reads = 0;
+    t.mock.method(reservations, "reserve", async (input: Omit<import("./resume-upload-reservation").UploadAttempt, "storageKey">) =>
+      ({ status: "reserved", attempt: { ...input, storageKey: "d".repeat(64), ...change } }));
+    async function* input() { reads++; yield Buffer.from("abc"); }
+    await assert.rejects(f.storage.stage(f.grant, metadata, input()), /identity/);
+    assert.equal(reads, 0); assert.deepEqual(await readdir(f.root), []);
+  });
+}

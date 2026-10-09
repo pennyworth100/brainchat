@@ -26,7 +26,7 @@ export class ResumeFileUpload {
         clientMessageId.length > 128 || /[^A-Za-z0-9_-]/.test(clientMessageId)) {
       return { completed: false, commit: "not-dispatched", error: Error("Invalid resume file identity") };
     }
-    const captured = { name: metadata.name, mime: metadata.mime };
+    const captured = { name: metadata.name, mime: metadata.mime, clientMessageId };
     // Install the single-attempt promise BEFORE starting asynchronous work.
     const attempt = Promise.resolve().then(async (): Promise<OperationOutcome<ResumeFileWrite>> => {
       let file;

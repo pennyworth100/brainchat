@@ -15,6 +15,7 @@ import { ResumeImageWriter } from "../src/lib/resume-image";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeFileStorage } from "../src/lib/resume-file-storage";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
+import { ResumeUploadReservations } from "../src/lib/resume-upload-reservation";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 import { createServer } from "node:http";
 import { Server, type Socket as ServerSocket } from "socket.io";
@@ -47,6 +48,8 @@ try {
   await a.query(sql);
   await a.query(await readFile("drizzle/0005_free_blazing_skull.sql", "utf8"));
   await a.query(await readFile("drizzle/0007_motionless_wolfpack.sql", "utf8"));
+  await a.query(await readFile("drizzle/0008_dark_grim_reaper.sql", "utf8"));
+  await a.query("INSERT INTO resume_upload_budget VALUES (1, 10000000000, 0)");
   await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
     .replaceAll('"public".', '"' + schema + '".'));
   await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
@@ -896,7 +899,7 @@ try {
   // Only this fixture's isolated temporary root is removed by its finalizer.
   const byteRoot = await mkdtemp(join(tmpdir(), "dimle-pg-file-"));
   try {
-    const byteStorage = new ResumeFileStorage(byteRoot, uploads);
+    const byteStorage = new ResumeFileStorage(byteRoot, uploads, new ResumeUploadReservations(operationPool));
     const byteUpload = new ResumeFileUpload(byteStorage, files);
     const metadata = { name: "actual.txt", mime: "text/plain" };
     async function* byteSource() { yield Buffer.from("actual bytes"); }
@@ -906,6 +909,9 @@ try {
     assert.ok(firstBytes.completed && firstBytes.result.authorized);
     const original = firstBytes.result.value.message;
     check((await readFile(join(byteRoot, original.url.split("/")[2], "blob"))).toString() === "actual bytes");
+    const provenance = (await a.query("SELECT * FROM resume_upload_attempts WHERE storage_key=$1", [original.url.split("/")[2]])).rows[0];
+    check(provenance.session_id === fixture.binding.sessionId && provenance.room_id === fixture.binding.roomId);
+    check(provenance.client_message_id === "actual-key" && Number(provenance.reserved_bytes) >= 12);
     const baseline = await countFiles();
     const sameAttempt = await byteUpload.saveWithOutcome(fixture.grant, "different-key", metadata, byteSource());
     check(sameAttempt.completed && !sameAttempt.result.authorized);
@@ -974,6 +980,38 @@ try {
     check(revoked.completed && !revoked.result.authorized);
     check(uploads.release(revokedGrant));
     check((await readdir(byteRoot)).length === 9 && await countFiles() === baseline);
+    // Real reservation COMMIT followed by lost ACK / local owner fence, and
+    // real budget denial: none may open/create a path or pull a source byte.
+    for (const mode of ["lost-ack", "fenced", "denied"]) {
+      const f = await makeUpload();
+      const before = Number((await a.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes);
+      if (mode === "denied") await a.query("UPDATE resume_upload_budget SET capacity_bytes = reserved_bytes");
+      const realLedger = new ResumeUploadReservations({ connect: async () => {
+        const real = await operationPool.connect();
+        return { query: async (sql: string, values?: unknown[]) => {
+          const result = await real.query(sql, values);
+          if (sql === "COMMIT" && mode === "lost-ack") throw Error("controlled reservation ACK loss");
+          if (sql === "COMMIT" && mode === "fenced") {
+            await uploadBindings.activate({ ...f.binding, generation: f.binding.generation + 1,
+              issuedAt: new Date(0), expiresAt: new Date(f.binding.expiresAt) },
+              "reservation-successor-" + f.binding.sessionId, async () => {}, () => true);
+          }
+          return result;
+        }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+      } });
+      let reads = 0;
+      async function* untouched() { reads++; yield Buffer.from("unused"); }
+      const reservedStorage = new ResumeFileStorage(byteRoot, uploads, realLedger);
+      await assert.rejects(reservedStorage.stage(f.grant, { ...metadata, clientMessageId: "reserved-" + mode }, untouched()));
+      check(reads === 0 && (await readdir(byteRoot)).length === 9);
+      const after = Number((await a.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes);
+      const rows = (await a.query("SELECT * FROM resume_upload_attempts WHERE session_id=$1 AND client_message_id=$2",
+        [f.binding.sessionId, "reserved-" + mode])).rows;
+      check(mode === "denied" ? after === before && rows.length === 0 :
+        rows.length === 1 && after - before === Number(rows[0].reserved_bytes));
+      check(uploads.release(f.grant));
+      if (mode === "denied") await a.query("UPDATE resume_upload_budget SET capacity_bytes = 10000000000");
+    }
   } finally { await rm(byteRoot, { recursive: true, force: true }); }
   // Real loopback owners + actual bearer lookup. No public route/parser wiring.
   const beforePreflight = checks;
