@@ -59,3 +59,34 @@ for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-du
   });
 }
 
+
+test("pending upload COMMIT stays unsettled and retains capacity past deadline", async () => {
+  const bindings = new ResumeBindings();
+  const binding = await bindings.activate({ sessionId: "pending", roomId: "upload123", username: "Guest",
+    authVersion: 1, generation: 1, issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+  }, "transport_upload_pending", async () => {}, () => true);
+  assert.ok(binding);
+  let now = 0;
+  const admissions = new ResumeUploadAdmissions(bindings, undefined, 10, 100, () => now);
+  const grant = admissions.admit(binding)!;
+  let finish!: () => void, entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const commit = new Promise<void>(resolve => { finish = resolve; });
+  const client = { query: async (sql: string) => {
+    if (sql === "COMMIT") { entered(); await commit; }
+    return { rowCount: 1 };
+  }, release: () => {} } as unknown as PoolClient;
+  let settled = false;
+  const pending = new ResumeUploadOperationGate({ connect: async () => client }, admissions)
+    .runWithOutcome(grant, async () => "receipt").then(value => { settled = true; return value; });
+  await started;
+  now = 100;
+  assert.equal(admissions.isCurrent(grant), false);
+  assert.equal(admissions.admit(binding), null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  finish();
+  assert.deepEqual(await pending, { completed: true, result: { authorized: true, value: "receipt" } });
+  assert.equal(admissions.admit(binding), null);
+  assert.equal(admissions.release(grant), true);
+});

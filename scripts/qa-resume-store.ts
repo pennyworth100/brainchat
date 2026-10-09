@@ -742,7 +742,7 @@ try {
     return { grant, binding, credential, identity };
   };
   for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-work",
-    "local-successor", "durable-successor", "revoke", "expiry", "policy", "work-fails", "lost-ack"]) {
+    "local-successor", "pending-successor", "durable-successor", "revoke", "expiry", "policy", "work-fails", "lost-ack"]) {
     const fixture = await makeUpload();
     const { grant, binding } = fixture;
     if (mode === "released") uploads.release(grant);
@@ -750,6 +750,8 @@ try {
     uploadBindings.detach(binding);
     let writes = 0;
     let commits = 0;
+    let finishSuccessor: (() => void) | undefined;
+    let successor: Promise<unknown> | undefined;
     const selectedGate = mode === "lost-ack" ? new ResumeUploadOperationGate({ connect: async () => {
       const real = await operationPool.connect();
       return { query: async (...args: unknown[]) => {
@@ -779,6 +781,11 @@ try {
       writes++;
       await insertResumeTextMessage(tx, binding, "upload-" + mode);
       if (mode === "deadline-work") uploadClock += 100;
+      if (mode === "pending-successor") {
+        const preparation = new Promise<void>(resolve => { finishSuccessor = resolve; });
+        successor = uploadBindings.activate({ ...fixture.identity, generation: 2 },
+          "pending_" + binding.sessionId, () => preparation, () => true);
+      }
       if (mode === "local-successor") {
         await assert.rejects(uploadBindings.activate({ ...fixture.identity, generation: 2 },
           "successor_" + binding.sessionId, async () => { throw Error("prepare failure"); }, () => true));
@@ -788,6 +795,7 @@ try {
     });
     if (contention) { await waitForBlockedSecond(uploadPid); await a.query("COMMIT"); }
     const result = await pending;
+    if (finishSuccessor) { finishSuccessor(); await successor; }
     const rows = (await a.query("SELECT id FROM messages WHERE room_id = 'upload123' AND content = $1", ["upload-" + mode])).rowCount;
     if (mode === "disconnect") {
       check(result.completed && result.result.authorized);
