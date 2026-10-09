@@ -37,7 +37,7 @@ export class ResumeMemberships {
     return Object.freeze({ users: Object.freeze(users), count: users.length });
   }
 
-  private current(binding: ResumeBinding, roomId: string): boolean {
+  isCurrent(binding: ResumeBinding, roomId: string): boolean {
     const slot = this.sessions.get(binding.sessionId);
     return binding.roomId === roomId && slot?.lease.binding === binding && slot.lease.isCurrent();
   }
@@ -68,11 +68,11 @@ export class ResumeMemberships {
   // Sender-originated fanout, never an arbitrary session-ID exclusion. Invalid
   // or copied senders fail closed. Reentrant sender loss stops remaining sends.
   broadcastExcept(sender: ResumeBinding, roomId: string, event: ResumeOutboundEvent, payload: unknown): number {
-    if (!this.current(sender, roomId)) return 0;
+    if (!this.isCurrent(sender, roomId)) return 0;
     const candidates = [...this.sessions.values()].map(slot => slot.lease.binding);
     let sent = 0;
     for (const binding of candidates) {
-      if (!this.current(sender, roomId)) break;
+      if (!this.isCurrent(sender, roomId)) break;
       if (binding !== sender && this.send(binding, roomId, event, payload)) sent++;
     }
     return sent;

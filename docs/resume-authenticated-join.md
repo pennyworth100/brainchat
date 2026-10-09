@@ -24,6 +24,9 @@ no guessed rollback/revocation or replay. Owner close fences issuance immediatel
 but does not wait for the INSERT to settle. Admission cleanup retains its existing
 awaitable semantics. The callable issue closure is trusted server code.
 
-No room join/history/presence or public auth handler changed. Next: migrate normal
-join and resumed connections to a single authoritative projection, then all
-protected outbound/send/DM handlers, before enabling the feature.
+Optional publishJoin now composes a guarded, one-shot history/presence sequence
+inside this same promise and deadline; see [join publication](resume-join-publication.md).
+Without this option no history/presence is emitted. Public auth handlers are still
+unchanged. Next: migrate normal join and resumed connections to a single
+authoritative projection, then all protected outbound/send/DM handlers, before
+enabling the feature.

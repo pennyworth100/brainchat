@@ -20,6 +20,8 @@ type Options = {
   issueCapacity?: ResumeCapacity;
   // Opt-in private composition. Shared with this exact bindings registry.
   memberships?: Pick<ResumeMemberships, "install">;
+  // Private, trusted one-shot publication; part of the same join deadline/flight.
+  publishJoin?: (binding: ResumeBinding, live: () => boolean) => Promise<boolean>;
 };
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
@@ -157,6 +159,9 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
       const binding = await admitInternal({ credential, expectedGeneration: 0, operationId: randomUUID() });
       if (!live() || !binding || !bindings.isCurrent(binding)) return null;
       joined = binding;
+      if (options.publishJoin && !await options.publishJoin(binding,
+        () => live() && bindings.isCurrent(binding))) return null;
+      if (!live() || !bindings.isCurrent(binding)) return null;
       return Object.freeze({ credential, binding });
     });
     const timeout = new Promise<null>(resolve => {

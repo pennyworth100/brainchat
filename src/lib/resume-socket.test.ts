@@ -7,9 +7,104 @@ import { attachResumeSocket } from "./resume-socket";
 import { ResumeBindings } from "./resume-bindings";
 import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
+import { resumeJoinPublication } from "./resume-join-publication";
 import type { ResumeIdentity } from "./resume-store";
 
 const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
+
+async function publicationFixture(t: TestContext,
+  read: (binding: import("./resume-bindings").ResumeBinding) => Promise<readonly unknown[] | null>,
+  extra: { timeoutMs?: number; issueCapacity?: ResumeCapacity } = {}) {
+  const f = await fixture(t), transport = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings);
+  const events: [string, unknown][] = [];
+  transport.socket.onAnyOutgoing((event, payload) => { events.push([event, payload]); });
+  const owner = attachResumeSocket(transport.socket, { ...opts, ...extra, memberships: members,
+    issue: async () => issuedJoin(), publishJoin: resumeJoinPublication(members, read) });
+  t.after(() => owner.close());
+  return { ...f, ...transport, opts, members, events, owner };
+}
+
+test("join publication retries share one read, history and presence sequence", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>(); let reads = 0;
+  const f = await publicationFixture(t, async () => { reads++; entered.resolve(); return gate.promise; });
+  const peer = await f.connect(), peerEvents: [string, unknown][] = [];
+  const peerOwner = attachResumeSocket(peer.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "peer" }) } });
+  const req = request(); req.credential.sessionId = "peer";
+  assert.ok(await peerOwner.admit(req)); t.after(() => peerOwner.close());
+  peer.socket.onAnyOutgoing((event, payload) => { peerEvents.push([event, payload]); });
+  const flight = f.owner.join(authenticatedJoin); await entered.promise;
+  assert.equal(f.owner.join(authenticatedJoin), flight); assert.deepEqual(f.events, []);
+  assert.equal(await f.owner.join({ ...authenticatedJoin, username: "Other" }), null);
+  gate.resolve([{ id: 1 }]); assert.ok(await flight);
+  assert.equal(f.owner.join(authenticatedJoin), flight); assert.equal(reads, 1);
+  assert.deepEqual(f.events, [["chat-history", [{ id: 1 }]], ["user-list", ["Alice", "Alice"]], ["user-count", 2]]);
+  assert.deepEqual(peerEvents, [["system-message", "Alice joined"], ["user-list", ["Alice", "Alice"]], ["user-count", 2]]);
+});
+
+test("late join history cannot reach replaced owner or redirect to successor", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>();
+  const f = await publicationFixture(t, async () => { entered.resolve(); return gate.promise; });
+  const flight = f.owner.join(authenticatedJoin); await entered.promise;
+  const transport = await f.connect(), successorEvents: string[] = [];
+  transport.socket.onAnyOutgoing(event => { successorEvents.push(event); });
+  const next = attachResumeSocket(transport.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => identity(2) } });
+  assert.ok(await next.admit(request(1))); t.after(() => next.close());
+  gate.resolve([{ id: 2 }]); assert.equal(await flight, null);
+  assert.deepEqual(f.events, []); assert.deepEqual(successorEvents, []);
+  assert.equal(f.members.presence("candy986").count, 1);
+});
+
+test("explicit close during history read fences publication and exact retries", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>();
+  const f = await publicationFixture(t, async () => { entered.resolve(); return gate.promise; });
+  const flight = f.owner.join(authenticatedJoin); await entered.promise;
+  await f.owner.close(); gate.resolve([]); assert.equal(await flight, null);
+  assert.equal(await f.owner.join(authenticatedJoin), null); assert.deepEqual(f.events, []);
+});
+
+test("join history deadline retains issuance capacity until late read settles", async t => {
+  const gate = deferred<readonly unknown[]>(), entered = deferred<void>(), capacity = new ResumeCapacity(1);
+  const f = await publicationFixture(t, async () => { entered.resolve(); return gate.promise; },
+    { timeoutMs: 20, issueCapacity: capacity });
+  const flight = f.owner.join(authenticatedJoin); await entered.promise;
+  assert.equal(await flight, null); assert.equal(capacity.acquire(), null);
+  gate.resolve([]); await new Promise<void>(resolve => setImmediate(resolve));
+  const release = capacity.acquire(); assert.ok(release); release();
+  assert.deepEqual(f.events, []); assert.equal(f.socket.connected, false);
+});
+
+test("denied or rejected history fails closed without publication or replay", async t => {
+  for (const reject of [false, true]) {
+    let reads = 0;
+    const f = await publicationFixture(t, async () => { reads++; if (reject) throw Error("history unavailable"); return null; });
+    const flight = f.owner.join(authenticatedJoin);
+    if (reject) await assert.rejects(flight, /history unavailable/);
+    else assert.equal(await flight, null);
+    assert.equal(await f.owner.join(authenticatedJoin), null);
+    assert.equal(reads, 1); assert.deepEqual(f.events, []); assert.equal(f.socket.connected, false);
+  }
+});
+
+test("reentrant close at history handoff suppresses notices and later presence", async t => {
+  const f = await publicationFixture(t, async () => []);
+  f.socket.onAnyOutgoing(event => { if (event === "chat-history") void f.owner.close(); });
+  assert.equal(await f.owner.join(authenticatedJoin), null);
+  assert.deepEqual(f.events, [["chat-history", []]]);
+  assert.equal(await f.owner.join(authenticatedJoin), null);
+});
+
+test("partial publication exception is terminal and cannot replay history", async t => {
+  const f = await publicationFixture(t, async () => []);
+  f.socket.onAnyOutgoing(event => { if (event === "user-list") throw Error("handoff failed"); });
+  await assert.rejects(f.owner.join(authenticatedJoin), /handoff failed/);
+  assert.equal(await f.owner.join(authenticatedJoin), null);
+  assert.deepEqual(f.events.map(([event]) => event), ["chat-history", "user-list"]);
+  assert.equal(f.members.presence("candy986").count, 0);
+});
+
 
 async function presenceFixture(t: TestContext) {
   const f = await fixture(t); let now = 0;
