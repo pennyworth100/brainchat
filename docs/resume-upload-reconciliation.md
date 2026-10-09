@@ -39,6 +39,19 @@ to report, not paths to normalize or remove. No filesystem writes from the colle
 
 ## Classification (facts may overlap)
 
+The private reference collector now reports `metadataStatus` separately from
+canonical URL extraction and scan completeness. `metadataComplete` means every
+applicable observed body matches the file writer's bounded canonical metadata
+and exact serialization; it is false on partial scans. `declaredSize` and
+`declaredSha256` are claims from valid metadata, NOT filesystem measurements.
+Name/MIME are validated but not returned; raw content is never returned.
+Invalid metadata, extra/duplicate JSON fields, or oversized provenance never
+erase a bounded positive URL. Bodies above 4096 UTF-8 bytes are suppressed by SQL
+before driver transfer; truncated/unread bodies supply no URL evidence.
+Metadata validity does not imply room/session/logical identity agreement,
+ownership, integrity, or safe deletion. Cross-reference identity classification
+and filesystem observation remain unimplemented.
+
 | Observation | Classification / consequence |
 | --- | --- |
 | One exact message path, matching attempt identity, validated metadata and actual size/digest within its ceiling | Referenced blob observed consistent; not proof of publication, backup or reclaimability |
@@ -115,7 +128,8 @@ collections. `inventoryUploadLedger` retains its ledger-only behavior.
 
 SQL bounds provenance columns and suppresses message content over **4096 bytes**
 before driver transfer or JSON parsing. Reference reports contain only bounded
-identifiers, status and canonical storage key, never raw bodies. They retain
+identifiers, status, canonical storage key and validated declared size/digest,
+never raw bodies. They retain
 tombstones and every duplicate reference; receipt/session cascades cannot hide
 independently scanned file messages. `references.complete` means the DB reference
 scan finished; `parseComplete` separately means all observed file references were
@@ -131,8 +145,12 @@ a concurrent commit between ledger and reference queries excluded from the pinne
 snapshot, malformed metadata, multibyte oversize, pagination caps and a genuine
 reference-table lock deadline. No runtime route or activation was added.
 
-Next implementation slice: validate bounded metadata and cross-reference identities
-without collapsing positive references, then filesystem fault injection for permissions,
+Bounded metadata is now classified independently as described above. Real driver
+instrumentation verifies an exact 4096-byte body is transferred and a 4097-byte
+body is NULL before parsing. Invalid-but-positive references remain in the report.
+
+Next implementation slice: classify cross-reference identities without collapsing
+positive references, then filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.

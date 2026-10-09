@@ -2,6 +2,89 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { PoolClient } from "pg";
 import { inventoryUploadDatabase } from "./resume-ledger-inventory";
+import { collectUploadReferences, type ReferenceInventory } from "./resume-reference-inventory";
+import type { QueryResult } from "pg";
+
+const key = "a".repeat(64);
+const validMetadata = { url: `/uploads/${key}/blob`, name: "safe.txt", size: 3,
+  mime: "text/plain", sha256: "b".repeat(64) };
+async function observe(content: string | null, extra = {}) {
+  const report: ReferenceInventory = { receipts: [], messages: [], complete: false,
+    parseComplete: false, metadataComplete: false, reasons: [] };
+  let fetched = false;
+  await collectUploadReferences(async text => ({ rows:
+    text.startsWith("FETCH") && text.includes("reference_messages") && !fetched
+      ? (fetched = true, [{ message_id: 1, room_id: "files123", type: "file", content, ...extra }]) : [],
+  } as QueryResult), { pageSize: 10, maxRows: 10 }, report);
+  return report;
+}
+
+test("canonical metadata is declared evidence only, with no raw name or body in report", async () => {
+  const report = await observe(JSON.stringify(validMetadata));
+  assert.equal(report.complete, true); assert.equal(report.parseComplete, true);
+  assert.equal(report.metadataComplete, true);
+  assert.equal(report.messages[0].metadataStatus, "valid");
+  assert.equal(report.messages[0].declaredSize, 3);
+  assert.equal(report.messages[0].declaredSha256, validMetadata.sha256);
+  assert.ok(!JSON.stringify(report).includes("safe.txt"));
+});
+
+for (const [field, value] of Object.entries({ name: "../PRIVATE", size: -1, mime: "Text/Plain", sha256: "B".repeat(64) })) {
+  test(`invalid ${field} retains positive canonical URL reference`, async () => {
+    const report = await observe(JSON.stringify({ ...validMetadata, [field]: value }));
+    assert.equal(report.messages[0].storageKey, key);
+    assert.equal(report.messages[0].status, "reference");
+    assert.equal(report.messages[0].metadataStatus, "invalid");
+    assert.equal(report.messages[0].declaredSize, undefined);
+    assert.equal(report.parseComplete, true); assert.equal(report.metadataComplete, false);
+    assert.ok(!JSON.stringify(report).includes("PRIVATE"));
+  });
+}
+
+test("extra fields, duplicate keys and alternate serialization are not canonical metadata", async () => {
+  for (const content of [JSON.stringify({ ...validMetadata, extra: "PRIVATE" }),
+    JSON.stringify(validMetadata).replace('"size":3', '"size":2,"size":3'),
+    JSON.stringify(validMetadata, null, 1), JSON.stringify({ url: validMetadata.url })]) {
+    const report = await observe(content);
+    assert.equal(report.messages[0].storageKey, key);
+    assert.equal(report.messages[0].metadataStatus, "invalid");
+    assert.equal(report.metadataComplete, false);
+  }
+});
+
+test("URL must match the entire canonical path, including its end boundary", async () => {
+  for (const url of [validMetadata.url + "\n", validMetadata.url + "?x=1",
+    "https://example.com" + validMetadata.url, validMetadata.url.replace("blob", "../blob")]) {
+    const report = await observe(JSON.stringify({ ...validMetadata, url }));
+    assert.equal(report.messages[0].storageKey, null);
+    assert.equal(report.messages[0].metadataStatus, "invalid");
+    assert.equal(report.parseComplete, false);
+  }
+});
+
+test("oversized provenance never discards a bounded positive reference", async () => {
+  for (const extra of [{ oversized: true }, { receipt_oversized: true }]) {
+    const report = await observe(JSON.stringify(validMetadata), extra);
+    assert.equal(report.messages[0].storageKey, key);
+    assert.equal(report.messages[0].status, "oversized");
+    assert.equal(report.messages[0].metadataStatus, "valid");
+    assert.equal(report.parseComplete, false);
+  }
+});
+
+test("oversized body is never parsed even if SQL cap is violated; exact byte boundary is parsed", async () => {
+  const base = JSON.stringify(validMetadata);
+  const boundary = base + " ".repeat(4096 - Buffer.byteLength(base));
+  const exact = await observe(boundary);
+  assert.equal(exact.messages[0].storageKey, key);
+  assert.equal(exact.messages[0].metadataStatus, "invalid"); // noncanonical whitespace
+  for (const content of [boundary + " ", JSON.stringify({ ...validMetadata, secret: "界".repeat(2000) }), null]) {
+    const report = await observe(content, { oversized: true });
+    assert.equal(report.messages[0].storageKey, null);
+    assert.equal(report.messages[0].metadataStatus, "unobserved");
+    assert.equal(report.metadataComplete, false);
+  }
+});
 
 for (const failure of ["receipt-limit", "message-query"] as const) {
   test(`reference ${failure} cannot claim complete DB observation or leak driver details`, async () => {

@@ -178,6 +178,7 @@ async function main() {
     check(initialDb.scope === "database-only" && initialDb.unobserved.join() === "filesystem");
     check(initialDb.references?.receipts[0].storageKey === committed.storage_key);
     check(initialDb.references?.messages[0].messageId === committed.message_id);
+    check(initialDb.references?.metadataComplete && initialDb.references.messages[0].metadataStatus === "valid");
     check(baseline.attempts.length === 2 && baseline.receipts.length === 1 && baseline.messages.length === 1);
     const missingPath = join(root, committed.storage_key, "blob");
     await rm(missingPath); // Deliberate corruption of this harness-owned fixture.
@@ -263,6 +264,40 @@ async function main() {
     check(!referenceCap.complete && !referenceCap.references?.complete && !referenceCap.references?.parseComplete);
     check(referenceCap.reasons.includes("row-limit:messages") && referenceCap.references?.messages.length === 2);
     await pool.query("DELETE FROM messages WHERE id=ANY($1::int[])", [invalidIds]);
+    // Exercise actual driver payloads at the UTF-8 byte cap, not just the
+    // returned report. A positive URL survives invalid metadata/provenance.
+    const baseContent = baseline.messages[0].content;
+    const exactContent = baseContent + " ".repeat(4096 - Buffer.byteLength(baseContent));
+    const boundaryIds: number[] = [];
+    for (const content of [exactContent, exactContent + " ",
+      JSON.stringify({ ...JSON.parse(baseContent), size: -1 })]) {
+      boundaryIds.push((await pool.query(`INSERT INTO messages (room_id,username,type,content)
+        VALUES ('files123','Boundary','file',$1) RETURNING id`, [content])).rows[0].id);
+    }
+    const boundedClient = await pool.connect(), boundedQuery = boundedClient.query.bind(boundedClient);
+    let exactTransferred = false, oversizedSuppressed = false;
+    boundedClient.query = (async (config: { text: string }) => {
+      const result = await boundedQuery(config);
+      if (config.text.startsWith("FETCH") && config.text.includes("reference_messages")) {
+        for (const row of result.rows) {
+          if (row.message_id === boundaryIds[0]) exactTransferred = Buffer.byteLength(row.content) === 4096;
+          if (row.message_id === boundaryIds[1]) oversizedSuppressed = row.content === null && row.oversized;
+        }
+      }
+      return result;
+    }) as typeof boundedClient.query;
+    const bounded = await inventoryUploadDatabase(boundedClient, { pageSize: 1, maxRows: 10, timeoutMs: 2000 });
+    check(exactTransferred && oversizedSuppressed);
+    check(bounded.complete && !bounded.references?.metadataComplete && !bounded.references?.parseComplete);
+    check(bounded.references?.messages.find(m => m.messageId === boundaryIds[0])?.storageKey === committed.storage_key);
+    check(bounded.references?.messages.find(m => m.messageId === boundaryIds[1])?.metadataStatus === "unobserved");
+    const invalidPositive = bounded.references?.messages.find(m => m.messageId === boundaryIds[2]);
+    check(invalidPositive?.storageKey === committed.storage_key && invalidPositive?.metadataStatus === "invalid");
+    check(!JSON.stringify(bounded).includes("Boundary") && !JSON.stringify(bounded).includes("safe.txt"));
+    await pool.query("DELETE FROM messages WHERE id=ANY($1::int[])", [boundaryIds]);
+    evidence.push({ case: "bounded-metadata-classification", checks: 7,
+      cases: "valid-declarations,4096-byte-driver-boundary,4097-byte-SQL-suppression,invalid-positive-reference",
+      filesystemIntegrity: "unobserved", identityAgreement: "unproven" });
     const messageLocker = await pool.connect();
     try {
       await messageLocker.query("BEGIN");

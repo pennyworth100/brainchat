@@ -45,7 +45,7 @@ async function inventoryDatabase(client: PoolClient,
   if (references) {
     report.scope = "database-only";
     report.unobserved = ["filesystem"];
-    report.references = { receipts: [], messages: [], complete: false, parseComplete: false, reasons: [] };
+    report.references = { receipts: [], messages: [], complete: false, parseComplete: false, metadataComplete: false, reasons: [] };
   }
   const start = performance.now();
   let sum = BigInt(0), phase = "begin", invalid = false;
