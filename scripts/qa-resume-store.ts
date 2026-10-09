@@ -6,6 +6,7 @@ import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeAdmission } from "../src/lib/resume-admission";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
+import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
 import { claimRoomPolicy } from "../src/lib/room-policy";
 
@@ -436,6 +437,46 @@ try {
     check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [[retrySession.sessionId, peer.sessionId]])).rows[0].count) === 0);
     check(await retryCount() === 4); // session cleanup does not delete room history
   } finally { await parallelPool.end(); }
+  // History uses the same dedicated transaction gate, never the global DB.
+  await a.query("INSERT INTO rooms (id) VALUES ('history123'), ('foreign123')");
+  await a.query(`INSERT INTO messages (room_id, username, content)
+    SELECT 'history123', 'History', n::text FROM generate_series(1, 105) n`);
+  await a.query("INSERT INTO messages (room_id, username, content) VALUES ('foreign123', 'Foreign', 'must not leak')");
+  const historySession = await first.issueAfterAuthenticatedJoin("history123", "History", 1);
+  assert.ok(historySession);
+  const historyCredential = { roomId: historySession.roomId, sessionId: historySession.sessionId, token: historySession.token };
+  const historyIdentity = await first.advanceGeneration(historyCredential, 0, opA, socketA);
+  assert.ok(historyIdentity);
+  const historyBindings = new ResumeBindings();
+  const historyBinding = await historyBindings.activate(historyIdentity, socketA, async () => {}, () => true);
+  assert.ok(historyBinding);
+  const reader = new ResumeHistoryReader(new ResumeOperationGate(operationPool, historyBindings));
+  const historyRows = await reader.read(historyBinding) as { id: number; message: string; username: string }[] | null;
+  check(historyRows?.length === 100);
+  check(historyRows?.[0].message === "6" && historyRows.at(-1)?.message === "105");
+  check(historyRows?.every((row, i) => row.username === "History" && (!i || row.id > historyRows[i - 1].id)));
+  check(!JSON.stringify(historyRows).includes(historySession.token));
+  check(await reader.read({ ...historyBinding, roomId: "foreign123" }) === null);
+  // A remote generation change is denied even before local ownership catches up.
+  const nextHistory = await first.advanceGeneration(historyCredential, 1, opB, socketB);
+  assert.ok(nextHistory);
+  check(await reader.read(historyBinding) === null);
+  const nextHistoryBinding = await historyBindings.activate(nextHistory, socketB, async () => {}, () => true);
+  assert.ok(nextHistoryBinding);
+  check((await reader.read(nextHistoryBinding))?.length === 100);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [historySession.sessionId]);
+  check(await reader.read(nextHistoryBinding) === null);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = NULL, expires_at = clock_timestamp() WHERE id = $1", [historySession.sessionId]);
+  check(await reader.read(nextHistoryBinding) === null);
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '1 hour' WHERE id = $1", [historySession.sessionId]);
+  // Policy wins under a real lock wait; no history escapes the new version.
+  const historyPid = (await operationPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'history123'");
+  const blockedHistory = reader.read(nextHistoryBinding);
+  await waitForBlockedSecond(historyPid);
+  await a.query("COMMIT");
+  check(await blockedHistory === null);
   // Cleanup is opt-in and uses database time; fixtures never touch a live room.
   while (await first.cleanupExpired(100)) { /* remove earlier expired fixtures */ }
   await a.query("INSERT INTO rooms (id) VALUES ('clean123')");
