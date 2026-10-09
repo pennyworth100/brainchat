@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import { inventoryUploadDatabase } from "./resume-ledger-inventory";
 import { collectUploadReferences, type ReferenceInventory } from "./resume-reference-inventory";
@@ -8,6 +9,32 @@ import type { QueryResult } from "pg";
 const key = "a".repeat(64);
 const validMetadata = { url: `/uploads/${key}/blob`, name: "safe.txt", size: 3,
   mime: "text/plain", sha256: "b".repeat(64) };
+
+test("receipt identity keeps independent unknowns, conflicts and private bounded inputs", async () => {
+  const payload = createHash("sha256").update(JSON.stringify(["files123", "PRIVATE", "file",
+    validMetadata.name, validMetadata.size, validMetadata.mime, validMetadata.sha256])).digest("hex");
+  for (const [extra, expected] of [
+    [{}, "match"], [{ payload_hash: "0".repeat(64) }, "conflict"],
+    [{ payload_hash: "invalid" }, "unobserved"], [{ message_username: null }, "unobserved"],
+    [{ message_username: "x".repeat(129) }, "unobserved"], [{ oversized: true }, "unobserved"],
+    [{ content: JSON.stringify({ ...validMetadata, size: -1 }) }, "unobserved"],
+  ] as const) {
+    const report: ReferenceInventory = { receipts: [], messages: [], complete: false,
+      parseComplete: false, metadataComplete: false, reasons: [] };
+    let fetched = false;
+    await collectUploadReferences(async text => ({ rows:
+      text.startsWith("FETCH") && text.includes("reference_receipts") && !fetched
+        ? (fetched = true, [{ message_id: 1, room_id: "files123", type: "file",
+          session_id: "session", client_message_id: "retry", content: JSON.stringify(validMetadata),
+          session_room_match: false, session_username_match: null, message_username: "PRIVATE",
+          payload_hash: payload, ...extra }]) : [],
+    } as QueryResult), { pageSize: 10, maxRows: 10 }, report);
+    assert.deepEqual(report.receipts[0].identityEvidence,
+      { sessionRoom: "conflict", sessionUsername: "unobserved", payloadHash: expected });
+    assert.equal(report.receipts[0].storageKey, key);
+    assert.ok(!JSON.stringify(report).includes("PRIVATE"));
+  }
+});
 async function observe(content: string | null, extra = {}) {
   const report: ReferenceInventory = { receipts: [], messages: [], complete: false,
     parseComplete: false, metadataComplete: false, reasons: [] };

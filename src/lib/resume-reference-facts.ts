@@ -12,7 +12,8 @@ export type ReferenceFacts = {
 
 // PRIVATE, linear in the already row-bounded inventory. Counts are observations,
 // never proof of absence. No winner, ownership, agreement or reclaimability flag.
-// Username, session state and payload-hash identity are NOT observed here.
+// Receipt-local evidence lives in refs; session authorization/state and full
+// cross-reference identity are NOT established by this aggregate.
 export function classifyReferenceFacts(attempts: LedgerAttempt[], refs: ReferenceInventory): ReferenceFacts {
   const groups = new Map<string, ReferenceFacts["keys"][number]>();
   const attemptsByKey = new Map<string, LedgerAttempt[]>();

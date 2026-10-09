@@ -61,8 +61,9 @@ Conflict counters count per-source observations: one mismatching message seen
 independently through both scans contributes two room-conflict observations,
 not two distinct messages. Multiple receipts/messages are flagged separately.
 
-`fullIdentity` is always `unobserved`: session state/room, message username,
-receipt payload hash and full logical agreement are not validated. Zero detected
+`fullIdentity` is always `unobserved`: session authorization/state and full logical
+agreement are not established. Receipt-local room/username/hash comparisons are
+reported separately below, not promoted to an aggregate identity verdict. Zero detected
 conflicts are NOT an agreement verdict. Counts/conflicts on partial scans remain
 positive evidence only; original references and completeness flags are retained.
 This linear, row-bounded classification uses only the same DB snapshot; it adds
@@ -165,8 +166,19 @@ Bounded metadata is now classified independently as described above. Real driver
 instrumentation verifies an exact 4096-byte body is transferred and a 4097-byte
 body is NULL before parsing. Invalid-but-positive references remain in the report.
 
-Next implementation slice: bounded session/username/payload-hash evidence for
-full cross-reference identity (currently unobserved), then filesystem fault injection for permissions,
+Receipt observations now include independent session-room, session-username and
+canonical file payload-hash comparisons (`match`, `conflict`, `unobserved`).
+The existing receipt cursor LEFT JOINs the session in the same pinned snapshot;
+SQL bounds comparison inputs and only the hash calculation sees the bounded
+message username. No username, session token/hash or raw body leaves the collector.
+Missing/oversized inputs and noncanonical metadata leave the relevant comparison
+unobserved. A tombstone has no message identity to compare. Comparisons are local
+to each receipt, never a winner among duplicate references. Even all matches
+prove neither current session authorization nor ownership, filesystem integrity,
+uniqueness or full identity; `fullIdentity` remains `unobserved`.
+
+Next implementation slice: session state/attempt cross-reference evidence before
+any full identity verdict, then filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.

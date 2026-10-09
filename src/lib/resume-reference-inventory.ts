@@ -1,6 +1,8 @@
 import type { QueryResult } from "pg";
+import { createHash } from "node:crypto";
 import { canonicalResumeFile } from "./resume-file";
 
+type Comparison = "match" | "conflict" | "unobserved";
 export type ReferenceObservation = {
   messageId: number | null; roomId: string | null;
   sessionId?: string; clientMessageId?: string;
@@ -9,6 +11,8 @@ export type ReferenceObservation = {
   metadataStatus: "valid" | "invalid" | "unobserved" | "not-applicable";
   // Declared values, NOT measured filesystem integrity.
   declaredSize?: number; declaredSha256?: string;
+  // Receipt-local observations, NOT authorization, ownership or full identity.
+  identityEvidence?: { sessionRoom: Comparison; sessionUsername: Comparison; payloadHash: Comparison };
 };
 export type ReferenceInventory = {
   receipts: ReferenceObservation[]; messages: ReferenceObservation[];
@@ -30,7 +34,12 @@ export async function collectUploadReferences(query: Query,
     const sql = source === "receipts"
       ? `SELECT left(r.session_id,128) AS session_id, left(r.client_message_id,128) AS client_message_id,
           (length(r.session_id)>128 OR length(r.client_message_id)>128) AS receipt_oversized,
+          CASE WHEN length(s.room_id)<=128 AND length(m.room_id)<=128 THEN s.room_id=m.room_id END AS session_room_match,
+          CASE WHEN length(s.username)<=128 AND length(m.username)<=128 THEN s.username=m.username END AS session_username_match,
+          CASE WHEN length(m.username)<=128 THEN m.username END AS message_username,
+          CASE WHEN length(r.payload_hash)=64 THEN r.payload_hash END AS payload_hash,
           ${projection} FROM resume_message_receipts r LEFT JOIN messages m ON m.id=r.message_id
+          LEFT JOIN room_resume_sessions s ON s.id=r.session_id
           ORDER BY r.session_id,r.client_message_id`
       : `SELECT ${projection} FROM messages m WHERE m.type='file' ORDER BY m.id`;
     await query(`DECLARE reference_${source} NO SCROLL CURSOR FOR ${sql}`);
@@ -46,6 +55,11 @@ export async function collectUploadReferences(query: Query,
           metadataStatus: "unobserved",
           ...(source === "receipts" ? { sessionId: row.session_id, clientMessageId: row.client_message_id } : {}),
         };
+        if (source === "receipts") {
+          const comparison = (value: unknown): Comparison => value === true ? "match" : value === false ? "conflict" : "unobserved";
+          observation.identityEvidence = { sessionRoom: comparison(row.session_room_match),
+            sessionUsername: comparison(row.session_username_match), payloadHash: "unobserved" };
+        }
         if (row.oversized || row.receipt_oversized) observation.status = "oversized";
         else if (row.message_id === null) { observation.status = "tombstone"; observation.metadataStatus = "not-applicable"; }
         else if (row.type !== "file") { observation.status = "non-file"; observation.metadataStatus = "not-applicable"; }
@@ -68,6 +82,14 @@ export async function collectUploadReferences(query: Query,
               if (row.content === canonical) {
                 observation.metadataStatus = "valid";
                 observation.declaredSize = file.size; observation.declaredSha256 = file.sha256;
+                if (observation.identityEvidence && !row.oversized &&
+                    typeof row.room_id === "string" && row.room_id.length <= 128 &&
+                    typeof row.message_username === "string" && row.message_username.length <= 128 &&
+                    typeof row.payload_hash === "string" && /^[a-f0-9]{64}$/.test(row.payload_hash)) {
+                  const hash = createHash("sha256").update(JSON.stringify([row.room_id,
+                    row.message_username, "file", file.name, file.size, file.mime, file.sha256])).digest("hex");
+                  observation.identityEvidence.payloadHash = hash === row.payload_hash ? "match" : "conflict";
+                }
               }
             } else observation.metadataStatus = "invalid";
           } catch { /* malformed content is explicit, never echoed */ }

@@ -183,6 +183,43 @@ async function main() {
     check(initialFacts?.messages === 1 && initialFacts.receipts === 1 && initialFacts.attempts === 1);
     check(initialFacts?.roomConflicts === 0 && initialFacts.receiptIdentityConflicts === 0);
     check(initialDb.referenceFacts?.fullIdentity === "unobserved");
+    const identity = (db: typeof initialDb) => db.references?.receipts[0].identityEvidence;
+    check(JSON.stringify(identity(initialDb)) === JSON.stringify({ sessionRoom: "match", sessionUsername: "match", payloadHash: "match" }));
+    const originalHash = (await pool.query("SELECT payload_hash FROM resume_message_receipts WHERE session_id=$1", [committed.session_id])).rows[0].payload_hash;
+    await pool.query("INSERT INTO rooms (id) VALUES ('other123')");
+    await pool.query("UPDATE room_resume_sessions SET room_id='other123', username='PRIVATE identity' WHERE id=$1", [committed.session_id]);
+    const sessionConflict = await databaseInventory();
+    check(identity(sessionConflict)?.sessionRoom === "conflict" && identity(sessionConflict)?.sessionUsername === "conflict");
+    check(identity(sessionConflict)?.payloadHash === "match"); // independent message hash, not session authority
+    check(!JSON.stringify(sessionConflict).includes("PRIVATE identity"));
+    await pool.query("UPDATE room_resume_sessions SET room_id='files123', username='Uploader' WHERE id=$1", [committed.session_id]);
+    await pool.query("UPDATE messages SET username='PRIVATE message' WHERE id=$1", [committed.message_id]);
+    const messageConflict = await databaseInventory();
+    check(identity(messageConflict)?.sessionUsername === "conflict" && identity(messageConflict)?.payloadHash === "conflict");
+    check(!JSON.stringify(messageConflict).includes("PRIVATE message"));
+    await pool.query("UPDATE messages SET username='Uploader' WHERE id=$1", [committed.message_id]);
+    await pool.query("UPDATE resume_message_receipts SET payload_hash=$2 WHERE session_id=$1", [committed.session_id, "0".repeat(64)]);
+    check(identity(await databaseInventory())?.payloadHash === "conflict");
+    await pool.query("UPDATE resume_message_receipts SET payload_hash='invalid' WHERE session_id=$1", [committed.session_id]);
+    check(identity(await databaseInventory())?.payloadHash === "unobserved");
+    await pool.query("UPDATE resume_message_receipts SET payload_hash=$2 WHERE session_id=$1", [committed.session_id, originalHash]);
+    await pool.query("UPDATE room_resume_sessions SET username=$2 WHERE id=$1", [committed.session_id, "界".repeat(129)]);
+    const oversizedIdentity = await databaseInventory();
+    check(identity(oversizedIdentity)?.sessionUsername === "unobserved" && identity(oversizedIdentity)?.payloadHash === "match");
+    check(!JSON.stringify(oversizedIdentity).includes("界"));
+    await pool.query("UPDATE room_resume_sessions SET username='Uploader' WHERE id=$1", [committed.session_id]);
+    const identityClient = await pool.connect(), identityQuery = identityClient.query.bind(identityClient);
+    identityClient.query = (async (config: { text: string }) => {
+      if (config.text.startsWith("DECLARE reference_receipts"))
+        await pool.query("UPDATE room_resume_sessions SET username='Concurrent' WHERE id=$1", [committed.session_id]);
+      return identityQuery(config);
+    }) as typeof identityClient.query;
+    check(identity(await inventoryUploadDatabase(identityClient, { pageSize: 1, maxRows: 10, timeoutMs: 2000 }))?.sessionUsername === "match");
+    check(identity(await databaseInventory())?.sessionUsername === "conflict");
+    await pool.query("UPDATE room_resume_sessions SET username='Uploader' WHERE id=$1", [committed.session_id]);
+    evidence.push({ case: "bounded-receipt-identity", checks: 12,
+      cases: "canonical-match,session-conflicts,message-conflicts,hash-conflict,invalid-hash,oversized-session,no-name-leak,pinned-session-snapshot",
+      fullIdentity: "unobserved", authorization: "unproven" });
     // Same canonical URL, conflicting durable provenance: observe, never repair.
     await pool.query("UPDATE resume_upload_attempts SET room_id='other123', client_message_id='other' WHERE storage_key=$1", [committed.storage_key]);
     const conflictDb = await databaseInventory();
@@ -228,6 +265,7 @@ async function main() {
     const tombstone = await snapshot();
     const tombstoneDb = await databaseInventory();
     check(tombstoneDb.references?.receipts[0].status === "tombstone" && tombstoneDb.references.receipts[0].messageId === null);
+    check(Object.values(identity(tombstoneDb)!).every(value => value === "unobserved"));
     check(tombstoneDb.references?.messages.length === 0 && tombstoneDb.references.complete);
     check(tombstoneDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key)?.receipts === 0);
     check(tombstone.receipts.length === 1 && tombstone.receipts[0].message_id === null &&
