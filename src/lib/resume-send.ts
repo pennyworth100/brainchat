@@ -6,21 +6,26 @@ import { ownsResumeSocket, type ResumeSocketOwner } from "./resume-socket";
 import { isValidRoomId } from "./room-id";
 import { ResumeCapacity } from "./resume-capacity";
 import { consumeResumeTextAttempt } from "./resume-text-rate";
+import { consumeResumeImageAttempt } from "./resume-image-rate";
+import { MAX_RESUME_IMAGE_DATA_URL_LENGTH, type ResumeImageMessage, type ResumeImageWriter } from "./resume-image";
+import type { OperationResult } from "./resume-operation";
 
 // One unresolved write per physical socket, shared by all callers. Capacity is
 // process-local, not a distributed rate limit or proof of DB cancellation.
 const writing = new WeakSet<Socket>();
 const capacity = new ResumeCapacity(100);
 
-export type ResumeSendReply = Readonly<{ clientMessageId: string; message: Readonly<ResumeTextMessage> }>;
-export type ResumeSendResult = { committed: false } | {
+type SendMessage = ResumeTextMessage | ResumeImageMessage;
+export type ResumeSendReply<M extends SendMessage = ResumeTextMessage> = Readonly<{ clientMessageId: string; message: Readonly<M> }>;
+export type ResumeSendResult<M extends SendMessage = ResumeTextMessage> = { committed: false } | {
   committed: null; reason: "deadline"; clientMessageId: string;
 } | {
-  committed: true; inserted: boolean; receipt: ResumeSendReply;
+  committed: true; inserted: boolean; receipt: ResumeSendReply<M>;
   ack: "skipped" | "handed-off" | "failed";
   fanout: "skipped" | "attempted" | "failed";
   errors: { stage: "ack" | "fanout"; error: unknown }[];
 };
+type SendLimits = { capacity?: ResumeCapacity; timeoutMs?: number; onLateError?: (error: unknown) => void };
 
 // PRIVATE composition only; server owns every authority argument and the
 // request-local synchronous ACK callback. Public registration remains OFF.
@@ -32,11 +37,38 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
   writer: Pick<ResumeMessageWriter, "saveOnceWithOutcome">,
   payload: { roomId?: unknown; clientMessageId?: unknown; message?: unknown } | null,
   ack: (reply: ResumeSendReply) => void,
-  limits: { capacity?: ResumeCapacity; timeoutMs?: number; onLateError?: (error: unknown) => void } = {}): Promise<ResumeSendResult> {
-  const roomId = payload?.roomId, clientMessageId = payload?.clientMessageId, content = payload?.message;
+  limits: SendLimits = {}): Promise<ResumeSendResult> {
+  const content = payload?.message;
+  if (typeof content !== "string" || !content.trim() || content.length > 10_000) return { committed: false };
+  return sendResume(socket, owner, binding, members, writer, payload, content, "chat-message",
+    () => consumeResumeTextAttempt(binding.sessionId), ack, limits);
+}
+
+// Same physical-socket exclusion, process capacity, deadline and publication
+// fences as text. Quota admission precedes canonical validation/DB dispatch.
+export async function sendResumeImage(socket: Socket, owner: ResumeSocketOwner,
+  binding: ResumeBinding, members: ResumeMemberships,
+  writer: Pick<ResumeImageWriter, "saveOnceWithOutcome">,
+  payload: { roomId?: unknown; clientMessageId?: unknown; dataUrl?: unknown } | null,
+  ack: (reply: ResumeSendReply<ResumeImageMessage>) => void,
+  limits: SendLimits = {}): Promise<ResumeSendResult<ResumeImageMessage>> {
+  const content = payload?.dataUrl;
+  if (typeof content !== "string" || content.length < 1 ||
+      content.length > MAX_RESUME_IMAGE_DATA_URL_LENGTH) return { committed: false };
+  return sendResume(socket, owner, binding, members, writer, payload, content, "chat-image",
+    () => consumeResumeImageAttempt(binding.sessionId, content), ack, limits);
+}
+
+async function sendResume<M extends SendMessage>(socket: Socket, owner: ResumeSocketOwner,
+  binding: ResumeBinding, members: ResumeMemberships,
+  writer: { saveOnceWithOutcome(binding: ResumeBinding, key: string, content: string):
+    Promise<OperationResult<{ message: M; inserted: boolean }>> },
+  payload: { roomId?: unknown; clientMessageId?: unknown } | null, content: string,
+  event: "chat-message" | "chat-image", consume: () => boolean,
+  ack: (reply: ResumeSendReply<M>) => void, limits: SendLimits): Promise<ResumeSendResult<M>> {
+  const roomId = payload?.roomId, clientMessageId = payload?.clientMessageId;
   if (typeof ack !== "function" || typeof roomId !== "string" || !isValidRoomId(roomId) ||
-      typeof clientMessageId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(clientMessageId) ||
-      typeof content !== "string" || !content.trim() || content.length > 10_000) return { committed: false };
+      typeof clientMessageId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(clientMessageId)) return { committed: false };
   const current = () => socket.connected && ownsResumeSocket(socket, owner) &&
     binding.transportId === owner.incarnation && members.isCurrent(binding, roomId);
   if (!current()) return { committed: false };
@@ -49,7 +81,7 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
   if (!release) return { committed: false };
   // Authenticated local identity, never payload fields. Denials, retries and
   // uncertain COMMITs consume attempts; there is deliberately no refund/reset.
-  if (!consumeResumeTextAttempt(binding.sessionId)) {
+  if (!consume()) {
     release();
     return { committed: false };
   }
@@ -59,11 +91,11 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
   let expired = false;
   const overdue = () => expired || performance.now() >= deadline;
   let timer!: ReturnType<typeof setTimeout>;
-  const stopped = new Promise<ResumeSendResult>(resolve => {
+  const stopped = new Promise<ResumeSendResult<M>>(resolve => {
     timer = setTimeout(() => { expired = true; resolve(uncertain); }, timeoutMs);
   });
   const report = limits.onLateError ?? ((error: unknown) => { console.error("Resume send late error", error); });
-  const work = (async (): Promise<ResumeSendResult> => {
+  const work = (async (): Promise<ResumeSendResult<M>> => {
     // Immutable scalar snapshot. Client username/session/generation never confer authority.
     const write = await writer.saveOnceWithOutcome(binding, clientMessageId, content);
     // A timeout is NOT rollback/denial. The write may still commit; no late
@@ -71,7 +103,7 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
     if (overdue()) return uncertain;
     if (!write.authorized) return { committed: false };
     const receipt = Object.freeze({ clientMessageId, message: Object.freeze({ ...write.value.message }) });
-    const result: Extract<ResumeSendResult, { committed: true }> = {
+    const result: Extract<ResumeSendResult<M>, { committed: true }> = {
       committed: true, inserted: write.value.inserted, receipt, ack: "skipped", fanout: "skipped", errors: [],
     };
     if (!current()) return result;
@@ -81,7 +113,7 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
     // individually rechecked by broadcastExcept. Existing receipt NEVER fans out.
     if (write.value.inserted && !overdue() && current()) {
       try {
-        members.broadcastExcept(binding, roomId, "chat-message", receipt.message);
+        members.broadcastExcept(binding, roomId, event, receipt.message);
         result.fanout = "attempted";
       } catch (error) {
         // Some recipients may already have received a packet; do not replay.

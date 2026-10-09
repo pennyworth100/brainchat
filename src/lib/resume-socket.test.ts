@@ -10,9 +10,154 @@ import { ResumeCapacity } from "./resume-capacity";
 import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
 import type { ResumeIdentity } from "./resume-store";
 import { syncResumeSocket } from "./resume-sync";
-import { sendResumeText } from "./resume-send";
+import { sendResumeText, sendResumeImage } from "./resume-send";
+import { canonicalResumeImage, MAX_RESUME_IMAGE_DATA_URL_LENGTH, type ResumeImageWrite } from "./resume-image";
 import type { ResumeTextWrite } from "./resume-message";
 import type { OperationResult } from "./resume-operation";
+
+const imagePayload = () => ({ roomId: "candy986", clientMessageId: "image_1", dataUrl: "data:image/png;base64,AA==" });
+const savedImage = (inserted = true): OperationResult<ResumeImageWrite> => ({ authorized: true,
+  value: { inserted, message: { id: 72, type: "image", username: "Alice", dataUrl: imagePayload().dataUrl, ts: 123 } } });
+let imageSession = 0;
+const imageFixture = (t: TestContext) => syncFixture(t, `image-send-${++imageSession}`);
+
+test("image and text share socket exclusion in both directions and aggregate capacity", async t => {
+  for (const firstType of ["image", "text"]) {
+    const f = await imageFixture(t), other = await imageFixture(t), gate = deferred<void>();
+    const cap = new ResumeCapacity(1); let writes = 0;
+    const image = (x = f, capacity = cap) => sendResumeImage(x.socket, x.owner, x.binding, x.members,
+      { saveOnceWithOutcome: async () => { writes++; await gate.promise; return savedImage(); } },
+      imagePayload(), () => {}, { capacity });
+    const text = (x = f, capacity = cap) => sendResumeText(x.socket, x.owner, x.binding, x.members,
+      { saveOnceWithOutcome: async () => { writes++; await gate.promise; return savedText(); } },
+      textPayload(), () => {}, { capacity });
+    const first = firstType === "image" ? image : text, second = firstType === "image" ? text : image;
+    const pending = first();
+    assert.deepEqual(await second(f, new ResumeCapacity(1)), { committed: false });
+    assert.deepEqual(await second(other), { committed: false }); assert.equal(writes, 1);
+    gate.resolve(); assert.ok((await pending).committed);
+    assert.ok((await second(other)).committed); assert.equal(writes, 2);
+  }
+});
+
+test("image adapter rejects primitive/identity/owner violations before writer dispatch", async t => {
+  const f = await imageFixture(t), other = await f.connect(); let writes = 0;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return savedImage(); } };
+  const ack = () => assert.fail("unauthorized ACK");
+  for (const payload of [null, { ...imagePayload(), roomId: "other123" },
+    { ...imagePayload(), clientMessageId: "bad key" }, { ...imagePayload(), dataUrl: 3 },
+    { ...imagePayload(), dataUrl: "" }, { ...imagePayload(), dataUrl: "x".repeat(MAX_RESUME_IMAGE_DATA_URL_LENGTH + 1) }]) {
+    assert.deepEqual(await sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, payload, ack), { committed: false });
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.deepEqual(await sendResumeImage(socket, owner, binding, f.members, writer, imagePayload(), ack), { committed: false });
+  }
+  assert.equal(writes, 0);
+});
+
+test("image immutable snapshot and authoritative receipt; exact-key retry is ACK-only", async t => {
+  const f = await imageFixture(t), gate = deferred<void>(), seen: unknown[] = [];
+  const payload = { ...imagePayload(), username: "spoof", sessionId: "spoof" };
+  let writes = 0;
+  const fanout = t.mock.method(f.members, "broadcastExcept", () => 0);
+  const writer = { saveOnceWithOutcome: async (...args: unknown[]) => {
+    seen.push(args); await gate.promise; return savedImage(++writes === 1);
+  } };
+  const ack = (reply: unknown) => { assert.ok(Object.isFrozen(reply)); };
+  const pending = sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, payload, ack);
+  payload.dataUrl = "mutated"; payload.clientMessageId = "changed"; payload.roomId = "other123";
+  gate.resolve(); const first = await pending;
+  const retry = await sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, imagePayload(), ack);
+  assert.ok(first.committed && retry.committed);
+  assert.deepEqual(seen[0], [f.binding, "image_1", imagePayload().dataUrl]);
+  assert.ok(Object.isFrozen(first.receipt.message));
+  assert.equal(first.receipt.message.username, "Alice"); assert.equal(retry.fanout, "skipped");
+  assert.equal(fanout.mock.callCount(), 1); assert.equal(fanout.mock.calls[0].arguments[2], "chat-image");
+});
+
+test("image deadline retains original ID and shared leases until late commit or error settles", async t => {
+  for (const reject of [false, true]) {
+    const f = await imageFixture(t), gate = deferred<void>(), cap = new ResumeCapacity(1), errors: unknown[] = [];
+    t.mock.method(f.members, "broadcastExcept", () => assert.fail("late fanout"));
+    const pending = sendResumeImage(f.socket, f.owner, f.binding, f.members,
+      { saveOnceWithOutcome: async () => { await gate.promise; if (reject) throw Error("uncertain"); return savedImage(); } },
+      imagePayload(), () => assert.fail("late ACK"), { capacity: cap, timeoutMs: 10, onLateError: e => { errors.push(e); } });
+    assert.deepEqual(await pending, { committed: null, reason: "deadline", clientMessageId: "image_1" });
+    assert.equal(cap.acquire(), null);
+    assert.deepEqual(await sendResumeText(f.socket, f.owner, f.binding, f.members,
+      { saveOnceWithOutcome: async () => assert.fail("overlap") }, textPayload(), () => {}), { committed: false });
+    await f.owner.close(); assert.equal(cap.acquire(), null);
+    gate.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(errors.length, reject ? 1 : 0);
+    const release = cap.acquire(); assert.ok(release); release();
+  }
+});
+
+test("image owner loss after commit fences ACK and publication", async t => {
+  for (const kind of ["close", "disconnect", "expiry"]) {
+    const f = await imageFixture(t), gate = deferred<void>();
+    t.mock.method(f.members, "broadcastExcept", () => assert.fail("stale fanout"));
+    const pending = sendResumeImage(f.socket, f.owner, f.binding, f.members,
+      { saveOnceWithOutcome: async () => { await gate.promise; return savedImage(); } },
+      imagePayload(), () => assert.fail("stale ACK"));
+    if (kind === "close") await f.owner.close();
+    if (kind === "disconnect") f.socket.disconnect(true);
+    if (kind === "expiry") f.expire();
+    gate.resolve(); const result = await pending;
+    assert.ok(result.committed); assert.equal(result.ack, "skipped"); assert.equal(result.fanout, "skipped");
+  }
+});
+
+test("image quota precedes validation, survives retry and reconnect, and ignores spoofed session", async t => {
+  const f = await imageFixture(t); let writes = 0;
+  const writer = { saveOnceWithOutcome: async (_binding: unknown, _key: string, content: string) => {
+    writes++; canonicalResumeImage(content); return savedImage(false);
+  } };
+  const malformed = { ...imagePayload(), dataUrl: "invalid", sessionId: "forged" };
+  for (let i = 0; i < 12; i++) {
+    await assert.rejects(sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, malformed, () => {}), /Invalid resume image/);
+  }
+  const cap = new ResumeCapacity(1);
+  assert.deepEqual(await sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, imagePayload(), () => {}, { capacity: cap }), { committed: false });
+  const release = cap.acquire(); assert.ok(release); release();
+  await f.owner.close();
+  const next = await f.connect(), owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => ({ ...identity(2), sessionId: f.binding.sessionId }) } });
+  t.after(() => owner.close()); const req = request(1); req.credential.sessionId = f.binding.sessionId;
+  const binding = await owner.admit(req); assert.ok(binding);
+  assert.deepEqual(await sendResumeImage(next.socket, owner, binding, f.members, { ...writer }, imagePayload(), () => {}), { committed: false });
+  assert.equal(writes, 12);
+});
+
+test("image adapter counts UTF8 bytes before writer even for malformed bounded Unicode", async t => {
+  const f = await imageFixture(t); let writes = 0;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return { authorized: false } as const; } };
+  const payload = { ...imagePayload(), dataUrl: "€".repeat(8 * 1024 * 1024) };
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual(await sendResumeImage(f.socket, f.owner, f.binding, f.members, writer, payload, () => {}), { committed: false });
+  }
+  assert.equal(writes, 2); // 2 * 24 MiB = exact 48 MiB budget; third denied before dispatch
+});
+
+test("image partial fanout/ACK failures stay committed and cannot replay on retry", async t => {
+  const f = await imageFixture(t); let delivered = 0, writes = 0;
+  for (const sessionId of ["image-peer-a", "image-peer-b"]) {
+    const peer = await f.connect(), owner = attachResumeSocket(peer.socket, { ...f.opts, memberships: f.members,
+      store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } });
+    t.after(() => owner.close()); const req = request(); req.credential.sessionId = sessionId;
+    assert.ok(await owner.admit(req));
+    t.mock.method(peer.socket, "emit", (event: string) => {
+      assert.equal(event, "chat-image"); if (sessionId === "image-peer-b") throw Error("partial"); delivered++; return true;
+    });
+  }
+  const run = () => sendResumeImage(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedImage(++writes === 1) }, imagePayload(), () => { throw Error("ACK"); });
+  const first = await run(); assert.ok(first.committed);
+  assert.equal(first.ack, "failed"); assert.equal(first.fanout, "failed");
+  assert.deepEqual(first.errors.map(e => e.stage), ["ack", "fanout"]); assert.equal(delivered, 1);
+  const retry = await run(); assert.ok(retry.committed); assert.equal(retry.fanout, "skipped"); assert.equal(delivered, 1);
+});
 
 const savedText = (inserted = true): OperationResult<ResumeTextWrite> => ({ authorized: true,
   value: { inserted, message: { id: 71, type: "message", username: "Alice", message: "hello", ts: 123 } } });
@@ -304,14 +449,16 @@ test("text adapter partial real recipient handoff failure remains committed; ret
   const retry = await run(); assert.ok(retry.committed); assert.equal(retry.fanout, "skipped"); assert.equal(delivered, 1);
 });
 
-async function syncFixture(t: TestContext) {
+async function syncFixture(t: TestContext, sessionId?: string) {
   const f = await fixture(t), transport = await f.connect(), opts = options();
   let now = 0;
   opts.bindings = new ResumeBindings(10, () => now);
   const members = new ResumeMemberships(opts.bindings);
-  const owner = attachResumeSocket(transport.socket, { ...opts, memberships: members });
+  const owner = attachResumeSocket(transport.socket, { ...opts, memberships: members,
+    ...(sessionId ? { store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } } : {}) });
   t.after(() => owner.close());
-  const binding = await owner.admit(request()); assert.ok(binding);
+  const req = request(); if (sessionId) req.credential.sessionId = sessionId;
+  const binding = await owner.admit(req); assert.ok(binding);
   return { ...f, ...transport, opts, members, owner, binding, expire: () => { now = binding.expiresAt; } };
 }
 
