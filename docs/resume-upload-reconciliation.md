@@ -191,8 +191,17 @@ facts neither authorize a new write nor establish original authorization,
 current-at-completion validity, attempt/session agreement, ownership or full identity.
 The existing independent `identityEvidence` and `fullIdentity` semantics are unchanged.
 
-Next implementation slice: attempt/session cross-reference evidence before
-any full identity verdict, then filesystem fault injection for permissions,
+DB-mode attempts now carry their own `identityEvidence.sessionRoom` comparison
+(`match`, `conflict`, `unobserved`), using a bounded LEFT JOIN in the same pinned
+snapshot. Missing/deleted sessions and oversized attempt/session identifiers or
+rooms leave it unobserved; positive ledger provenance and accounting remain
+independent. Session room is not projected. This is NOT receipt-local identity,
+authorization, original ownership or a full identity verdict. Ledger-only mode
+does not join sessions or gain this field. Real PostgreSQL regressions cover both
+directions of room mismatch, oversized provenance, deletion, and a concurrent
+commit observed only by a fresh inventory. No runtime caller or schema changes.
+
+Next implementation slice: filesystem fault injection for permissions,
 symlinks, unstable files and concurrent writers. Any later repair requires its
 own reviewed protocol, durable all-writer barrier, paired DB/blob recovery proof
 and separately authorized execution. Production remains behind Max's release gate.

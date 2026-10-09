@@ -7,6 +7,8 @@ import { classifyReferenceFacts, type ReferenceFacts } from "./resume-reference-
 export type LedgerAttempt = {
   storage_key: string; session_id: string; room_id: string;
   client_message_id: string; reserved_bytes: string; created_at: string; oversized: boolean;
+  // Attempt-local snapshot comparison, not receipt agreement or authorization.
+  identityEvidence?: { sessionRoom: "match" | "conflict" | "unobserved" };
 };
 export type LedgerInventory = {
   scope: "ledger-only" | "database-only"; complete: boolean; reasons: string[];
@@ -90,14 +92,21 @@ async function inventoryDatabase(client: PoolClient,
     // SQL-side text bounds prevent malformed legacy text columns from making
     // a row arbitrarily large. Oversized provenance is explicitly invalid.
     await query(`DECLARE ledger_inventory NO SCROLL CURSOR FOR
-      SELECT storage_key, left(session_id,128) AS session_id, left(room_id,128) AS room_id,
-        client_message_id, reserved_bytes::text, created_at::text,
-        (length(session_id)>128 OR length(room_id)>128) AS oversized
-      FROM resume_upload_attempts ORDER BY storage_key`);
+      SELECT a.storage_key, left(a.session_id,128) AS session_id, left(a.room_id,128) AS room_id,
+        a.client_message_id, a.reserved_bytes::text, a.created_at::text,
+        (length(a.session_id)>128 OR length(a.room_id)>128) AS oversized
+        ${references ? `, CASE WHEN length(a.session_id)<=128 AND length(a.room_id)<=128
+          AND length(s.id)<=128 AND length(s.room_id)<=128
+          THEN a.room_id=s.room_id END AS session_room_match` : ""}
+      FROM resume_upload_attempts a
+      ${references ? "LEFT JOIN room_resume_sessions s ON s.id=a.session_id" : ""}
+      ORDER BY a.storage_key`);
     while (true) {
       const count = Math.min(limits.pageSize, limits.maxRows - report.attempts.length + 1);
-      const rows = (await query(`FETCH FORWARD ${count} FROM ledger_inventory`)).rows as LedgerAttempt[];
-      for (const row of rows) {
+      const rows = (await query(`FETCH FORWARD ${count} FROM ledger_inventory`)).rows as (LedgerAttempt & { session_room_match?: boolean | null })[];
+      for (const raw of rows) {
+        const { session_room_match: sessionRoom, ...row } = raw;
+        if (references) row.identityEvidence = { sessionRoom: sessionRoom === true ? "match" : sessionRoom === false ? "conflict" : "unobserved" };
         if (report.attempts.length === limits.maxRows) {
           report.reasons.push("row-limit"); return report;
         }

@@ -174,6 +174,31 @@ async function main() {
     const databaseInventory = (maxRows = 10) => pool.connect().then(client => inventoryUploadDatabase(client,
       { pageSize: 1, maxRows, timeoutMs: 2000 }));
     const initialDb = await databaseInventory();
+    const attemptRoom = (db: typeof initialDb) => db.attempts.find(a => a.storage_key === committed.storage_key)?.identityEvidence?.sessionRoom;
+    check(attemptRoom(initialDb) === "match");
+    await pool.query("UPDATE resume_upload_attempts SET session_id=$2 WHERE storage_key=$1", [committed.storage_key, "0".repeat(129)]);
+    const oversizedAttempt = await databaseInventory();
+    check(attemptRoom(oversizedAttempt) === "unobserved" && oversizedAttempt.attempts.some(a => a.oversized));
+    await pool.query("UPDATE resume_upload_attempts SET session_id=$2, room_id=$3 WHERE storage_key=$1", [committed.storage_key, committed.session_id, "x".repeat(129)]);
+    check(attemptRoom(await databaseInventory()) === "unobserved");
+    await pool.query("UPDATE resume_upload_attempts SET room_id=$2 WHERE storage_key=$1", [committed.storage_key, committed.room_id]);
+    const longRoom = "r".repeat(129);
+    await pool.query("INSERT INTO rooms (id) VALUES ($1)", [longRoom]);
+    await pool.query("UPDATE room_resume_sessions SET room_id=$2 WHERE id=$1", [committed.session_id, longRoom]);
+    const oversizedSessionRoom = await databaseInventory();
+    check(attemptRoom(oversizedSessionRoom) === "unobserved" && !JSON.stringify(oversizedSessionRoom).includes(longRoom));
+    await pool.query("UPDATE room_resume_sessions SET room_id='files123' WHERE id=$1", [committed.session_id]);
+    await pool.query("DELETE FROM rooms WHERE id=$1", [longRoom]);
+    const attemptClient = await pool.connect(), attemptQuery = attemptClient.query.bind(attemptClient);
+    attemptClient.query = (async (config: { text: string }) => {
+      if (config.text.startsWith("DECLARE ledger_inventory"))
+        await pool.query("UPDATE resume_upload_attempts SET room_id='else123' WHERE storage_key=$1", [committed.storage_key]);
+      return attemptQuery(config);
+    }) as typeof attemptClient.query;
+    check(attemptRoom(await inventoryUploadDatabase(attemptClient, { pageSize: 1, maxRows: 10, timeoutMs: 2000 })) === "match");
+    const freshAttempt = await databaseInventory();
+    check(attemptRoom(freshAttempt) === "conflict" && freshAttempt.accounting === "consistent" && freshAttempt.referenceFacts?.fullIdentity === "unobserved");
+    await pool.query("UPDATE resume_upload_attempts SET room_id=$2 WHERE storage_key=$1", [committed.storage_key, committed.room_id]);
     check(initialDb.complete && initialDb.references?.complete && initialDb.references.parseComplete);
     check(initialDb.scope === "database-only" && initialDb.unobserved.join() === "filesystem");
     check(initialDb.references?.receipts[0].storageKey === committed.storage_key);
@@ -223,6 +248,7 @@ async function main() {
     await pool.query("INSERT INTO rooms (id) VALUES ('other123')");
     await pool.query("UPDATE room_resume_sessions SET room_id='other123', username='PRIVATE identity' WHERE id=$1", [committed.session_id]);
     const sessionConflict = await databaseInventory();
+    check(attemptRoom(sessionConflict) === "conflict");
     check(identity(sessionConflict)?.sessionRoom === "conflict" && identity(sessionConflict)?.sessionUsername === "conflict");
     check(identity(sessionConflict)?.payloadHash === "match"); // independent message hash, not session authority
     check(!JSON.stringify(sessionConflict).includes("PRIVATE identity"));
@@ -318,6 +344,10 @@ async function main() {
     await pool.query("DELETE FROM room_resume_sessions WHERE id=$1", [committed.session_id]);
     const expired = await snapshot();
     const expiredDb = await databaseInventory();
+    check(attemptRoom(expiredDb) === "unobserved" && expiredDb.attempts.length === 2 && expiredDb.accounting === "consistent");
+    evidence.push({ case: "attempt-session-room", checks: 8,
+      cases: "match,attempt-room-conflict,session-room-conflict,oversized-session-id,oversized-attempt-room,oversized-session-room,pinned-vs-fresh,deleted-session",
+      authorization: "unproven", fullIdentity: "unobserved" });
     check(expiredDb.references?.receipts.length === 0 && expiredDb.references.messages.length === 1);
     check(expiredDb.references?.messages[0].storageKey === committed.storage_key);
     const expiredFacts = expiredDb.referenceFacts?.keys.find(k => k.storageKey === committed.storage_key);
