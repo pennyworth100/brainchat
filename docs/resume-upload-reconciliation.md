@@ -6,6 +6,31 @@ enabled. The ledger remains monotonic. This contract does not grant repair autho
 
 ## Evidence sources and completeness
 
+### Private evidence envelope
+
+`serializeUploadEvidence` captures the ORIGINAL DB, root and supplied-key content
+reports independently in a versioned JSON envelope. Sources may be null; duplicates,
+tombstones, conflicts, partial results and each source completeness axis remain intact.
+No join, collector rerun, aggregate PASS, absence, ownership or repair authority is
+created. A completed supplied-key batch never establishes volume coverage.
+
+Each source carries explicit observation ID, namespace, release SHA and start/end;
+DB additionally carries database/schema IDs, filesystem sources volume/root IDs and
+original limits. All IDs must be opaque non-secret labels, never credentials or paths.
+These are CALLER ASSERTIONS, not verified live identities, clock synchronization or
+an all-writer barrier. Different source identities remain independent; within a content
+source namespace labels must agree. Original collector report types are trusted
+in-process data, not a public/untrusted-report validation API. No runtime caller exists.
+
+Serialization snapshots without invoking getters/toJSON, preserves array order and
+repeated observations, and rejects instead of truncating: maximum 8 MiB UTF-8 output,
+500,000 visited nodes, depth 24, 4,096 UTF-16 units per string, 64 object fields,
+100,000 array entries (root 10,000, content 1,000). Non-JSON data/cycles fail closed.
+These are capture/serialization bounds, not bounds on earlier collection or hostile
+Proxy execution. Reports exceeding them cannot produce a partial 'successful' envelope.
+Only the immutable serialized capture is returned; caller mutations cannot rewrite it.
+The envelope remains private and potentially sensitive; do not publish actual reports.
+
 ### Private root-entry slice
 
 `inventoryUploadRoot` is a separate, unwired observer. Its caller must attest that
