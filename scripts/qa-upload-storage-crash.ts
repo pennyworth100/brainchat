@@ -232,6 +232,29 @@ async function main() {
     check(capped.attempts.length === 1 && capped.lastStorageKey === full.attempts[0].storage_key);
     const exact = await inventory(2);
     check(exact.complete && exact.accounting === "consistent");
+    // An owned connection can arrive with a previously pinned snapshot. BEGIN
+    // with the same isolation level does not replace that snapshot in PostgreSQL.
+    const inherited = await pool.connect();
+    await inherited.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await inherited.query("SELECT * FROM resume_upload_budget");
+    await pool.query("UPDATE resume_upload_budget SET reserved_bytes=0");
+    const fresh = await inventoryUploadLedger(inherited, { pageSize: 1, maxRows: 10, timeoutMs: 2000 });
+    check(fresh.complete && fresh.budget?.reserved_bytes === "0");
+    check(fresh.accounting === "inconsistent" && fresh.reasons.includes("counter-sum-mismatch"));
+    await pool.query("UPDATE resume_upload_budget SET reserved_bytes=$1", [ceiling * 2]);
+    for (const poisoned of [false, true]) {
+      const occupied = await pool.connect();
+      await occupied.query("BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE");
+      // This caller-owned uncommitted change must be rolled back, never committed.
+      await occupied.query("UPDATE resume_upload_budget SET reserved_bytes=0");
+      if (poisoned) await assert.rejects(occupied.query("SELECT 1/0"));
+      const clean = await inventoryUploadLedger(occupied, { pageSize: 1, maxRows: 10, timeoutMs: 2000 });
+      check(clean.complete && clean.accounting === "consistent");
+      check(clean.budget?.reserved_bytes === String(ceiling * 2));
+      check((await pool.query("SELECT reserved_bytes::text FROM resume_upload_budget")).rows[0].reserved_bytes === String(ceiling * 2));
+    }
+    evidence.push({ case: "owned-connection-reset", checks: 8, inheritedSnapshot: "fresh",
+      readWriteAndAbortedTransactions: "rolled-back-not-committed" });
     // Hold a fixture-only lock to force a genuine PostgreSQL statement deadline.
     const locker = await pool.connect();
     try {

@@ -19,6 +19,8 @@ export type LedgerInventory = {
 
 // PRIVATE, not wired to a route or scheduler. Consumes an EXCLUSIVE checked-out
 // client and destroys it on exit. Caller must bound pool acquisition separately.
+// Consumption includes ROLLBACK of any inherited transaction. Never pass a
+// connection whose pending work must be preserved or shared with another owner.
 // No DML, refund, replay, available-capacity or reclaimability result.
 export async function inventoryUploadLedger(client: PoolClient,
   limits: { pageSize: number; maxRows: number; timeoutMs: number }): Promise<LedgerInventory> {
@@ -46,6 +48,12 @@ export async function inventoryUploadLedger(client: PoolClient,
       const config: QueryConfig & { query_timeout: number } = { text, values, query_timeout: remaining };
       return client.query(config);
     };
+    // BEGIN inside an existing transaction does not necessarily create a new
+    // snapshot. Reset even an aborted or read-only transaction before starting
+    // this observation; never commit work inherited from the exclusive owner.
+    phase = "reset";
+    await query("ROLLBACK");
+    phase = "begin";
     await query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await query("SELECT set_config('statement_timeout', $1, true)", [String(limits.timeoutMs)]);
     phase = "budget";

@@ -81,6 +81,13 @@ implementation or validation of a production collector.
 
 `src/lib/resume-ledger-inventory.ts` consumes one exclusively checked-out client
 and destroys it on exit. Pool acquisition must be bounded by its private caller.
+Ownership transfer explicitly permits rolling back any inherited transaction;
+never pass shared connections or pending work that must be preserved. Before
+BEGIN, the collector issues ROLLBACK: PostgreSQL otherwise retains a snapshot
+already pinned by an earlier REPEATABLE READ READ ONLY transaction. Reset errors
+fail closed, without querying the ledger. Real PostgreSQL regressions verify
+fresh observation after a concurrent change and rollback (never commit) of
+inherited read-write and aborted transactions.
 It scans budget and attempts in REPEATABLE READ READ ONLY, with a server cursor,
 row/page/time limits, SQL-side provenance text bounds, exact bigint arithmetic,
 and explicit partial/error reasons. Invalid rows are retained and not counted as

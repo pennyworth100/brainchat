@@ -6,11 +6,12 @@ import { inventoryUploadLedger } from "./resume-ledger-inventory";
 const attempt = { storage_key: "a".repeat(64), session_id: "11111111-1111-4111-8111-111111111111",
   room_id: "files123", client_message_id: "one", reserved_bytes: "1024", oversized: false };
 const limits = { pageSize: 1, maxRows: 2, timeoutMs: 1000 };
-function fixture(options: { failPage?: boolean; badAmount?: boolean; deadline?: boolean; releaseError?: boolean } = {}) {
+function fixture(options: { failPage?: boolean; badAmount?: boolean; deadline?: boolean; releaseError?: boolean; resetError?: boolean } = {}) {
   const sql: string[] = [], released: boolean[] = [];
   let page = 0;
   const client = { query: async (config: { text: string }) => {
     sql.push(config.text);
+    if (options.resetError && sql.length === 1) throw Error("private connection failure");
     if (config.text.includes("FROM resume_upload_budget")) return { rows: [{ capacity_bytes: "2048", reserved_bytes: "1024" }] };
     if (config.text.startsWith("FETCH")) {
       if (options.deadline) throw Error("Query read timeout");
@@ -24,7 +25,8 @@ function fixture(options: { failPage?: boolean; badAmount?: boolean; deadline?: 
 test("ledger uses one read-only transaction and releases a destroyed connection", async () => {
   const f = fixture(), r = await inventoryUploadLedger(f.client, limits);
   assert.equal(r.complete, true); assert.equal(r.accounting, "consistent");
-  assert.equal(f.sql[0], "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  assert.equal(f.sql[0], "ROLLBACK");
+  assert.equal(f.sql[1], "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   assert.equal(f.sql.at(-1), "ROLLBACK"); assert.deepEqual(f.released, [true]);
   assert.deepEqual(r.unobserved, ["receipts", "messages", "filesystem"]);
   assert.equal(r.crossStoreStability, "unproven");
@@ -56,4 +58,12 @@ test("invalid bounds do not execute SQL and still dispose the owned connection",
   const f = fixture(), r = await inventoryUploadLedger(f.client, { ...limits, maxRows: Infinity });
   assert.deepEqual(f.sql, []); assert.deepEqual(f.released, [true]);
   assert.equal(r.complete, false); assert.deepEqual(r.reasons, ["invalid-limits"]);
+});
+test("failed transaction reset cannot become a complete or empty-consistent report", async () => {
+  const f = fixture({ resetError: true }), r = await inventoryUploadLedger(f.client, limits);
+  assert.deepEqual(f.sql, ["ROLLBACK"]); assert.deepEqual(f.released, [true]);
+  assert.equal(r.complete, false); assert.equal(r.accounting, "unknown");
+  assert.equal(r.budget, null); assert.deepEqual(r.attempts, []);
+  assert.deepEqual(r.reasons, ["db-error:reset"]);
+  assert.ok(!JSON.stringify(r).includes("private connection failure"));
 });
