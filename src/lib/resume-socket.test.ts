@@ -6,6 +6,7 @@ import { io, type Socket } from "socket.io-client";
 import { attachResumeSocket } from "./resume-socket";
 import { ResumeBindings } from "./resume-bindings";
 import { ResumeMemberships } from "./resume-membership";
+import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeIdentity } from "./resume-store";
 
 const request = (generation = 0) => ({ credential: { sessionId: "session-a", roomId: "candy986",
@@ -39,6 +40,126 @@ function options() {
     bindings: new ResumeBindings(10, () => 0),
     prepare: async () => async () => {}, onCleanupError: (error: unknown): void => { assert.fail(String(error)); } };
 }
+
+test("composed admission installs once and conflicts cannot close a valid owner", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let installs = 0, calls = 0;
+  const owner = attachResumeSocket(socket, { ...opts,
+    store: { advanceGeneration: async () => { calls++; return identity(); } },
+    memberships: { install: (...args) => { installs++; return members.install(...args); } } });
+  const invalid = request(); invalid.credential.token = "invalid";
+  assert.equal(await owner.admit(invalid), null); assert.equal(socket.connected, true);
+  const flight = owner.admit(request());
+  assert.equal(owner.admit(request()), flight);
+  assert.equal(await owner.admit(request(1)), null);
+  const binding = await flight; assert.ok(binding);
+  assert.equal(owner.admit(request()), flight);
+  assert.equal(await owner.admit(request(1)), null);
+  assert.equal(calls, 1); assert.equal(installs, 1); assert.equal(socket.connected, true);
+  assert.equal(opts.bindings.isCurrent(binding), true); await owner.close();
+});
+
+test("composed membership rejection disconnects before stalled cleanup", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const cleanup = deferred<void>(); let cleanups = 0;
+  const owner = attachResumeSocket(socket, { ...opts,
+    prepare: async () => async () => { cleanups++; await cleanup.promise; },
+    memberships: { install: () => null } });
+  assert.equal(await owner.admit(request()), null);
+  assert.equal(socket.connected, false); assert.equal(socket.listenerCount("disconnecting"), 0);
+  assert.equal(await owner.admit(request()), null);
+  cleanup.resolve(); await owner.close(); assert.equal(cleanups, 1);
+});
+
+test("composed install throw releases exact lease and preserves failure", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let lease: ReturnType<typeof members.install>;
+  const failure = Error("installation failed");
+  const owner = attachResumeSocket(socket, { ...opts, memberships: { install: (...args) => {
+    lease = members.install(...args); throw failure;
+  } } });
+  await assert.rejects(owner.admit(request()), error => error === failure);
+  assert.equal(socket.connected, false); assert.ok(lease!);
+  assert.equal(lease!.isCurrent(), false); assert.equal(lease!.release(), false);
+  await owner.close();
+});
+
+test("composed overload closes only rejected socket without CAS", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const capacity = new ResumeCapacity(1), release = capacity.acquire(); assert.ok(release);
+  let calls = 0, installs = 0;
+  const owner = attachResumeSocket(socket, { ...opts, capacity,
+    store: { advanceGeneration: async () => { calls++; return identity(); } },
+    memberships: { install: () => { installs++; return null; } } });
+  assert.equal(await owner.admit(request()), null); assert.equal(socket.connected, false);
+  assert.equal(calls, 0); assert.equal(installs, 0); assert.equal(capacity.acquire(), null);
+  release(); await owner.close();
+});
+
+test("composed timeout disconnects without releasing unresolved CAS capacity", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const pending = deferred<ResumeIdentity>(), capacity = new ResumeCapacity(1); let installs = 0;
+  const owner = attachResumeSocket(socket, { ...opts, capacity, timeoutMs: 15,
+    store: { advanceGeneration: async () => pending.promise },
+    memberships: { install: () => { installs++; return null; } } });
+  assert.equal(await owner.admit(request()), null); assert.equal(socket.connected, false);
+  assert.equal(capacity.acquire(), null); assert.equal(installs, 0);
+  pending.resolve(identity()); await owner.close();
+  const release = capacity.acquire(); assert.ok(release); release();
+  assert.equal(installs, 0);
+});
+
+test("composed uncertain CAS rejects once, disconnects and never installs", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const failure = Error("uncertain CAS"); let calls = 0, installs = 0;
+  const owner = attachResumeSocket(socket, { ...opts,
+    store: { advanceGeneration: async () => { calls++; throw failure; } },
+    memberships: { install: () => { installs++; return null; } } });
+  const flight = owner.admit(request()); assert.equal(owner.admit(request()), flight);
+  await assert.rejects(flight, error => error === failure);
+  assert.equal(socket.connected, false); assert.equal(await owner.admit(request()), null);
+  assert.equal(calls, 1); assert.equal(installs, 0); await owner.close();
+});
+
+test("composed replacement closed reentrantly never exposes candidate binding", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const memberships = new ResumeMemberships(opts.bindings);
+  const old = attachResumeSocket(first.socket, { ...opts, memberships });
+  assert.ok(await old.admit(request()));
+  const next = attachResumeSocket(second.socket, { ...opts, memberships,
+    store: { advanceGeneration: async () => identity(2) } });
+  first.socket.once("disconnect", () => { void next.close(); });
+  assert.equal(await next.admit(request(1)), null);
+  assert.equal(first.socket.connected, false); assert.equal(second.socket.connected, false);
+  await old.close(); await next.close();
+});
+
+test("composed disconnect before install preserves preparation cleanup failure", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const preparing = deferred<void>(), started = deferred<void>(), errors: unknown[] = [];
+  const failure = Error("late cleanup failed"); let installs = 0;
+  const owner = attachResumeSocket(socket, { ...opts,
+    prepare: async () => { started.resolve(); await preparing.promise; return async () => { throw failure; }; },
+    onCleanupError: error => { errors.push(error); },
+    memberships: { install: () => { installs++; return null; } } });
+  const flight = owner.admit(request()); await started.promise;
+  socket.disconnect(true); preparing.resolve();
+  await assert.rejects(flight, error => error === failure);
+  await owner.close(); // cleanup failure belongs to original work, not a second dispose
+  assert.equal(installs, 0); assert.deepEqual(errors, []);
+});
+
+test("composed install-time disconnect reports shared close failure once", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const failure = Error("close cleanup failed"), errors: unknown[] = [];
+  const owner = attachResumeSocket(socket, { ...opts,
+    prepare: async () => async () => { throw failure; },
+    onCleanupError: error => { errors.push(error); },
+    memberships: { install: () => { socket.disconnect(true); return null; } } });
+  assert.equal(await owner.admit(request()), null);
+  await assert.rejects(owner.close(), error => error === failure);
+  assert.deepEqual(errors, [failure]);
+});
 
 test("membership successor physically evicts old socket without deleting successor", async t => {
   const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();

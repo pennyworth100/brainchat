@@ -1,7 +1,9 @@
 # Private physical-socket owner (3.0.10 draft)
 
 `attachResumeSocket` is deliberately NOT called by `server.ts`. It creates no
-public event, token, membership, history, presence, broadcast or DB schema change.
+public event, token, room membership, history, presence, broadcast or DB schema change.
+The optional private [lifecycle composition](resume-lifecycle.md) installs logical
+membership and physically evicts replaced sockets; it is not public room access.
 
 One process/module WeakMap reserves each actual Socket.IO server Socket object.
 Same-options reattachment returns the same frozen owner, even after close.
@@ -16,8 +18,9 @@ Automatic disconnect cleanup reports errors once; explicit close still rejects.
 Preparation must clean its own partial failure and must not expose any data.
 
 Owners now share a pending-work budget and admission deadline; see
-[admission limits](resume-admission-limits.md). They do NOT cancel DB work, evict a
-superseded socket, or gate outbound broadcasts. `close()` can wait indefinitely
+[admission limits](resume-admission-limits.md). They do NOT cancel DB work or gate
+outbound broadcasts. Without lifecycle composition they do not evict a
+superseded socket. `close()` can wait indefinitely
 for work even after an admission timeout. A superseded
 socket remains physically connected until separately closed, although its binding
 is fenced. Never put these sockets in public room broadcast membership yet.

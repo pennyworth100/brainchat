@@ -39,6 +39,12 @@ export class ResumeAdmission {
     try { return !this.closed && performance.now() < this.deadline && this.connected(); } catch { return false; }
   }
 
+  // Distinguish the reserved attempt from a non-destructive invalid/conflicting
+  // request. Promise identity is server-owned and must be checked synchronously.
+  ownsAttempt(flight: Promise<ResumeBinding | null>): boolean {
+    return flight === this.flight;
+  }
+
   admit(request: Request): Promise<ResumeBinding | null> {
     if (!this.live()) return Promise.resolve(null);
     const credential = { ...request.credential };

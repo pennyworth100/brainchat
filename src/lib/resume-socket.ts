@@ -4,6 +4,7 @@ import { ResumeAdmission } from "./resume-admission";
 import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeBindings, ResumeBinding } from "./resume-bindings";
 import type { ResumeIdentity, ResumeStore } from "./resume-store";
+import type { ResumeMemberships } from "./resume-membership";
 
 type Options = {
   store: Pick<ResumeStore, "advanceGeneration">;
@@ -13,6 +14,8 @@ type Options = {
   onCleanupError: (error: unknown) => void;
   capacity?: ResumeCapacity;
   timeoutMs?: number;
+  // Opt-in private composition. Shared with this exact bindings registry.
+  memberships?: Pick<ResumeMemberships, "install">;
 };
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
@@ -74,14 +77,45 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     }
     return result;
   };
-  const onDisconnect = () => {
-    void close().catch(error => {
+  let observingClose = false;
+  const closeAutomatically = () => {
+    const result = close();
+    if (observingClose) return;
+    observingClose = true;
+    void result.catch(error => {
       // close() retains the original rejected promise for an explicit await.
       try { onCleanupError(error); }
       catch (reportError) { console.error("Resume cleanup error reporter failed", reportError); }
     });
   };
-  const owner = Object.freeze({ incarnation, admit: admission.admit.bind(admission), close });
+  const onDisconnect = closeAutomatically;
+  const memberships = options.memberships;
+  const flights = new WeakMap<Promise<ResumeBinding | null>, Promise<ResumeBinding | null>>();
+  const terminate = () => {
+    // Fence/release synchronously; never wait for stalled CAS or cleanup before
+    // physical disconnection. close retains the original cleanup result.
+    closeAutomatically();
+    socket.disconnect(true);
+  };
+  const admit: ResumeSocketOwner["admit"] = request => {
+    const flight = admission.admit(request);
+    if (!memberships || !admission.ownsAttempt(flight)) return flight;
+    const previous = flights.get(flight);
+    if (previous) return previous;
+    const result = flight.then(binding => {
+      try {
+        if (binding && memberships.install(socket, owner, binding)) return binding;
+      } catch (error) {
+        terminate();
+        throw error;
+      }
+      terminate();
+      return null;
+    }, error => { terminate(); throw error; });
+    flights.set(flight, result);
+    return result;
+  };
+  const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, close });
   owners.set(socket, { options, owner, subscribe: release => {
     if (closed) return null;
     releases.add(release);
