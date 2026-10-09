@@ -10,6 +10,117 @@ import { ResumeCapacity } from "./resume-capacity";
 import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
 import type { ResumeIdentity } from "./resume-store";
 import { syncResumeSocket } from "./resume-sync";
+import { sendResumeText } from "./resume-send";
+import type { ResumeTextWrite } from "./resume-message";
+import type { OperationResult } from "./resume-operation";
+
+const savedText = (inserted = true): OperationResult<ResumeTextWrite> => ({ authorized: true,
+  value: { inserted, message: { id: 71, type: "message", username: "Alice", message: "hello", ts: 123 } } });
+const textPayload = () => ({ roomId: "candy986", clientMessageId: "request_1", message: "hello" });
+
+test("text adapter rejects invalid payload and copied/wrong physical authority before DB", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let writes = 0;
+  const writer = { saveOnceWithOutcome: async () => { writes++; return savedText(); } };
+  const ack = () => assert.fail("unauthorized ACK");
+  for (const payload of [null, { ...textPayload(), roomId: "other123" },
+    { ...textPayload(), clientMessageId: "bad key" }, { ...textPayload(), message: " " },
+    { ...textPayload(), message: "a".repeat(10_001) }]) {
+    assert.deepEqual(await sendResumeText(f.socket, f.owner, f.binding, f.members, writer, payload, ack), { committed: false });
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.deepEqual(await sendResumeText(socket, owner, binding, f.members, writer, textPayload(), ack), { committed: false });
+  }
+  assert.equal(writes, 0);
+});
+
+test("text adapter snapshots client fields and hands off only committed authoritative receipt", async t => {
+  const f = await syncFixture(t), gate = deferred<OperationResult<ResumeTextWrite>>();
+  const payload = { ...textPayload(), username: "spoof", sessionId: "spoof" }; const calls: unknown[] = [];
+  const fanout = t.mock.method(f.members, "broadcastExcept", (...args: unknown[]) => { calls.push(args); return 0; });
+  const pending = sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async (...args) => { assert.deepEqual(args, [f.binding, "request_1", "hello"]); return gate.promise; } },
+    payload, reply => { calls.push(reply); assert.ok(Object.isFrozen(reply)); assert.ok(Object.isFrozen(reply.message)); });
+  payload.roomId = "other123"; payload.message = "mutated"; payload.clientMessageId = "changed";
+  assert.equal(calls.length, 0); gate.resolve(savedText()); const result = await pending;
+  assert.ok(result.committed); assert.equal(result.ack, "handed-off"); assert.equal(result.fanout, "attempted");
+  assert.equal(result.receipt.clientMessageId, "request_1"); assert.equal(result.receipt.message.username, "Alice");
+  assert.equal(fanout.mock.calls[0].arguments[1], "candy986"); assert.equal(calls.length, 2);
+});
+
+test("text adapter reports durable commit but suppresses old-owner ACK/fanout after async owner loss", async t => {
+  for (const kind of ["close", "disconnect", "expiry", "replacement"]) {
+    const f = await syncFixture(t), gate = deferred<OperationResult<ResumeTextWrite>>();
+    const fanout = t.mock.method(f.members, "broadcastExcept", () => assert.fail("stale fanout"));
+    const pending = sendResumeText(f.socket, f.owner, f.binding, f.members,
+      { saveOnceWithOutcome: async () => gate.promise }, textPayload(), () => assert.fail("stale ACK"));
+    if (kind === "close") await f.owner.close();
+    if (kind === "disconnect") f.socket.disconnect(true);
+    if (kind === "expiry") f.expire();
+    if (kind === "replacement") {
+      const next = await f.connect(), owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+        store: { advanceGeneration: async () => identity(2) } });
+      t.after(() => owner.close()); assert.ok(await owner.admit(request(1)));
+    }
+    gate.resolve(savedText()); const result = await pending;
+    assert.ok(result.committed); assert.equal(result.ack, "skipped"); assert.equal(result.fanout, "skipped");
+    assert.equal(fanout.mock.callCount(), 0);
+  }
+});
+
+test("text adapter DB denial/error cannot ACK or publish and uncertain commit is not retried", async t => {
+  const f = await syncFixture(t); let writes = 0;
+  t.mock.method(f.members, "broadcastExcept", () => assert.fail("denied fanout"));
+  const run = (fail: boolean) => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => { writes++; if (fail) throw Error("uncertain COMMIT"); return { authorized: false }; } },
+    textPayload(), () => assert.fail("denied ACK"));
+  assert.deepEqual(await run(false), { committed: false }); await assert.rejects(run(true), /uncertain COMMIT/);
+  assert.equal(writes, 2);
+});
+
+test("text adapter same-key existing receipt ACKs without replaying fanout", async t => {
+  const f = await syncFixture(t); let writes = 0, acks = 0;
+  const fanout = t.mock.method(f.members, "broadcastExcept", () => 0);
+  const run = () => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedText(++writes === 1) }, textPayload(), () => { acks++; });
+  const first = await run(), retry = await run(); assert.ok(first.committed && retry.committed);
+  assert.equal(first.inserted, true); assert.equal(retry.inserted, false);
+  assert.equal(retry.fanout, "skipped"); assert.deepEqual(first.receipt, retry.receipt);
+  assert.equal(acks, 2); assert.equal(fanout.mock.callCount(), 1);
+});
+
+test("text adapter ACK failure remains committed and cannot authorize a retry fanout", async t => {
+  const f = await syncFixture(t); let acks = 0;
+  const fanout = t.mock.method(f.members, "broadcastExcept", () => 0);
+  const result = await sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedText() }, textPayload(), () => { acks++; throw Error("ACK broken"); });
+  assert.ok(result.committed); assert.equal(result.ack, "failed"); assert.equal(result.fanout, "attempted");
+  assert.equal(result.errors[0].stage, "ack"); assert.equal(acks, 1); assert.equal(fanout.mock.callCount(), 1);
+});
+
+test("text adapter reentrant ACK close suppresses remaining publication", async t => {
+  const f = await syncFixture(t);
+  t.mock.method(f.members, "broadcastExcept", () => assert.fail("closed sender fanout"));
+  const result = await sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedText() }, textPayload(), () => { void f.owner.close(); });
+  assert.ok(result.committed); assert.equal(result.ack, "handed-off"); assert.equal(result.fanout, "skipped");
+});
+
+test("text adapter partial real recipient handoff failure remains committed; retry is ACK-only", async t => {
+  const f = await syncFixture(t); let delivered = 0, writes = 0;
+  for (const sessionId of ["peer_a", "peer_b", "peer_c"]) {
+    const peer = await f.connect(), owner = attachResumeSocket(peer.socket, { ...f.opts, memberships: f.members,
+      store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } });
+    t.after(() => owner.close()); const req = request(); req.credential.sessionId = sessionId;
+    assert.ok(await owner.admit(req));
+    t.mock.method(peer.socket, "emit", () => { if (sessionId === "peer_b") throw Error("partial outbound"); delivered++; return true; });
+  }
+  const run = () => sendResumeText(f.socket, f.owner, f.binding, f.members,
+    { saveOnceWithOutcome: async () => savedText(++writes === 1) }, textPayload(), () => {});
+  const first = await run(); assert.ok(first.committed); assert.equal(first.fanout, "failed");
+  assert.equal(first.errors[0].stage, "fanout"); assert.equal(delivered, 1);
+  const retry = await run(); assert.ok(retry.committed); assert.equal(retry.fanout, "skipped"); assert.equal(delivered, 1);
+});
 
 async function syncFixture(t: TestContext) {
   const f = await fixture(t), transport = await f.connect(), opts = options();
