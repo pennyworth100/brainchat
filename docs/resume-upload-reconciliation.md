@@ -301,3 +301,29 @@ measured local bytes under these preconditions, not declared-metadata agreement,
 ownership, full identity, durability, current authorization or safe reclamation.
 Cross-store stability stays unproven. No DB/FS atomicity is claimed.
 No live volume was read; no repair, refund, deletion, replay or activation added.
+
+## Private per-reference content comparison
+
+`compareUploadReferenceContent` is a pure, unwired comparison of one explicitly
+paired reference and keyed completed content observation. Its caller must bind
+the actual observed root and the DB reference to the same trusted, stable storage
+namespace identity (not a room, path or inferred deployment). Exact matching
+namespace labels do not establish that external binding. Namespaces are bounded
+ASCII identifiers; storage keys are exact lowercase 64-hex strings. A missing or
+mismatched namespace/key leaves both comparisons unobserved, not conflicting.
+
+Only a valid reference with a completed, unchanged-at-checks, error-free content
+observation can compare. Single-link metadata, canonical exact stat size, safe
+bytes-read count within the observer's 64 MiB ceiling, and canonical measured
+SHA-256 must agree with that completion contract. Partial positive metadata is
+never promoted to match, absence or empty-file evidence. Declared size and digest
+are compared independently as match/conflict/unobserved; missing or malformed
+declarations are not coerced. No raw content or provenance is copied to output.
+
+Callers retain original references, source identity, scan completeness and all
+duplicate observations; each explicit pair remains independent. This function
+does not select a winner, join arrays, aggregate a PASS or establish a DB/FS
+snapshot. Even two matches do not establish ownership, full logical identity,
+current authorization, durability or safe reclamation. Cross-store stability
+always stays unproven and full identity unobserved. No runtime integration,
+filesystem/DB access, repair, refund, deletion, replay or deployment is added.
