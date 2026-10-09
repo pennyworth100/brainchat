@@ -18,6 +18,42 @@ const savedText = (inserted = true): OperationResult<ResumeTextWrite> => ({ auth
   value: { inserted, message: { id: 71, type: "message", username: "Alice", message: "hello", ts: 123 } } });
 const textPayload = () => ({ roomId: "candy986", clientMessageId: "request_1", message: "hello" });
 
+test("text rate debt survives physical reconnect and wrapper changes; rejection is before DB", async t => {
+  const f = await fixture(t), opts = options(), members = new ResumeMemberships(opts.bindings);
+  const sessionId = "rate-integration-session";
+  async function connect(generation: number) {
+    const transport = await f.connect();
+    const owner = attachResumeSocket(transport.socket, { ...opts, memberships: members,
+      store: { advanceGeneration: async () => ({ ...identity(generation), sessionId }) } });
+    t.after(() => owner.close());
+    const req = request(generation - 1); req.credential.sessionId = sessionId;
+    const binding = await owner.admit(req); assert.ok(binding);
+    return { ...transport, owner, binding };
+  }
+  let writes = 0;
+  const writer = { saveOnceWithOutcome: async (): Promise<OperationResult<ResumeTextWrite>> => {
+    writes++;
+    if (writes === 1) throw Error("uncertain COMMIT");
+    if (writes === 2) return { authorized: false };
+    return savedText(false); // already-stored retries still cost an attempt
+  } };
+  const run = (x: Awaited<ReturnType<typeof connect>>, i: number, cap = new ResumeCapacity(1)) =>
+    sendResumeText(x.socket, x.owner, x.binding, members, { ...writer },
+      { ...textPayload(), clientMessageId: `rate-${i}`, sessionId: `spoof-${i}` } as ReturnType<typeof textPayload>,
+      () => {}, { capacity: cap });
+  const first = await connect(1);
+  await assert.rejects(run(first, 0), /uncertain COMMIT/);
+  assert.deepEqual(await run(first, 1), { committed: false });
+  for (let i = 2; i < 120; i++) assert.equal((await run(first, i)).committed, true);
+  const cap = new ResumeCapacity(1);
+  assert.deepEqual(await run(first, 120, cap), { committed: false });
+  const release = cap.acquire(); assert.ok(release); release();
+  await first.owner.close();
+  const next = await connect(2);
+  assert.deepEqual(await run(next, 121), { committed: false });
+  assert.equal(writes, 120);
+});
+
 test("text deadline returns uncertain identity, retains both leases and suppresses late commit publication", async t => {
   const first = await syncFixture(t), second = await syncFixture(t);
   const cap = new ResumeCapacity(1), gate = deferred<OperationResult<ResumeTextWrite>>();

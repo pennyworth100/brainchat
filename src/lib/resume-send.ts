@@ -5,6 +5,7 @@ import type { ResumeMemberships } from "./resume-membership";
 import { ownsResumeSocket, type ResumeSocketOwner } from "./resume-socket";
 import { isValidRoomId } from "./room-id";
 import { ResumeCapacity } from "./resume-capacity";
+import { consumeResumeTextAttempt } from "./resume-text-rate";
 
 // One unresolved write per physical socket, shared by all callers. Capacity is
 // process-local, not a distributed rate limit or proof of DB cancellation.
@@ -46,6 +47,12 @@ export async function sendResumeText(socket: Socket, owner: ResumeSocketOwner,
   if (writing.has(socket)) return { committed: false };
   const release = (limits.capacity ?? capacity).acquire();
   if (!release) return { committed: false };
+  // Authenticated local identity, never payload fields. Denials, retries and
+  // uncertain COMMITs consume attempts; there is deliberately no refund/reset.
+  if (!consumeResumeTextAttempt(binding.sessionId)) {
+    release();
+    return { committed: false };
+  }
   writing.add(socket);
   const deadline = performance.now() + timeoutMs;
   const uncertain = Object.freeze({ committed: null, reason: "deadline", clientMessageId } as const);
