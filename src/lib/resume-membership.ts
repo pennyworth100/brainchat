@@ -42,6 +42,16 @@ export class ResumeMemberships {
     return binding.roomId === roomId && slot?.lease.binding === binding && slot.lease.isCurrent();
   }
 
+  // Server-owned physical lookup, never a binding reconstructed from headers.
+  // This does not authenticate an HTTP caller who merely knows socket.id.
+  bindingFor(socket: Socket, owner: ResumeSocketOwner, roomId: string): ResumeBinding | null {
+    const slot = this.sockets.get(socket);
+    if (!ownsResumeSocket(socket, owner) || !slot ||
+        slot.lease.binding.transportId !== owner.incarnation ||
+        !this.isCurrent(slot.lease.binding, roomId)) return null;
+    return slot.lease.binding;
+  }
+
   // PRIVATE outbound seam. Call AFTER all async reads/authorization, with inert
   // server-built data. Success means handed to Socket.IO, not received/ACKed.
   // An exact old binding must never redirect delayed history to its successor.

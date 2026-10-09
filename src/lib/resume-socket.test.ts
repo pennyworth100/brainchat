@@ -1,4 +1,126 @@
 import assert from "node:assert/strict";
+import { preflightResumeUpload } from "./resume-upload-preflight";
+import { ResumeUploadAdmissions } from "./resume-upload-admission";
+
+test("upload preflight rejects wrong room/session/token and forged physical owner before DB/body", async t => {
+  const f = await syncFixture(t), other = await f.connect();
+  const uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  let lookups = 0, bodies = 0;
+  const store = { lookup: async () => { lookups++; return identity(); } };
+  const run = async (payload: Parameters<typeof preflightResumeUpload>[5], socket = f.socket, owner = f.owner) => {
+    const grant = await preflightResumeUpload(socket, owner, f.members, store, uploads, payload);
+    if (grant) bodies++;
+    return grant;
+  };
+  for (const payload of [null, { ...request().credential, roomId: "other123" },
+    { ...request().credential, sessionId: "forged" }, { ...request().credential, token: "bad" }]) {
+    assert.equal(await run(payload), null);
+  }
+  assert.equal(await run(request().credential, other.socket), null);
+  assert.equal(await run(request().credential, f.socket, { ...f.owner }), null);
+  assert.equal(lookups, 0); assert.equal(bodies, 0);
+  assert.equal(await preflightResumeUpload(f.socket, f.owner, new ResumeMemberships(f.opts.bindings),
+    store, uploads, request().credential), null);
+  assert.equal(lookups, 0);
+});
+
+test("upload preflight authenticates bearer; DB denial/errors never grant or consume body", async t => {
+  const f = await syncFixture(t), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  const run = (lookup: Parameters<typeof preflightResumeUpload>[3]["lookup"]) =>
+    preflightResumeUpload(f.socket, f.owner, f.members, { lookup }, uploads, request().credential);
+  assert.equal(await run(async () => null), null);
+  await assert.rejects(run(async () => { throw Error("database unavailable"); }), /database unavailable/);
+  const grant = await run(async () => identity()); assert.ok(grant);
+  assert.equal(grant.binding, f.binding); assert.ok(Object.isFrozen(grant));
+  assert.equal(await run(async () => identity()), null); // unresolved upload admission
+  uploads.release(grant);
+});
+
+test("upload preflight snapshots credentials and rejects mismatched durable identity", async t => {
+  const f = await syncFixture(t), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  for (const mismatch of [{ sessionId: "other" }, { roomId: "other123" }, { username: "Mallory" },
+    { authVersion: 2 }, { generation: 2 }, { expiresAt: new Date(999) }]) {
+    assert.equal(await preflightResumeUpload(f.socket, f.owner, f.members,
+      { lookup: async () => ({ ...identity(), ...mismatch }) }, uploads, request().credential), null);
+  }
+  const gate = deferred<void>(), payload = request().credential;
+  const flight = preflightResumeUpload(f.socket, f.owner, f.members, { lookup: async credential => {
+    assert.ok(Object.isFrozen(credential)); await gate.promise;
+    assert.deepEqual(credential, request().credential); return identity();
+  } }, uploads, payload);
+  payload.roomId = "other123"; payload.token = "forged"; payload.sessionId = "other";
+  gate.resolve(); const grant = await flight; assert.ok(grant); uploads.release(grant);
+});
+
+test("upload preflight rechecks close/disconnect/expiry after durable lookup before body", async t => {
+  for (const loss of ["close", "disconnect", "expiry"]) {
+    const f = await syncFixture(t), gate = deferred<void>(), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+    const pending = preflightResumeUpload(f.socket, f.owner, f.members,
+      { lookup: async () => { await gate.promise; return identity(); } }, uploads, request().credential);
+    if (loss === "close") await f.owner.close();
+    if (loss === "disconnect") f.socket.disconnect(true);
+    if (loss === "expiry") f.expire();
+    gate.resolve(); assert.equal(await pending, null);
+  }
+});
+
+test("upload preflight does not redirect an old lookup to a successor owner", async t => {
+  const f = await syncFixture(t), gate = deferred<void>(), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  const pending = preflightResumeUpload(f.socket, f.owner, f.members,
+    { lookup: async () => { await gate.promise; return identity(); } }, uploads, request().credential);
+  const next = await f.connect(), owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => identity(2) } });
+  t.after(() => owner.close()); const binding = await owner.admit(request(1)); assert.ok(binding);
+  gate.resolve(); assert.equal(await pending, null);
+  const grant = await preflightResumeUpload(next.socket, owner, f.members,
+    { lookup: async () => identity(2) }, uploads, request().credential);
+  assert.ok(grant); assert.equal(grant.binding, binding); uploads.release(grant);
+});
+
+test("upload preflight retains per-socket and aggregate capacity until expired lookup settles", async t => {
+  const f = await syncFixture(t), other = await syncFixture(t), gate = deferred<void>();
+  const cap = new ResumeCapacity(1), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  let now = 0, lookups = 0, settled = false;
+  const store = { lookup: async () => { lookups++; await gate.promise; return identity(); } };
+  const first = preflightResumeUpload(f.socket, f.owner, f.members, store, uploads,
+    request().credential, { capacity: cap, timeoutMs: 10, now: () => now });
+  void first.then(() => { settled = true; });
+  now = 10;
+  assert.equal(await preflightResumeUpload(f.socket, f.owner, f.members, store, uploads,
+    request().credential, { capacity: new ResumeCapacity(1) }), null);
+  assert.equal(await preflightResumeUpload(other.socket, other.owner, other.members, store,
+    new ResumeUploadAdmissions(other.opts.bindings), request().credential, { capacity: cap }), null);
+  await f.owner.close(); assert.equal(cap.acquire(), null); assert.equal(settled, false);
+  assert.equal(lookups, 1); gate.resolve(); assert.equal(await first, null);
+  const release = cap.acquire(); assert.ok(release); release();
+});
+
+test("upload preflight rejects delayed/invalid clock and invalid timeout without admission", async t => {
+  for (const finished of [10, -1, NaN, Infinity]) {
+    const f = await syncFixture(t), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+    let now = 0;
+    assert.equal(await preflightResumeUpload(f.socket, f.owner, f.members,
+      { lookup: async () => { now = finished; return identity(); } }, uploads, request().credential,
+      { timeoutMs: 10, now: () => now }), null);
+  }
+  const f = await syncFixture(t), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  for (const timeoutMs of [0, -1, 0.5, 10_001, Infinity]) {
+    await assert.rejects(preflightResumeUpload(f.socket, f.owner, f.members,
+      { lookup: async () => assert.fail("invalid limit DB") }, uploads, request().credential, { timeoutMs }), /deadline/);
+  }
+});
+
+test("upload preflight grants admitted HTTP lifetime but disconnect cannot admit another body", async t => {
+  const f = await syncFixture(t), uploads = new ResumeUploadAdmissions(f.opts.bindings);
+  const run = () => preflightResumeUpload(f.socket, f.owner, f.members,
+    { lookup: async () => identity() }, uploads, request().credential);
+  const grant = await run(); assert.ok(grant);
+  f.socket.disconnect(true);
+  assert.equal(uploads.acceptChunk(grant, 1), true);
+  assert.equal(await run(), null);
+  assert.equal(f.members.bindingFor(f.socket, f.owner, "candy986"), null);
+  uploads.release(grant);
+});
 import test, { type TestContext } from "node:test";
 import http from "node:http";
 import { Server, type Socket as ServerSocket } from "socket.io";
