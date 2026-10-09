@@ -9,6 +9,123 @@ import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeIdentity } from "./resume-store";
 
+const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
+
+test("timed out issuance retains capacity until actual settlement", async t => {
+  const f = await fixture(t), opts = options(), issueCapacity = new ResumeCapacity(1);
+  const gate = deferred<void>(), entered = deferred<void>(); let issues = 0;
+  const config = { ...opts, timeoutMs: 10, issueCapacity, memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => { issues++; entered.resolve(); await gate.promise; return issuedJoin(); } };
+  const first = attachResumeSocket((await f.connect()).socket, config);
+  const pending = first.join(authenticatedJoin); await entered.promise; assert.equal(await pending, null);
+  const second = attachResumeSocket((await f.connect()).socket, config);
+  assert.equal(await second.join(authenticatedJoin), null); assert.equal(issues, 1);
+  gate.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+  const third = attachResumeSocket((await f.connect()).socket, config);
+  assert.ok(await third.join(authenticatedJoin)); assert.equal(issues, 2);
+  await Promise.all([first.close(), second.close(), third.close()]);
+});
+
+test("join deadline during preparation releases late membership without publishing credential", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const gate = deferred<void>(), entered = deferred<void>(); let cleanups = 0;
+  const members = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, timeoutMs: 10, memberships: members,
+    issue: async () => issuedJoin(),
+    prepare: async () => { entered.resolve(); await gate.promise; return async () => { cleanups++; }; } });
+  const flight = owner.join(authenticatedJoin); await entered.promise;
+  assert.equal(await flight, null); assert.equal(socket.connected, false);
+  gate.resolve(); await owner.close();
+  assert.equal(cleanups, 1); assert.equal(members.broadcast("candy986", "room-info", {}), 0);
+});
+const issuedJoin = () => ({ ...identity(0), token: request().credential.token });
+
+test("authenticated join reserves before issuance and shares one credential/membership", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), gate = deferred<void>();
+  let issues = 0, advances = 0, installs = 0;
+  const owner = attachResumeSocket(socket, { ...opts,
+    issue: async (...args) => { assert.deepEqual(args, ["candy986", "Alice", 1]); issues++; await gate.promise; return issuedJoin(); },
+    store: { advanceGeneration: async () => { advances++; return identity(); } },
+    memberships: { install: (...args) => { installs++; return members.install(...args); } } });
+  const input = { ...authenticatedJoin };
+  const flight = owner.join(input); input.username = "Changed";
+  assert.equal(owner.join(authenticatedJoin), flight);
+  assert.equal(await owner.join({ ...authenticatedJoin, username: "Other" }), null);
+  assert.equal(await owner.admit(request()), null);
+  gate.resolve(); const result = await flight; assert.ok(result);
+  assert.equal(owner.join(authenticatedJoin), flight);
+  assert.equal(result.binding.username, "Alice"); assert.equal(result.credential.token, issuedJoin().token);
+  assert.ok(Object.isFrozen(result)); assert.ok(Object.isFrozen(result.credential));
+  assert.deepEqual([issues, advances, installs], [1, 1, 1]);
+  assert.equal(members.send(result.binding, "candy986", "room-info", {}), true);
+  await owner.close(); assert.equal(await owner.join(authenticatedJoin), null);
+});
+
+test("resume reservation rejects join without issuing; malformed resume does not reserve", async t => {
+  const f = await fixture(t), opts = options(), members = new ResumeMemberships(opts.bindings);
+  let issues = 0;
+  const config = { ...opts, memberships: members, issue: async () => { issues++; return issuedJoin(); } };
+  const first = attachResumeSocket((await f.connect()).socket, config);
+  assert.ok(await first.admit(request()));
+  assert.equal(await first.join(authenticatedJoin), null); assert.equal(issues, 0);
+  await first.close();
+  const second = attachResumeSocket((await f.connect()).socket, { ...config, bindings: new ResumeBindings(10, () => 0),
+    memberships: { install: () => null } });
+  const invalid = request(); invalid.credential.token = "invalid";
+  assert.equal(await second.admit(invalid), null);
+  assert.equal(await second.join(authenticatedJoin), null); assert.equal(issues, 1);
+  await second.close();
+});
+
+test("disconnect during issuance prevents CAS, membership and credential exposure", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const entered = deferred<void>(), gate = deferred<void>(); let advances = 0;
+  const owner = attachResumeSocket(socket, { ...opts, memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => { entered.resolve(); await gate.promise; return issuedJoin(); },
+    store: { advanceGeneration: async () => { advances++; return identity(); } } });
+  const flight = owner.join(authenticatedJoin); await entered.promise;
+  socket.disconnect(true); gate.resolve();
+  assert.equal(await flight, null); assert.equal(advances, 0);
+  assert.equal(await owner.join(authenticatedJoin), null); await owner.close();
+});
+
+test("uncertain issuance is terminal and never automatically retried", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  let issues = 0;
+  const owner = attachResumeSocket(socket, { ...opts, memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => { issues++; throw Error("ambiguous insert"); } });
+  const flight = owner.join(authenticatedJoin);
+  assert.equal(owner.join(authenticatedJoin), flight);
+  await assert.rejects(flight, /ambiguous insert/);
+  assert.equal(socket.connected, false); assert.equal(await owner.join(authenticatedJoin), null);
+  assert.equal(issues, 1); await owner.close();
+});
+
+test("join timeout fences late issuance and reports late rejection once", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const gate = deferred<void>(), done = deferred<void>(); let advances = 0;
+  const errors: unknown[] = [];
+  const owner = attachResumeSocket(socket, { ...opts, timeoutMs: 10,
+    memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => { await gate.promise; throw Error("late insert failure"); },
+    store: { advanceGeneration: async () => { advances++; return identity(); } },
+    onCleanupError: error => { errors.push(error); done.resolve(); } });
+  assert.equal(await owner.join(authenticatedJoin), null); assert.equal(socket.connected, false);
+  gate.resolve(); await done.promise;
+  assert.equal(errors.length, 1); assert.equal(advances, 0); await owner.close();
+});
+
+test("issuance policy mismatch fails closed before CAS", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options(); let advances = 0;
+  const owner = attachResumeSocket(socket, { ...opts, memberships: new ResumeMemberships(opts.bindings),
+    issue: async () => ({ ...issuedJoin(), authVersion: 2 }),
+    store: { advanceGeneration: async () => { advances++; return identity(); } } });
+  assert.equal(await owner.join(authenticatedJoin), null); assert.equal(advances, 0);
+  assert.equal(socket.connected, false); await owner.close();
+});
+
+
 test("private outbound delivers exact current binding only, never copies or wrong rooms", async t => {
   const f = await fixture(t), { socket, client } = await f.connect(), opts = options();
   const memberships = new ResumeMemberships(opts.bindings);

@@ -3,7 +3,8 @@ import type { Socket } from "socket.io";
 import { ResumeAdmission } from "./resume-admission";
 import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeBindings, ResumeBinding } from "./resume-bindings";
-import type { ResumeIdentity, ResumeStore } from "./resume-store";
+import type { ResumeIdentity, ResumeStore, ResumeCredential } from "./resume-store";
+import { isValidRoomId } from "./room-id";
 import type { ResumeMemberships } from "./resume-membership";
 
 type Options = {
@@ -14,12 +15,17 @@ type Options = {
   onCleanupError: (error: unknown) => void;
   capacity?: ResumeCapacity;
   timeoutMs?: number;
+  // Trusted server-authenticated input only; never wire directly to client data.
+  issue?: ResumeStore["issueAfterAuthenticatedJoin"];
+  issueCapacity?: ResumeCapacity;
   // Opt-in private composition. Shared with this exact bindings registry.
   memberships?: Pick<ResumeMemberships, "install">;
 };
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
   admit: (request: Parameters<ResumeAdmission["admit"]>[0]) => Promise<ResumeBinding | null>;
+  join: (authenticated: { roomId: string; username: string; authVersion: number }) =>
+    Promise<Readonly<{ credential: Readonly<ResumeCredential>; binding: ResumeBinding }> | null>;
   close: () => Promise<void>;
 }>;
 
@@ -28,6 +34,7 @@ export type ResumeSocketOwner = Readonly<{
 const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner;
   subscribe: (release: () => void) => (() => void) | null }>();
 const capacity = new ResumeCapacity(100);
+const issuanceCapacity = new ResumeCapacity(100);
 
 // Server-object identity check; never accept a copied owner or a different socket.
 export function ownsResumeSocket(socket: Socket, owner: ResumeSocketOwner): boolean {
@@ -97,8 +104,10 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     closeAutomatically();
     socket.disconnect(true);
   };
-  const admit: ResumeSocketOwner["admit"] = request => {
+  let mode: "join" | "resume" | undefined;
+  const admitInternal: ResumeSocketOwner["admit"] = request => {
     const flight = admission.admit(request);
+    if (!mode && admission.ownsAttempt(flight)) mode = "resume";
     if (!memberships || !admission.ownsAttempt(flight)) return flight;
     const previous = flights.get(flight);
     if (previous) return previous;
@@ -115,7 +124,59 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     flights.set(flight, result);
     return result;
   };
-  const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, close });
+  const admit: ResumeSocketOwner["admit"] = request => {
+    if (mode === "join") return Promise.resolve(null);
+    return admitInternal(request);
+  };
+  let joinKey: string | undefined;
+  let joinFlight: ReturnType<ResumeSocketOwner["join"]> | undefined;
+  let joined: ResumeBinding | undefined;
+  const join: ResumeSocketOwner["join"] = authenticated => {
+    const { roomId, username, authVersion } = authenticated;
+    if (closed || !socket.connected || mode === "resume" || !options.issue || !memberships ||
+        typeof roomId !== "string" || !isValidRoomId(roomId) || typeof username !== "string" ||
+        !username.trim() || username.length > 64 || !Number.isSafeInteger(authVersion) || authVersion < 1) {
+      return Promise.resolve(null);
+    }
+    const key = JSON.stringify([roomId, username, authVersion]);
+    if (joinFlight) return key === joinKey && (!joined || bindings.isCurrent(joined))
+      ? joinFlight : Promise.resolve(null);
+    mode = "join"; joinKey = key; // reserve before any hook or asynchronous work
+    const release = (options.issueCapacity ?? issuanceCapacity).acquire();
+    if (!release) { terminate(); return joinFlight = Promise.resolve(null); }
+    const deadline = performance.now() + (options.timeoutMs ?? 10_000);
+    const live = () => !closed && socket.connected && performance.now() < deadline;
+    let timer: ReturnType<typeof setTimeout>;
+    let timedOut = false;
+    const work = Promise.resolve().then(async () => {
+      if (!live()) return null;
+      const issued = await options.issue!(roomId, username, authVersion);
+      if (!live() || !issued || issued.roomId !== roomId || issued.username !== username ||
+          issued.authVersion !== authVersion || issued.generation !== 0) return null;
+      const credential = Object.freeze({ roomId, sessionId: issued.sessionId, token: issued.token });
+      const binding = await admitInternal({ credential, expectedGeneration: 0, operationId: randomUUID() });
+      if (!live() || !binding || !bindings.isCurrent(binding)) return null;
+      joined = binding;
+      return Object.freeze({ credential, binding });
+    });
+    const timeout = new Promise<null>(resolve => {
+      timer = setTimeout(() => { timedOut = true; terminate(); resolve(null); }, options.timeoutMs ?? 10_000);
+    });
+    const settled = work.then(value => {
+      clearTimeout(timer); release();
+      if (!value) terminate();
+      return value;
+    }, error => {
+      clearTimeout(timer); release(); terminate();
+      if (timedOut) {
+        try { onCleanupError(error); }
+        catch (reportError) { console.error("Join late error reporter failed", reportError); }
+      }
+      throw error;
+    });
+    return joinFlight = Promise.race([settled, timeout]);
+  };
+  const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, join, close });
   owners.set(socket, { options, owner, subscribe: release => {
     if (closed) return null;
     releases.add(release);
