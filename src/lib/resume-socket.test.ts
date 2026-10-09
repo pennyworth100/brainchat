@@ -9,6 +9,109 @@ import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
 import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
 import type { ResumeIdentity } from "./resume-store";
+import { syncResumeSocket } from "./resume-sync";
+
+async function syncFixture(t: TestContext) {
+  const f = await fixture(t), transport = await f.connect(), opts = options();
+  let now = 0;
+  opts.bindings = new ResumeBindings(10, () => now);
+  const members = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(transport.socket, { ...opts, memberships: members });
+  t.after(() => owner.close());
+  const binding = await owner.admit(request()); assert.ok(binding);
+  return { ...f, ...transport, opts, members, owner, binding, expire: () => { now = binding.expiresAt; } };
+}
+
+test("sync rejects wrong room, copied authority and another physical socket before read", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let reads = 0, acks = 0;
+  const reader = { read: async () => { reads++; return []; } }, ack = () => { acks++; };
+  const payload = { roomId: "candy986" };
+  for (const roomId of ["other123", "invalid", 12, undefined]) {
+    assert.equal(await syncResumeSocket(f.socket, f.owner, f.binding, f.members, reader, { roomId }, ack), false);
+  }
+  assert.equal(await syncResumeSocket(f.socket, { ...f.owner }, f.binding, f.members, reader, payload, ack), false);
+  assert.equal(await syncResumeSocket(f.socket, f.owner, { ...f.binding }, f.members, reader, payload, ack), false);
+  assert.equal(await syncResumeSocket(other.socket, f.owner, f.binding, f.members, reader, payload, ack), false);
+  assert.deepEqual([reads, acks], [0, 0]);
+});
+
+test("sync probe is local liveness only, including during a pending DB read", async t => {
+  const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let reads = 0;
+  const reader = { read: async () => { reads++; return gate.promise; } }, replies: unknown[] = [];
+  const run = (probeOnly: boolean) => syncResumeSocket(f.socket, f.owner, f.binding, f.members, reader,
+    { roomId: "candy986", probeOnly }, reply => { replies.push(reply); });
+  const pending = run(false);
+  assert.equal(await run(true), true); assert.equal(reads, 1); assert.deepEqual(replies, [{ ok: true }]);
+  await f.owner.close(); assert.equal(await run(true), false);
+  gate.resolve([]); assert.equal(await pending, false); assert.equal(replies.length, 1);
+});
+
+test("sync rejects overlapping reads and performs fresh reads after settlement", async t => {
+  const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let reads = 0;
+  const reader = { read: async () => { reads++; return gate.promise; } }, replies: unknown[] = [];
+  const run = () => syncResumeSocket(f.socket, f.owner, f.binding, f.members, reader,
+    { roomId: "candy986" }, reply => { replies.push(reply); });
+  const pending = run(); assert.equal(await run(), false); assert.equal(reads, 1);
+  gate.resolve([{ id: 7 }]); assert.equal(await pending, true); assert.equal(await run(), true);
+  assert.equal(reads, 2); assert.equal(replies.length, 2);
+});
+
+test("sync drops delayed ACK on owner close, disconnect, expiry and replacement", async t => {
+  for (const kind of ["close", "disconnect", "expiry", "replacement"]) {
+    const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let acks = 0;
+    const pending = syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+      { read: async () => gate.promise }, { roomId: "candy986" }, () => { acks++; });
+    if (kind === "close") await f.owner.close();
+    if (kind === "disconnect") f.socket.disconnect(true);
+    if (kind === "expiry") f.expire();
+    if (kind === "replacement") {
+      const next = await f.connect();
+      const owner = attachResumeSocket(next.socket, { ...f.opts, memberships: f.members,
+        store: { advanceGeneration: async () => identity(2) } });
+      t.after(() => owner.close()); assert.ok(await owner.admit(request(1)));
+    }
+    gate.resolve([{ id: 7 }]); assert.equal(await pending, false); assert.equal(acks, 0);
+  }
+});
+
+test("sync denial and late failure never ACK and release read reservation", async t => {
+  const f = await syncFixture(t); let acks = 0;
+  const run = (read: () => Promise<readonly unknown[] | null>) => syncResumeSocket(f.socket, f.owner,
+    f.binding, f.members, { read }, { roomId: "candy986" }, () => { acks++; });
+  assert.equal(await run(async () => null), false);
+  const gate = deferred<void>();
+  const failed = run(async () => { await gate.promise; throw Error("late DB failure"); });
+  gate.resolve(); await assert.rejects(failed, /late DB failure/); assert.equal(acks, 0);
+  assert.equal(await run(async () => []), true); assert.equal(acks, 1);
+});
+
+test("sync snapshots request and recomputes presence at handoff", async t => {
+  const f = await syncFixture(t), gate = deferred<readonly unknown[]>(), replies: unknown[] = [];
+  const payload = { roomId: "candy986", probeOnly: false };
+  const pending = syncResumeSocket(f.socket, f.owner, f.binding, f.members,
+    { read: async binding => { assert.equal(binding, f.binding); return gate.promise; } }, payload,
+    reply => { replies.push(reply); });
+  payload.roomId = "other123"; payload.probeOnly = true;
+  const peer = await f.connect(), owner = attachResumeSocket(peer.socket, { ...f.opts, memberships: f.members,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "peer", username: "Bob" }) } });
+  t.after(() => owner.close()); const req = request(); req.credential.sessionId = "peer";
+  assert.ok(await owner.admit(req)); gate.resolve([{ id: 7 }]); assert.equal(await pending, true);
+  assert.equal(replies.length, 1);
+  const reply = replies[0] as { history: unknown[]; users: string[] };
+  assert.deepEqual(reply.history, [{ id: 7 }]); assert.deepEqual(reply.users.sort(), ["Alice", "Bob"]);
+  assert.deepEqual(Object.keys(reply).sort(), ["history", "users"]);
+});
+
+test("sync handoff exceptions do not replay ACK and release reservation", async t => {
+  const f = await syncFixture(t); let acks = 0, reads = 0;
+  const reader = { read: async () => { reads++; return []; } };
+  await assert.rejects(syncResumeSocket(f.socket, f.owner, f.binding, f.members, reader,
+    { roomId: "candy986" }, () => { acks++; throw Error("ACK handoff"); }), /ACK handoff/);
+  assert.deepEqual([reads, acks], [1, 1]);
+  assert.equal(await syncResumeSocket(f.socket, f.owner, f.binding, f.members, reader,
+    { roomId: "candy986" }, () => { acks++; }), true);
+  assert.deepEqual([reads, acks], [2, 2]);
+});
 
 const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
 
