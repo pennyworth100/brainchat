@@ -25,6 +25,11 @@ export type ResumeSocketOwner = Readonly<{
 const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner }>();
 const capacity = new ResumeCapacity(100);
 
+// Server-object identity check; never accept a copied owner or a different socket.
+export function ownsResumeSocket(socket: Socket, owner: ResumeSocketOwner): boolean {
+  return owners.get(socket)?.owner === owner;
+}
+
 // PRIVATE, not registered by server.ts. One module instance in one server process.
 // Repeated installation requires the same options object; a competing installer
 // fails before creating an admission, listener or incarnation.

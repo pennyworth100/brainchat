@@ -5,6 +5,7 @@ import { Server, type Socket as ServerSocket } from "socket.io";
 import { io, type Socket } from "socket.io-client";
 import { attachResumeSocket } from "./resume-socket";
 import { ResumeBindings } from "./resume-bindings";
+import { ResumeMemberships } from "./resume-membership";
 import type { ResumeIdentity } from "./resume-store";
 
 const request = (generation = 0) => ({ credential: { sessionId: "session-a", roomId: "candy986",
@@ -38,6 +39,99 @@ function options() {
     bindings: new ResumeBindings(10, () => 0),
     prepare: async () => async () => {}, onCleanupError: (error: unknown): void => { assert.fail(String(error)); } };
 }
+
+test("membership successor physically evicts old socket without deleting successor", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings);
+  const old = attachResumeSocket(first.socket, opts), before = await old.admit(request());
+  assert.ok(before);
+  const lease = members.install(first.socket, old, before); assert.ok(lease);
+  assert.equal(members.install(first.socket, old, before), lease);
+  // Test-only room proves actual eviction removes broadcast membership.
+  await first.socket.join("test-only-private-room");
+  let disconnects = 0;
+  first.socket.on("disconnect", () => { disconnects++; lease.release(); });
+  const next = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => identity(2) } });
+  const binding = await next.admit(request(1)); assert.ok(binding);
+  const successor = members.install(second.socket, next, binding); assert.ok(successor);
+  assert.equal(first.socket.connected, false); assert.equal(first.socket.rooms.size, 0);
+  assert.equal(disconnects, 1); assert.equal(lease.isCurrent(), false);
+  assert.equal(lease.release(), false); await old.close();
+  assert.equal(successor.isCurrent(), true); assert.equal(opts.bindings.isCurrent(binding), true);
+  assert.equal(members.install(first.socket, old, before), null);
+  assert.equal(second.socket.rooms.has("candy986"), false);
+  second.socket.disconnect(true); await next.close();
+  assert.equal(successor.isCurrent(), false); assert.equal(successor.release(), false);
+});
+
+test("membership rejects copied owners, wrong physical socket and stale bindings", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), owner = attachResumeSocket(first.socket, opts);
+  const binding = await owner.admit(request()); assert.ok(binding);
+  assert.equal(members.install(second.socket, owner, binding), null);
+  assert.equal(members.install(first.socket, { ...owner }, binding), null);
+  assert.equal(members.install(first.socket, owner, { ...binding }), null);
+  const lease = members.install(first.socket, owner, binding); assert.ok(lease);
+  assert.equal(lease.release(), true); assert.equal(lease.release(), false);
+  assert.equal(opts.bindings.isCurrent(binding), false);
+  assert.equal(members.install(first.socket, owner, binding), null);
+  await owner.close();
+});
+
+test("membership capacity rejects unrelated sessions but permits exact replacement", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  assert.throws(() => new ResumeMemberships(opts.bindings, 0), /capacity/);
+  const members = new ResumeMemberships(opts.bindings, 1), old = attachResumeSocket(first.socket, opts);
+  const before = await old.admit(request()); assert.ok(before);
+  const lease = members.install(first.socket, old, before); assert.ok(lease);
+  const unrelated = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId: "session-b" }) } });
+  const otherRequest = request(); otherRequest.credential.sessionId = "session-b";
+  const other = await unrelated.admit(otherRequest); assert.ok(other);
+  assert.equal(members.install(second.socket, unrelated, other), null);
+  assert.equal(lease.isCurrent(), true); assert.equal(first.socket.connected, true);
+  const third = await f.connect();
+  const next = attachResumeSocket(third.socket, { ...opts,
+    store: { advanceGeneration: async () => identity(2) } });
+  const binding = await next.admit(request(1)); assert.ok(binding);
+  const successor = members.install(third.socket, next, binding); assert.ok(successor);
+  assert.equal(first.socket.connected, false); assert.equal(successor.release(), true);
+  assert.ok(members.install(second.socket, unrelated, other));
+  await old.close(); await next.close(); await unrelated.close();
+});
+
+test("membership rechecks successor after reentrant old disconnect closes it", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), old = attachResumeSocket(first.socket, opts);
+  const before = await old.admit(request()); assert.ok(before);
+  assert.ok(members.install(first.socket, old, before));
+  const next = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => identity(2) } });
+  const binding = await next.admit(request(1)); assert.ok(binding);
+  first.socket.once("disconnect", () => second.socket.disconnect(true));
+  assert.equal(members.install(second.socket, next, binding), null);
+  assert.equal(opts.bindings.isCurrent(binding), false);
+  await old.close(); await next.close();
+});
+
+test("failed physical eviction fences candidate without reviving old authority", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), old = attachResumeSocket(first.socket, opts);
+  const before = await old.admit(request()); assert.ok(before);
+  const lease = members.install(first.socket, old, before); assert.ok(lease);
+  const next = attachResumeSocket(second.socket, { ...opts,
+    store: { advanceGeneration: async () => identity(2) } });
+  const binding = await next.admit(request(1)); assert.ok(binding);
+  const disconnect = first.socket.disconnect;
+  first.socket.disconnect = () => { throw Error("eviction failed"); };
+  try { assert.throws(() => members.install(second.socket, next, binding), /eviction failed/); }
+  finally { first.socket.disconnect = disconnect; }
+  assert.equal(lease.isCurrent(), false); assert.equal(opts.bindings.isCurrent(binding), false);
+  assert.equal(opts.bindings.isCurrent(before), false);
+  assert.equal(members.install(second.socket, next, binding), null);
+  await old.close(); await next.close();
+});
 
 test("real socket has one immutable owner, server incarnation and no public resume handler", async t => {
   const f = await fixture(t), { socket } = await f.connect(), opts = options();
