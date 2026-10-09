@@ -9,7 +9,7 @@ for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-du
   "bytes", "successor", "work-fails", "commit-lost", "commit-sync", "durable-denied"] as const) {
   test(`upload durable gate: ${mode}`, async () => {
     const bindings = new ResumeBindings();
-    const identity = { sessionId: "upload", roomId: "upload123", username: "Guest",
+    const identity = { sessionId: "upload", roomId: "files123", username: "Guest",
       authVersion: 1, generation: 1, issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) };
     const binding = await bindings.activate(identity, "transport_upload_1", async () => {}, () => true);
     assert.ok(binding);
@@ -62,7 +62,7 @@ for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-du
 
 test("pending upload COMMIT stays unsettled and retains capacity past deadline", async () => {
   const bindings = new ResumeBindings();
-  const binding = await bindings.activate({ sessionId: "pending", roomId: "upload123", username: "Guest",
+  const binding = await bindings.activate({ sessionId: "pending", roomId: "files123", username: "Guest",
     authVersion: 1, generation: 1, issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
   }, "transport_upload_pending", async () => {}, () => true);
   assert.ok(binding);

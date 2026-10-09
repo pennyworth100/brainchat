@@ -722,14 +722,14 @@ try {
   check(deniedOutcome.completed && !deniedOutcome.result.authorized);
   await outcomeAdmission.close();
   // Admitted HTTP lifetime: real DB checks, no public handler or file effects.
-  await a.query("INSERT INTO rooms (id) VALUES ('upload123')");
+  await a.query("INSERT INTO rooms (id) VALUES ('files123')");
   const uploadBindings = new ResumeBindings();
   let uploadClock = 0;
   const uploads = new ResumeUploadAdmissions(uploadBindings, undefined, 1024, 100, () => uploadClock);
   const uploadGate = new ResumeUploadOperationGate(operationPool, uploads);
   const makeUpload = async () => {
-    const policy = (await a.query("SELECT auth_version FROM rooms WHERE id = 'upload123'")).rows[0].auth_version;
-    const session = await first.issueAfterAuthenticatedJoin("upload123", "Uploader", policy);
+    const policy = (await a.query("SELECT auth_version FROM rooms WHERE id = 'files123'")).rows[0].auth_version;
+    const session = await first.issueAfterAuthenticatedJoin("files123", "Uploader", policy);
     assert.ok(session);
     const credential = { roomId: session.roomId, sessionId: session.sessionId, token: session.token };
     const transport = "upload_" + session.sessionId;
@@ -769,7 +769,7 @@ try {
       uploadPid = (await probe.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
       probe.release();
       await a.query("BEGIN");
-      if (mode === "policy") await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'upload123'");
+      if (mode === "policy") await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
       else {
         await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [binding.sessionId]);
         if (mode === "durable-successor") await first.advanceGeneration(fixture.credential, 1, opB, socketB);
@@ -796,7 +796,7 @@ try {
     if (contention) { await waitForBlockedSecond(uploadPid); await a.query("COMMIT"); }
     const result = await pending;
     if (finishSuccessor) { finishSuccessor(); await successor; }
-    const rows = (await a.query("SELECT id FROM messages WHERE room_id = 'upload123' AND content = $1", ["upload-" + mode])).rowCount;
+    const rows = (await a.query("SELECT id FROM messages WHERE room_id = 'files123' AND content = $1", ["upload-" + mode])).rowCount;
     if (mode === "disconnect") {
       check(result.completed && result.result.authorized);
       check(rows === 1 && writes === 1);
