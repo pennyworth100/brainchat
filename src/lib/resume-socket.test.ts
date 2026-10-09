@@ -11,6 +11,91 @@ import type { ResumeIdentity } from "./resume-store";
 
 const authenticatedJoin = { roomId: "candy986", username: "Alice", authVersion: 1 };
 
+async function presenceFixture(t: TestContext) {
+  const f = await fixture(t); let now = 0;
+  const opts = { ...options(), bindings: new ResumeBindings(10, () => now) };
+  const members = new ResumeMemberships(opts.bindings);
+  const owners: ReturnType<typeof attachResumeSocket>[] = [];
+  t.after(async () => { await Promise.all(owners.map(owner => owner.close())); });
+  async function add(sessionId: string, roomId = "candy986", generation = 1,
+    prepare = opts.prepare) {
+    const transport = await f.connect();
+    const owner = attachResumeSocket(transport.socket, { ...opts, memberships: members, prepare,
+      store: { advanceGeneration: async () => ({ ...identity(generation), sessionId, roomId }) } });
+    owners.push(owner);
+    const req = request(generation - 1);
+    req.credential.sessionId = sessionId; req.credential.roomId = roomId;
+    return { ...transport, owner, pending: owner.admit(req) };
+  }
+  return { members, add, expire: () => { now = 1000; } };
+}
+
+test("presence is frozen, room-local and counts logical sessions, not equal usernames", async t => {
+  const f = await presenceFixture(t);
+  for (const [id, room] of [["b", "candy986"], ["a", "candy986"], ["c", "other123"]]) {
+    assert.ok(await (await f.add(id, room)).pending);
+  }
+  const snapshot = f.members.presence("candy986");
+  assert.deepEqual(snapshot, { count: 2, users: [{ id: "a", username: "Alice" }, { id: "b", username: "Alice" }] });
+  assert.ok(Object.isFrozen(snapshot)); assert.ok(Object.isFrozen(snapshot.users));
+  assert.ok(snapshot.users.every(Object.isFrozen));
+  assert.deepEqual(f.members.presence("missing123"), { count: 0, users: [] });
+  assert.equal(f.members.presence("other123").count, 1);
+});
+
+test("presence hides fenced preparation and preserves logical ID on replacement", async t => {
+  const f = await presenceFixture(t), first = await f.add("a"); assert.ok(await first.pending);
+  const before = f.members.presence("candy986");
+  const entered = deferred<void>(), ready = deferred<void>();
+  const next = await f.add("a", "candy986", 2, async () => {
+    entered.resolve(); await ready.promise; return async () => {};
+  });
+  await entered.promise;
+  assert.equal(first.socket.connected, true); assert.equal(f.members.presence("candy986").count, 0);
+  ready.resolve(); assert.ok(await next.pending);
+  assert.equal(first.socket.connected, false);
+  assert.deepEqual(f.members.presence("candy986"), before);
+  await first.owner.close(); assert.deepEqual(f.members.presence("candy986"), before);
+});
+
+test("presence removes closed, disconnected and expired members without mutating old snapshots", async t => {
+  const f = await presenceFixture(t), a = await f.add("a"), b = await f.add("b"), c = await f.add("c");
+  await Promise.all([a.pending, b.pending, c.pending]);
+  const before = f.members.presence("candy986"); assert.equal(before.count, 3);
+  await a.owner.close(); assert.equal(a.socket.connected, true);
+  b.socket.disconnect(true);
+  assert.deepEqual(f.members.presence("candy986").users, [{ id: "c", username: "Alice" }]);
+  f.expire(); assert.equal(c.socket.connected, true);
+  assert.equal(f.members.presence("candy986").count, 0); assert.equal(before.count, 3);
+});
+
+test("sender exclusion rejects copied, wrong-room and replaced bindings", async t => {
+  const f = await presenceFixture(t), a = await f.add("a"), b = await f.add("b"), c = await f.add("c", "other123");
+  const sender = await a.pending; assert.ok(sender); await b.pending; await c.pending;
+  const emitted = [0, 0, 0];
+  [a, b, c].forEach((x, i) => x.socket.onAnyOutgoing(() => { emitted[i]++; }));
+  assert.equal(f.members.broadcastExcept({ ...sender }, "candy986", "system-message", "x"), 0);
+  assert.equal(f.members.broadcastExcept(sender, "other123", "system-message", "x"), 0);
+  assert.equal(f.members.broadcastExcept(sender, "candy986", "system-message", "x"), 1);
+  assert.deepEqual(emitted, [0, 1, 0]);
+  const replacement = await f.add("a", "candy986", 2); assert.ok(await replacement.pending);
+  assert.equal(f.members.broadcastExcept(sender, "candy986", "system-message", "stale"), 0);
+  assert.deepEqual(emitted, [0, 1, 0]);
+});
+
+test("sender fanout stops on reentrant sender close and drops expired senders", async t => {
+  const f = await presenceFixture(t), a = await f.add("a"), b = await f.add("b"), c = await f.add("c");
+  const sender = await a.pending; assert.ok(sender); await b.pending; await c.pending;
+  let last = 0;
+  b.socket.onAnyOutgoing(() => { void a.owner.close(); });
+  c.socket.onAnyOutgoing(() => { last++; });
+  assert.equal(f.members.broadcastExcept(sender, "candy986", "system-message", "x"), 1);
+  assert.equal(last, 0);
+  const d = await f.add("d"); const expired = await d.pending; assert.ok(expired);
+  f.expire();
+  assert.equal(f.members.broadcastExcept(expired, "candy986", "system-message", "x"), 0);
+});
+
 test("timed out issuance retains capacity until actual settlement", async t => {
   const f = await fixture(t), opts = options(), issueCapacity = new ResumeCapacity(1);
   const gate = deferred<void>(), entered = deferred<void>(); let issues = 0;

@@ -8,6 +8,10 @@ export type ResumeMembership = Readonly<{
   release: () => boolean;
 }>;
 type Slot = { socket: Socket; lease: ResumeMembership };
+export type ResumePresence = Readonly<{
+  users: readonly Readonly<{ id: string; username: string }>[];
+  count: number;
+}>;
 const outboundEvents = new Set(["room-info", "chat-history", "room-snapshot", "system-message",
   "user-count", "user-list", "chat-message", "chat-image", "chat-file"]);
 export type ResumeOutboundEvent = "room-info" | "chat-history" | "room-snapshot" |
@@ -21,6 +25,21 @@ export class ResumeMemberships {
   private readonly sockets = new WeakMap<Socket, Slot>();
   constructor(private readonly bindings: ResumeBindings, private readonly capacity = 10_000) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw Error("Invalid membership capacity");
+  }
+
+  // Fresh immutable logical-session projection. Data, not authorization:
+  // recompute after async work. Ordering and IDs survive transport replacement.
+  presence(roomId: string): ResumePresence {
+    const users = [...this.sessions.values()]
+      .filter(slot => slot.lease.binding.roomId === roomId && slot.lease.isCurrent())
+      .map(({ lease: { binding } }) => Object.freeze({ id: binding.sessionId, username: binding.username }))
+      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    return Object.freeze({ users: Object.freeze(users), count: users.length });
+  }
+
+  private current(binding: ResumeBinding, roomId: string): boolean {
+    const slot = this.sessions.get(binding.sessionId);
+    return binding.roomId === roomId && slot?.lease.binding === binding && slot.lease.isCurrent();
   }
 
   // PRIVATE outbound seam. Call AFTER all async reads/authorization, with inert
@@ -42,6 +61,19 @@ export class ResumeMemberships {
     let sent = 0;
     for (const binding of candidates) {
       if (this.send(binding, roomId, event, payload)) sent++;
+    }
+    return sent;
+  }
+
+  // Sender-originated fanout, never an arbitrary session-ID exclusion. Invalid
+  // or copied senders fail closed. Reentrant sender loss stops remaining sends.
+  broadcastExcept(sender: ResumeBinding, roomId: string, event: ResumeOutboundEvent, payload: unknown): number {
+    if (!this.current(sender, roomId)) return 0;
+    const candidates = [...this.sessions.values()].map(slot => slot.lease.binding);
+    let sent = 0;
+    for (const binding of candidates) {
+      if (!this.current(sender, roomId)) break;
+      if (binding !== sender && this.send(binding, roomId, event, payload)) sent++;
     }
     return sent;
   }
