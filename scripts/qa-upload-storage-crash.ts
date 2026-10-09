@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes, createHash } from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool, type PoolClient } from "pg";
@@ -104,9 +104,10 @@ async function main() {
         check(signal === "SIGKILL");
         expectedCharge += ceiling;
         // Entirely fresh DB pool and filesystem reads after the worker is dead.
-        const restarted = new Pool({ connectionString, options: "-c search_path=" + schema });
+        const recoveryPool = new Pool({ connectionString, options: "-c search_path=" + schema });
+        const restarted = await recoveryPool.connect();
         try {
-          await restarted.query("BEGIN READ ONLY");
+          await restarted.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
           const charge = (await restarted.query("SELECT * FROM resume_upload_budget")).rows[0];
           check(Number(charge.reserved_bytes) === expectedCharge && Number(charge.capacity_bytes) === ceiling * 2);
           const attempts = (await restarted.query("SELECT * FROM resume_upload_attempts ORDER BY storage_key")).rows;
@@ -126,8 +127,8 @@ async function main() {
           check(receipts.length === (mode === "staged" ? 0 : 1));
           check(Number((await restarted.query("SELECT count(*) FROM messages")).rows[0].count) === receipts.length);
           const referenced = new Set(receipts.map(r => JSON.parse(r.content).url.split("/")[2]));
-          const orphans = attempts.filter(a => !referenced.has(a.storage_key));
-          check(orphans.length === 1 && orphans[0].client_message_id === "crash_staged");
+          const unreferenced = attempts.filter(a => !referenced.has(a.storage_key));
+          check(unreferenced.length === 1 && unreferenced[0].client_message_id === "crash_staged");
           if (mode === "lost-ack") {
             const receipt = receipts[0], file = JSON.parse(receipt.content);
             check(message.commit === "unknown" && receipt.session_id === message.sessionId &&
@@ -139,14 +140,85 @@ async function main() {
           check(Number((await restarted.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes) === expectedCharge);
           await restarted.query("COMMIT");
           evidence.push({ mode, signal, reservedBytes: expectedCharge, files: names.length,
-            receipts: receipts.length, orphanAttempts: orphans.length, readOnlyRecovery: true });
-        } finally { await restarted.end(); }
+            receipts: receipts.length, unreferencedAtObservation: unreferenced.length, readOnlyInventory: true });
+        } finally { restarted.release(true); await recoveryPool.end(); }
       } finally {
         if (child.exitCode === null && child.signalCode === null) {
           const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
         }
       }
     }
+    // Adversarial FIXTURE mutations below are not reconciliation operations.
+    // A future collector must observe these states without repairing them.
+    const committed = (await pool.query(`SELECT a.*, r.message_id FROM resume_upload_attempts a
+      JOIN resume_message_receipts r USING (session_id, client_message_id)`)).rows[0];
+    check(!!committed && committed.message_id !== null);
+    const snapshot = async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        check((await client.query("SHOW transaction_read_only")).rows[0].transaction_read_only === "on");
+        const attempts = (await client.query("SELECT * FROM resume_upload_attempts ORDER BY storage_key")).rows;
+        // Preserve tombstones and independently inventory file messages: receipts
+        // cascade on session expiry, but messages and attempt provenance survive.
+        const receipts = (await client.query(`SELECT r.*, m.content FROM resume_message_receipts r
+          LEFT JOIN messages m ON m.id=r.message_id`)).rows;
+        const messages = (await client.query("SELECT id, room_id, content FROM messages WHERE type='file'")).rows;
+        const budget = (await client.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0];
+        await client.query("COMMIT");
+        return { attempts, receipts, messages, charged: Number(budget.reserved_bytes) };
+      } finally { client.release(true); }
+    };
+    const baseline = await snapshot();
+    check(baseline.attempts.length === 2 && baseline.receipts.length === 1 && baseline.messages.length === 1);
+    const missingPath = join(root, committed.storage_key, "blob");
+    await rm(missingPath); // Deliberate corruption of this harness-owned fixture.
+    await assert.rejects(stat(missingPath), { code: "ENOENT" }); checks++;
+    const missing = await snapshot();
+    check(missing.messages[0].id === committed.message_id && missing.receipts.length === 1);
+    check(missing.charged === ceiling * 2);
+    evidence.push({ case: "missing-blob", classification: "referenced-blob-missing", charged: missing.charged });
+
+    const unknownKey = randomBytes(32).toString("hex");
+    await mkdir(join(root, unknownKey)); // Even a syntactically valid key proves no ownership.
+    const unknown = await snapshot();
+    check((await readdir(root)).includes(unknownKey));
+    check(!unknown.attempts.some(a => a.storage_key === unknownKey));
+    check(unknown.charged === ceiling * 2);
+    evidence.push({ case: "unknown-directory", classification: "unattributed-path", charged: unknown.charged });
+
+    // Conflicting references cannot be hidden by reducing paths to a Set.
+    const duplicate = (await pool.query(`INSERT INTO messages (room_id, username, type, content)
+      VALUES ('files123', 'Other', 'file', $1) RETURNING id`, [baseline.messages[0].content])).rows[0];
+    const ambiguous = await snapshot();
+    check(ambiguous.messages.length === 2 && ambiguous.receipts.length === 1);
+    check(ambiguous.messages.every(m => JSON.parse(m.content).url === "/uploads/" + committed.storage_key + "/blob"));
+    check(ambiguous.charged === ceiling * 2);
+    evidence.push({ case: "duplicate-reference", classification: "ambiguous-provenance", charged: ambiguous.charged });
+    await pool.query("DELETE FROM messages WHERE id=$1", [duplicate.id]);
+
+    // Real ON DELETE SET NULL; observation uses a separate read-only transaction.
+    await pool.query("DELETE FROM messages WHERE id=$1", [committed.message_id]);
+    const tombstone = await snapshot();
+    check(tombstone.receipts.length === 1 && tombstone.receipts[0].message_id === null &&
+      tombstone.receipts[0].content === null);
+    check(tombstone.messages.length === 0 && tombstone.attempts.length === 2);
+    check(tombstone.charged === ceiling * 2);
+    evidence.push({ case: "tombstone", classification: "logical-receipt-without-storage-reference", charged: tombstone.charged });
+
+    // Restore the fixture message via explicit identity, then relink its receipt.
+    // This is test setup, NEVER a permitted recovery/replay operation.
+    await pool.query(`INSERT INTO messages (id, room_id, username, type, content)
+      VALUES ($1, 'files123', 'Uploader', 'file', $2)`, [committed.message_id, baseline.messages[0].content]);
+    await pool.query("UPDATE resume_message_receipts SET message_id=$1 WHERE session_id=$2",
+      [committed.message_id, committed.session_id]);
+    await pool.query("DELETE FROM room_resume_sessions WHERE id=$1", [committed.session_id]);
+    const expired = await snapshot();
+    check(expired.receipts.length === 0 && expired.messages.length === 1);
+    check(expired.attempts.length === 2 && expired.attempts.some(a => a.storage_key === committed.storage_key));
+    check(JSON.parse(expired.messages[0].content).url === "/uploads/" + committed.storage_key + "/blob");
+    check(expired.charged === ceiling * 2);
+    evidence.push({ case: "session-cascade", classification: "message-reference-without-retry-receipt", charged: expired.charged });
     console.log(JSON.stringify({ passed: checks, evidence,
       limitations: "Worker crash only; no PostgreSQL/power-loss, disk-quota, public HTTP or backup proof" }));
   } finally {

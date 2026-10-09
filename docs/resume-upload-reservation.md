@@ -43,3 +43,8 @@ The isolated PostgreSQL harness uses the generated migration, 32 competing calls
 real INSERT rollback, a real committed-but-lost ACK, then SIGKILL of a Node worker
 after its acknowledged reservation and verification using a fresh DB pool. It is
 an application-process crash test, NOT a PostgreSQL server/power-loss test.
+
+The [read-only reconciliation contract](resume-upload-reconciliation.md) records
+how missing blobs, unknown paths, tombstones, receipt cascades and conflicting
+references must remain explicit. No production collector or reclaim operation
+is implemented; an absent receipt never proves a blob is unreferenced.
