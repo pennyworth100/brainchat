@@ -5,9 +5,9 @@ import { ResumeBindings } from "./resume-bindings";
 import { ResumeOperationGate } from "./resume-operation";
 import { ResumeMessageWriter } from "./resume-message";
 
-for (const uncertain of [false, true]) {
-  test(uncertain ? "message writer rejects uncertain COMMIT without retry" :
-    "message receipt waits for COMMIT, and preserves server identity", async () => {
+for (const durable of [false, true]) for (const uncertain of [false, true]) {
+  test((durable ? "durable: " : "plain: ") + (uncertain ? "message writer rejects uncertain COMMIT without retry" :
+    "message receipt waits for COMMIT, and preserves server identity"), async () => {
     const bindings = new ResumeBindings();
     const binding = await bindings.activate({
       sessionId: "fixture", roomId: "candy986", username: "Guest", authVersion: 1,
@@ -29,14 +29,15 @@ for (const uncertain of [false, true]) {
           reachCommit(); await finish;
           if (uncertain) throw new Error("uncertain commit");
         }
-        return { rowCount: 1 };
+        return { rowCount: 1, rows: [] };
       },
       release: (error: boolean) => { destroyed = error; },
     } as unknown as PoolClient;
     const writer = new ResumeMessageWriter(new ResumeOperationGate(
       { connect: async () => client } as Pick<Pool, "connect">, bindings));
     let settled = false;
-    const pending = writer.save(binding, "literal ' text");
+    const pending = durable ? writer.saveOnce(binding, "key", "literal ' text") :
+      writer.save(binding, "literal ' text");
     void pending.then(() => { settled = true; }, () => { settled = true; });
     await committing;
     assert.equal(settled, false);

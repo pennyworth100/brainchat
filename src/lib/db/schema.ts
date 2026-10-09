@@ -1,7 +1,9 @@
 import {
   bigint,
   integer,
+  index,
   pgTable,
+  primaryKey,
   serial,
   text,
   timestamp,
@@ -59,3 +61,14 @@ export const roomResumeSessions = pgTable("room_resume_sessions", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
 });
+
+// Receipt survives message deletion (NULL is a tombstone), but not session deletion.
+export const resumeMessageReceipts = pgTable("resume_message_receipts", {
+  sessionId: text("session_id").notNull().references(() => roomResumeSessions.id, { onDelete: "cascade" }),
+  clientMessageId: varchar("client_message_id", { length: 128 }).notNull(),
+  payloadHash: varchar("payload_hash", { length: 64 }).notNull(),
+  messageId: integer("message_id").references(() => messages.id, { onDelete: "set null" }),
+}, table => [
+  primaryKey({ columns: [table.sessionId, table.clientMessageId] }),
+  index("resume_receipts_message_idx").on(table.messageId),
+]);

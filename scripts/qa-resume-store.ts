@@ -31,6 +31,8 @@ try {
     .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"');
   await a.query(sql);
   await a.query(await readFile("drizzle/0005_free_blazing_skull.sql", "utf8"));
+  await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
+    .replaceAll('"public".', '"' + schema + '".'));
   await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
   const first = new ResumeStore(a);
   const second = new ResumeStore(b);
@@ -349,7 +351,85 @@ try {
   check(await first.lookup(oldCredential) === null);
   check(await first.advanceGeneration(oldCredential, 0, opA, socketA) === null);
   check((await first.issueAfterAuthenticatedJoin("claim123", "Current auth", 4))?.authVersion === 4);
-  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, independent DB clients, claim/issue policy races, CAS and durable-operation locks; not socket resume" }));
+  // Retry receipts use a separate room so earlier exact row-count assertions stay useful.
+  await a.query("INSERT INTO rooms (id) VALUES ('retry123')");
+  const retrySession = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
+  assert.ok(retrySession);
+  const retryCredential = { roomId: "retry123", sessionId: retrySession.sessionId, token: retrySession.token };
+  const retryIdentity = await first.advanceGeneration(retryCredential, 0, opA, socketA);
+  assert.ok(retryIdentity);
+  const retryBinding = await bindings.activate(retryIdentity, socketA, async () => {}, () => true);
+  assert.ok(retryBinding);
+  const retryCount = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'retry123'")).rows[0].count);
+  const parallelPool = new Pool({ connectionString: process.env.RESUME_TEST_DATABASE_URL,
+    options: "-c search_path=" + schema, max: 1 });
+  try {
+    const parallelWriter = new ResumeMessageWriter(new ResumeOperationGate(parallelPool, bindings));
+    const sameKey = await Promise.all([writer.saveOnce(retryBinding, "same-key", "text"),
+      parallelWriter.saveOnce(retryBinding, "same-key", "text")]);
+    check(sameKey.every(r => r.authorized));
+    check(sameKey[0].authorized && sameKey[1].authorized && sameKey[0].value.id === sameKey[1].value.id);
+    check(await retryCount() === 1);
+    await assert.rejects(writer.saveOnce(retryBinding, "same-key", "changed"), /identity conflict/); checks++;
+    check(await retryCount() === 1);
+    for (const invalid of ["", "x".repeat(129), "white space", "key\n"]) {
+      await assert.rejects(writer.saveOnce(retryBinding, invalid, "text")); checks++;
+    }
+    check(!(await writer.saveOnce({ ...retryBinding }, "same-key", "text")).authorized);
+    check((await writer.saveOnce(retryBinding, "other-key", "text")).authorized);
+    const peer = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
+    assert.ok(peer);
+    const peerIdentity = await first.advanceGeneration({ roomId: peer.roomId, sessionId: peer.sessionId, token: peer.token }, 0, opA, socketB);
+    assert.ok(peerIdentity);
+    const peerBinding = await bindings.activate(peerIdentity, socketB, async () => {}, () => true);
+    assert.ok(peerBinding);
+    check((await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    await a.query("INSERT INTO messages (room_id, username, content, client_message_id) VALUES ('retry123', 'Writer', 'text', 'same-key')");
+    check(await retryCount() === 4);
+    // Real database COMMIT succeeds; only its acknowledgment is lost.
+    let commitAttempts = 0;
+    const lostAckPool = { connect: async () => {
+      const real = await parallelPool.connect();
+      return { query: async (...args: unknown[]) => {
+        const result = await (real.query as Function).apply(real, args);
+        if (args[0] === "COMMIT") { commitAttempts++; throw new Error("lost COMMIT ack"); }
+        return result;
+      }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    } };
+    const lostAckWriter = new ResumeMessageWriter(new ResumeOperationGate(lostAckPool, bindings));
+    await assert.rejects(lostAckWriter.saveOnce(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
+    check(commitAttempts === 1 && await retryCount() === 5);
+    const successorIdentity = await first.advanceGeneration(retryCredential, 1, opB, socketB);
+    assert.ok(successorIdentity);
+    const successor = await bindings.activate(successorIdentity, socketB, async () => {}, () => true);
+    assert.ok(successor);
+    check(!(await writer.saveOnce(retryBinding, "lost-ack", "durable")).authorized);
+    const resolved = await writer.saveOnce(successor, "lost-ack", "durable");
+    check(resolved.authorized && resolved.value.message === "durable");
+    check(await retryCount() === 5);
+    // Receipt insertion failure rolls back its preceding message INSERT.
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_reject CHECK (client_message_id <> 'rollback-key')");
+    await assert.rejects(writer.saveOnce(successor, "rollback-key", "rollback")); checks++;
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_reject");
+    check(await retryCount() === 5);
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE client_message_id = 'rollback-key'")).rows[0].count) === 0);
+    assert.ok(resolved.authorized);
+    await a.query("DELETE FROM messages WHERE id = $1", [resolved.value.id]);
+    await assert.rejects(writer.saveOnce(successor, "lost-ack", "durable"), /no longer available/); checks++;
+    check(await retryCount() === 4);
+    check(await first.revoke(retryCredential, 2));
+    check(!(await writer.saveOnce(successor, "same-key", "text")).authorized);
+    await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [peer.sessionId]);
+    check(!(await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    // Policy denial must hold even when the requested receipt already exists.
+    await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '1 hour' WHERE id = $1", [peer.sessionId]);
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'retry123'");
+    check(!(await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    await a.query("DELETE FROM room_resume_sessions WHERE room_id = 'retry123'");
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [[retrySession.sessionId, peer.sessionId]])).rows[0].count) === 0);
+    check(await retryCount() === 4); // session cleanup does not delete room history
+  } finally { await parallelPool.end(); }
+  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable message retry receipts; not socket resume" }));
 } finally {
   await a.query("ROLLBACK");
   await a.query('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE');
