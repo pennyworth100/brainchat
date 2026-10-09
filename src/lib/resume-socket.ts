@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Socket } from "socket.io";
 import { ResumeAdmission } from "./resume-admission";
+import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeBindings, ResumeBinding } from "./resume-bindings";
 import type { ResumeIdentity, ResumeStore } from "./resume-store";
 
@@ -10,6 +11,8 @@ type Options = {
   // No room membership, history, presence or other outbound access here.
   prepare: (identity: ResumeIdentity) => Promise<() => Promise<void>>;
   onCleanupError: (error: unknown) => void;
+  capacity?: ResumeCapacity;
+  timeoutMs?: number;
 };
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
@@ -20,6 +23,7 @@ export type ResumeSocketOwner = Readonly<{
 // Key by the actual server Socket object, NEVER socket.id, handshake or client ID.
 // Keep closed owners until the socket is collected: reattachment cannot reopen it.
 const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner }>();
+const capacity = new ResumeCapacity(100);
 
 // PRIVATE, not registered by server.ts. One module instance in one server process.
 // Repeated installation requires the same options object; a competing installer
@@ -35,7 +39,10 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   let closed = false;
   let closing: Promise<void> | undefined;
   const admission = new ResumeAdmission(store, bindings, incarnation,
-    () => !closed && socket.connected, prepare);
+    () => !closed && socket.connected, prepare, {
+      capacity: options.capacity ?? capacity, timeoutMs: options.timeoutMs ?? 10_000,
+      onLateError: onCleanupError,
+    });
   const close = () => {
     closed = true; // synchronous permanent fence, even if CAS/prepare never settles
     socket.off("disconnecting", onDisconnect);

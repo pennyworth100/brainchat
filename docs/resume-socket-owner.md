@@ -15,9 +15,10 @@ failure. Late CAS cannot activate; late preparation releases its exact lease.
 Automatic disconnect cleanup reports errors once; explicit close still rejects.
 Preparation must clean its own partial failure and must not expose any data.
 
-This step does NOT bound pending CAS/preparation, cancel DB work, evict a superseded
-socket, or gate outbound broadcasts. `close()` can wait indefinitely for work;
-resource caps and deadlines are the next private lifecycle step. A superseded
+Owners now share a pending-work budget and admission deadline; see
+[admission limits](resume-admission-limits.md). They do NOT cancel DB work, evict a
+superseded socket, or gate outbound broadcasts. `close()` can wait indefinitely
+for work even after an admission timeout. A superseded
 socket remains physically connected until separately closed, although its binding
 is fenced. Never put these sockets in public room broadcast membership yet.
 

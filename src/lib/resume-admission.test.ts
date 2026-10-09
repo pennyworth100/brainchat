@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ResumeAdmission } from "./resume-admission";
 import { ResumeBindings } from "./resume-bindings";
+import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeIdentity } from "./resume-store";
 
 const request = () => ({ credential: { sessionId: "session-a", roomId: "candy986",
@@ -14,6 +15,109 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+test("hung CAS times out without freeing capacity; exact retries share one permit", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const capacity = new ResumeCapacity(1), db = deferred<ResumeIdentity>();
+  let calls = 0, prepared = 0;
+  const limits = { capacity, timeoutMs: 100, onLateError: (e: unknown) => assert.fail(String(e)) };
+  const make = (id: string) => new ResumeAdmission({ advanceGeneration: async () => { calls++; return db.promise; } },
+    new ResumeBindings(10, () => 0), id, () => true, async () => { prepared++; return async () => {}; }, limits);
+  const a = make("server-transport-1"), p = a.admit(request());
+  assert.equal(a.admit(request()), p); await Promise.resolve();
+  const overloaded = make("server-transport-2");
+  assert.equal(await overloaded.admit(request()), null); assert.equal(calls, 1);
+  t.mock.timers.tick(100); assert.equal(await p, null);
+  assert.equal(capacity.acquire(), null); assert.equal(await a.admit(request()), null);
+  let closed = false; const closing = a.close().then(() => { closed = true; });
+  await Promise.resolve(); assert.equal(closed, false);
+  db.resolve(identity()); await closing; assert.equal(prepared, 0);
+  const permit = capacity.acquire(); assert.ok(permit); permit(); permit();
+  assert.equal(await overloaded.admit(request()), null); // overload never reopens
+  const successor = make("server-transport-3"); assert.ok(await successor.admit(request()));
+  assert.equal(calls, 2); await successor.close();
+});
+
+test("hung preparation times out; late failing cleanup is reported and permit retained until settlement", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const capacity = new ResumeCapacity(1), entered = deferred<void>(), ready = deferred<void>();
+  const cleanup = deferred<void>(), cleanupEntered = deferred<void>(), reported = deferred<unknown>();
+  let reports = 0, cleanups = 0;
+  const failure = Error("late exact lease failed");
+  const a = new ResumeAdmission({ advanceGeneration: async () => identity() }, new ResumeBindings(10, () => 0),
+    "server-transport-1", () => true, async () => {
+      entered.resolve(); await ready.promise;
+      return async () => { cleanups++; cleanupEntered.resolve(); await cleanup.promise; };
+    }, { capacity, timeoutMs: 100, onLateError: e => { reports++; reported.resolve(e); } });
+  const p = a.admit(request()); await entered.promise;
+  t.mock.timers.tick(100); assert.equal(await p, null); assert.equal(capacity.acquire(), null);
+  ready.resolve(); await cleanupEntered.promise; assert.equal(capacity.acquire(), null);
+  cleanup.reject(failure); assert.equal(await reported.promise, failure); await a.close();
+  assert.equal(cleanups, 1); assert.equal(reports, 1);
+  const permit = capacity.acquire(); assert.ok(permit); permit();
+});
+
+test("disconnected pending work retains shared budget and never activates", async () => {
+  const capacity = new ResumeCapacity(1), db = deferred<ResumeIdentity>();
+  const a = new ResumeAdmission({ advanceGeneration: async () => db.promise }, new ResumeBindings(10, () => 0),
+    "server-transport-1", () => true, async () => assert.fail("no preparation"),
+    { capacity, timeoutMs: 1000, onLateError: e => assert.fail(String(e)) });
+  const p = a.admit(request()); await Promise.resolve(); const closing = a.close();
+  assert.equal(capacity.acquire(), null); db.resolve(identity());
+  assert.equal(await p, null); await closing;
+  const release = capacity.acquire(); assert.ok(release); release();
+});
+
+test("completed admission clears deadline and releases permit, not active authority", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const capacity = new ResumeCapacity(1), bindings = new ResumeBindings(10, () => 0);
+  const a = new ResumeAdmission({ advanceGeneration: async () => identity() }, bindings,
+    "server-transport-1", () => true, async () => async () => {},
+    { capacity, timeoutMs: 100, onLateError: e => assert.fail(String(e)) });
+  const p = a.admit(request()), binding = await p; assert.ok(binding);
+  t.mock.timers.tick(1000); assert.ok(bindings.isCurrent(binding)); assert.equal(a.admit(request()), p);
+  const release = capacity.acquire(); assert.ok(release); release(); await a.close();
+});
+
+test("invalid limits reject construction before side effects", () => {
+  for (const n of [0, -1, NaN, Infinity, 1.5]) assert.throws(() => new ResumeCapacity(n), /capacity/);
+  for (const timeoutMs of [0, -1, NaN, Infinity, 1.5, 2_147_483_648]) {
+    assert.throws(() => new ResumeAdmission({ advanceGeneration: async () => identity() }, new ResumeBindings(),
+      "server-transport-1", () => true, async () => async () => {},
+      { capacity: new ResumeCapacity(), timeoutMs, onLateError: () => {} }), /deadline/);
+  }
+});
+
+test("monotonic deadline fences late CAS even before the timer callback runs", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 0, prepared = 0;
+  t.mock.method(performance, "now", () => now);
+  const db = deferred<ResumeIdentity>(), capacity = new ResumeCapacity(1);
+  const a = new ResumeAdmission({ advanceGeneration: async () => db.promise }, new ResumeBindings(10, () => 0),
+    "server-transport-1", () => true, async () => { prepared++; return async () => {}; },
+    { capacity, timeoutMs: 100, onLateError: e => assert.fail(String(e)) });
+  const p = a.admit(request()); await Promise.resolve();
+  now = 100; db.resolve(identity()); // timers deliberately not advanced
+  assert.equal(await p, null); assert.equal(prepared, 0);
+  assert.equal(await a.admit(request()), null); await a.close();
+  const release = capacity.acquire(); assert.ok(release); release();
+});
+
+test("late uncertain CAS rejection is observed once and never replayed", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const db = deferred<ResumeIdentity>(), reported = deferred<unknown>(), capacity = new ResumeCapacity(1);
+  let calls = 0, reports = 0;
+  const failure = Error("commit acknowledgment lost");
+  const a = new ResumeAdmission({ advanceGeneration: async () => { calls++; return db.promise; } },
+    new ResumeBindings(10, () => 0), "server-transport-1", () => true,
+    async () => assert.fail("must not prepare"), { capacity, timeoutMs: 100,
+      onLateError: e => { reports++; reported.resolve(e); } });
+  const p = a.admit(request()); await Promise.resolve(); t.mock.timers.tick(100);
+  assert.equal(await p, null); db.reject(failure);
+  assert.equal(await reported.promise, failure); await a.close();
+  assert.equal(await a.admit(request()), null); assert.equal(calls, 1); assert.equal(reports, 1);
+  const release = capacity.acquire(); assert.ok(release); release();
+});
 
 test("pre-CAS admission reserves one operation, coalesces exact retry and snapshots input", async () => {
   const db = deferred<ResumeIdentity | null>(), bindings = new ResumeBindings(10, () => 0);
