@@ -22,7 +22,9 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Official Image mirror; digest verified against Docker Hub.
+        # See docs/ci-postgres-image.md for provenance and update procedure.
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_DB: dimle_ci
           POSTGRES_USER: dimle
