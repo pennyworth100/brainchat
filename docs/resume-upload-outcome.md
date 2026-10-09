@@ -80,6 +80,31 @@ an uncertain COMMIT permits deletion of either attempt's file. No fanout occurs;
 `inserted:false` must never replay a broadcast. An acknowledged DB commit is not
 proof of network delivery or attachment durability across storage loss.
 
-Next: exclusive server-owned file lifecycle/capability, bounded multipart
-streaming, then fenced publication. No cleanup on deadline/unknown COMMIT.
-This database-only primitive is not upload acceptance.
+## Private exclusive byte storage (not wired)
+
+`ResumeFileStorage` now stages one attempt per exact admission grant under a
+trusted, absolute, stable, server-controlled upload root. ALL ancestor directories
+must also be trusted; this is not protection against a hostile same-uid process
+renaming ancestors. It rejects a symlink root and exclusively creates a random
+256-bit attempt directory (0700) and `blob` (0600, O_EXCL/O_NOFOLLOW). User names
+never become paths. Existing/colliding paths are never overwritten.
+
+Bounded metadata is copied before filesystem effects. Raw chunks are admitted
+before copying/writing, then snapshotted and written serially with short-write
+progress checks and grant checks before each write. Size/hash derive from the
+actual completed bytes. Successful file fsync/close, directory fsync/close and
+root fsync/close precede issuing an immutable, exact registry/grant-bound result.
+`resolve` rejects copied/cross-registry results, different/released/denied grants.
+This is local filesystem durability policy, not a storage-provider backup proof.
+
+All file closes and iterator finalization are awaited. No files are deleted and
+no leases are released, even after failure. The caller must retain the lease
+until source/file/DB work settles. A pending source read is not timer-cancelled:
+the future bounded HTTP parser must implement safe stream cancellation. This
+sink does not bound upstream buffers or metadata parser memory, validate MIME
+contents, prove malware safety, or authorize durable DB policy by itself.
+
+Next: checked composition of this capability with the private structural DB
+primitive, cancellation during delayed writes/reads, bounded
+multipart/HTTP ownership, then fenced publication and durable reconciliation.
+No public handler imports this module. This is not full upload acceptance.
