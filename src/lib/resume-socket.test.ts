@@ -9,6 +9,92 @@ import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeIdentity } from "./resume-store";
 
+test("private outbound delivers exact current binding only, never copies or wrong rooms", async t => {
+  const f = await fixture(t), { socket, client } = await f.connect(), opts = options();
+  const memberships = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships });
+  const binding = await owner.admit(request()); assert.ok(binding);
+  let emitted = 0; socket.onAnyOutgoing(() => { emitted++; });
+  assert.equal(memberships.send({ ...binding }, "candy986", "chat-history", []), false);
+  assert.equal(memberships.send(binding, "other123", "chat-history", []), false);
+  assert.equal(memberships.send(binding, "candy986", "disconnect" as "chat-history", []), false);
+  assert.equal(emitted, 0);
+  const received = new Promise(resolve => client.once("chat-history", resolve));
+  assert.equal(memberships.send(binding, "candy986", "chat-history", [{ id: 1 }]), true);
+  assert.deepEqual(await received, [{ id: 1 }]); assert.equal(emitted, 1);
+  await owner.close();
+  assert.equal(socket.connected, true);
+  assert.equal(memberships.send(binding, "candy986", "chat-history", []), false);
+  assert.equal(emitted, 1);
+});
+
+test("outbound fences old socket during successor preparation, before physical eviction", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const memberships = new ResumeMemberships(opts.bindings);
+  const old = attachResumeSocket(first.socket, { ...opts, memberships });
+  const before = await old.admit(request()); assert.ok(before);
+  const entered = deferred<void>(), ready = deferred<void>();
+  const next = attachResumeSocket(second.socket, { ...opts, memberships,
+    store: { advanceGeneration: async () => identity(2) },
+    prepare: async () => { entered.resolve(); await ready.promise; return async () => {}; } });
+  const pending = next.admit(request(1)); await entered.promise;
+  assert.equal(first.socket.connected, true);
+  assert.equal(memberships.send(before, "candy986", "chat-history", ["old"]), false);
+  assert.equal(memberships.broadcast("candy986", "chat-message", "pending"), 0);
+  ready.resolve(); const binding = await pending; assert.ok(binding);
+  assert.equal(memberships.send(before, "candy986", "chat-history", ["delayed"]), false);
+  const received = new Promise(resolve => second.client.once("chat-message", resolve));
+  assert.equal(memberships.broadcast("candy986", "chat-message", "new"), 1);
+  assert.equal(await received, "new");
+  await old.close(); await next.close();
+});
+
+test("outbound checks absolute expiry at delivery, not at snapshot/read time", async t => {
+  const f = await fixture(t), { socket } = await f.connect(); let now = 0;
+  const opts = { ...options(), bindings: new ResumeBindings(10, () => now) };
+  const memberships = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships });
+  const binding = await owner.admit(request()); assert.ok(binding);
+  let emitted = 0; socket.onAnyOutgoing(() => { emitted++; });
+  now = 1000;
+  assert.equal(memberships.send(binding, "candy986", "room-snapshot", {}), false);
+  assert.equal(memberships.broadcast("candy986", "chat-message", {}), 0);
+  assert.equal(socket.connected, true); assert.equal(emitted, 0); await owner.close();
+});
+
+test("broadcast filters rooms and rechecks each recipient after reentrant close", async t => {
+  const f = await fixture(t), opts = options(), memberships = new ResumeMemberships(opts.bindings);
+  const owners: { owner: ReturnType<typeof attachResumeSocket>; socket: ServerSocket }[] = [];
+  for (const [sessionId, roomId] of [["a", "candy986"], ["b", "candy986"], ["c", "other123"]]) {
+    const { socket } = await f.connect();
+    const owner = attachResumeSocket(socket, { ...opts, memberships,
+      store: { advanceGeneration: async () => ({ ...identity(), sessionId, roomId }) } });
+    const req = request(); req.credential.sessionId = sessionId; req.credential.roomId = roomId;
+    assert.ok(await owner.admit(req)); owners.push({ owner, socket });
+  }
+  const emitted = [0, 0, 0];
+  owners.forEach(({ socket }, index) => socket.onAnyOutgoing(() => {
+    emitted[index]++;
+    if (index === 0) void owners[1].owner.close();
+  }));
+  assert.equal(memberships.broadcast("candy986", "chat-message", "hello"), 1);
+  assert.deepEqual(emitted, [1, 0, 0]);
+  assert.equal(memberships.broadcast("missing123", "chat-message", "hello"), 0);
+  await Promise.all(owners.map(({ owner }) => owner.close()));
+});
+
+test("admission without installed membership cannot send or receive a broadcast", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const memberships = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, opts);
+  const binding = await owner.admit(request()); assert.ok(binding);
+  assert.equal(opts.bindings.isCurrent(binding), true);
+  assert.equal(memberships.send(binding, "candy986", "chat-history", []), false);
+  assert.equal(memberships.broadcast("candy986", "chat-message", {}), 0);
+  await owner.close();
+});
+
+
 const request = (generation = 0) => ({ credential: { sessionId: "session-a", roomId: "candy986",
   token: Buffer.alloc(32, 1).toString("base64url") }, expectedGeneration: generation,
   operationId: `operation-${generation.toString().padStart(16, "0")}` });

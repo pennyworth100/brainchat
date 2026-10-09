@@ -32,4 +32,7 @@ Explicit owner close synchronously releases the exact membership and registry
 capacity even while asynchronous preparation cleanup is pending or fails. It
 does not physically disconnect that socket. Close subscriptions reject closed
 owners and are removed by lease release; late old-owner cleanup cannot release
-a successor. Admission-plus-install composition remains a separate next step.
+a successor. Admission-plus-install composition is implemented by the optional
+memberships dependency (see resume-lifecycle.md). Private outbound delivery is
+now available through send/broadcast (see resume-outbound.md); public migration
+is still pending.

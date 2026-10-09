@@ -8,15 +8,42 @@ export type ResumeMembership = Readonly<{
   release: () => boolean;
 }>;
 type Slot = { socket: Socket; lease: ResumeMembership };
+const outboundEvents = new Set(["room-info", "chat-history", "room-snapshot", "system-message",
+  "user-count", "user-list", "chat-message", "chat-image", "chat-file"]);
+export type ResumeOutboundEvent = "room-info" | "chat-history" | "room-snapshot" |
+  "system-message" | "user-count" | "user-list" | "chat-message" | "chat-image" | "chat-file";
 
-// PRIVATE logical membership only. No Socket.IO room joins, onlineUsers,
-// history, presence or broadcast access. Install AFTER admission, never prepare.
+// PRIVATE logical membership and exact outbound boundary. No public room joins,
+// onlineUsers or automatic presence/history. Install AFTER admission, never prepare.
 // Share one registry alongside one ResumeBindings instance per server process.
 export class ResumeMemberships {
   private readonly sessions = new Map<string, Slot>();
   private readonly sockets = new WeakMap<Socket, Slot>();
   constructor(private readonly bindings: ResumeBindings, private readonly capacity = 10_000) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw Error("Invalid membership capacity");
+  }
+
+  // PRIVATE outbound seam. Call AFTER all async reads/authorization, with inert
+  // server-built data. Success means handed to Socket.IO, not received/ACKed.
+  // An exact old binding must never redirect delayed history to its successor.
+  send(binding: ResumeBinding, roomId: string, event: ResumeOutboundEvent, payload: unknown): boolean {
+    const slot = this.sessions.get(binding.sessionId);
+    if (!outboundEvents.has(event) || binding.roomId !== roomId ||
+        slot?.lease.binding !== binding || !slot.lease.isCurrent()) return false;
+    slot.socket.emit(event, payload);
+    return true;
+  }
+
+  // Snapshot candidates, but revalidate each exact lease at its send boundary.
+  // Reentrant close/replacement of another recipient cannot leak a later packet.
+  // Do not use Socket.IO rooms: a physically connected stale socket may remain.
+  broadcast(roomId: string, event: ResumeOutboundEvent, payload: unknown): number {
+    const candidates = [...this.sessions.values()].map(slot => slot.lease.binding);
+    let sent = 0;
+    for (const binding of candidates) {
+      if (this.send(binding, roomId, event, payload)) sent++;
+    }
+    return sent;
   }
 
   install(socket: Socket, owner: ResumeSocketOwner, binding: ResumeBinding): ResumeMembership | null {
