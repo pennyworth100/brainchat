@@ -13,6 +13,13 @@ type Slot = { binding: ResumeBinding; active: boolean; cancelled: boolean };
 // checking isCurrent before an await does NOT protect a later side effect.
 export class ResumeBindings {
   private readonly slots = new Map<string, Slot>();
+  private readonly transports = new Map<string, Slot>();
+
+  private releaseTransport(slot: Slot) {
+    if (this.transports.get(slot.binding.transportId) === slot) {
+      this.transports.delete(slot.binding.transportId);
+    }
+  }
   constructor(private readonly capacity = 10_000, private readonly now = Date.now) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Invalid binding capacity");
   }
@@ -21,7 +28,10 @@ export class ResumeBindings {
   // No eviction of unexpired sessions: overload rejects instead of enabling replay.
   sweep() {
     for (const [id, slot] of this.slots) {
-      if (slot.binding.expiresAt <= this.now()) this.slots.delete(id);
+      if (slot.binding.expiresAt <= this.now()) {
+        this.releaseTransport(slot);
+        this.slots.delete(id);
+      }
     }
   }
 
@@ -32,6 +42,10 @@ export class ResumeBindings {
         !Number.isInteger(identity.generation) || identity.generation < 0 ||
         !/^[A-Za-z0-9_-]{16,128}$/.test(transportId)) return null;
     this.sweep();
+    // Reserve a server-owned transport for only one pending/active session.
+    // A conflict must not fence either session or run preparation.
+    const owner = this.transports.get(transportId);
+    if (owner && owner.binding.sessionId !== identity.sessionId) return null;
     const previous = this.slots.get(identity.sessionId);
     if (previous) {
       const b = previous.binding;
@@ -58,7 +72,9 @@ export class ResumeBindings {
     // Fence old authority BEFORE async preparation. Never roll back the generation
     // on failure. prepare must not publish data or grant privileges; transport
     // membership alone is insufficient. Caller cleans up failed/stale preparation.
+    if (previous) this.releaseTransport(previous);
     this.slots.set(binding.sessionId, candidate);
+    this.transports.set(transportId, candidate);
     try {
       await prepare();
       if (this.slots.get(binding.sessionId) !== candidate || candidate.cancelled ||
@@ -66,13 +82,17 @@ export class ResumeBindings {
       candidate.active = true;
       return binding;
     } finally {
-      if (!candidate.active) candidate.cancelled = true;
+      if (!candidate.active) {
+        candidate.cancelled = true;
+        this.releaseTransport(candidate);
+      }
     }
   }
 
   isCurrent(binding: ResumeBinding): boolean {
     const slot = this.slots.get(binding.sessionId);
-    return !!slot && slot.binding === binding && slot.active && !slot.cancelled &&
+    return !!slot && slot.binding === binding && this.transports.get(binding.transportId) === slot &&
+      slot.active && !slot.cancelled &&
       binding.expiresAt > this.now();
   }
 
@@ -83,6 +103,7 @@ export class ResumeBindings {
     if (!slot || slot.binding !== binding) return false;
     slot.active = false;
     slot.cancelled = true;
+    this.releaseTransport(slot);
     return true;
   }
 

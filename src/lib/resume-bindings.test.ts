@@ -3,6 +3,94 @@ import test from "node:test";
 import { ResumeBindings } from "./resume-bindings";
 import type { ResumeIdentity } from "./resume-store";
 
+test("pending and active transport ownership rejects another session before prepare", async () => {
+  const c = new ResumeBindings(10, () => 0), g = gate();
+  let calls = 0;
+  const prepare = async () => { calls++; };
+  const pending = c.activate(identity(), transport(1), () => g.promise, connected);
+  assert.equal(await c.activate(identity(1, "session-b"), transport(1), prepare, connected), null);
+  g.resolve();
+  const a = (await pending)!;
+  assert.equal(await c.activate(identity(1, "session-b"), transport(1), prepare, connected), null);
+  assert.equal(calls, 0);
+  assert.ok(c.isCurrent(a));
+  assert.equal(await c.activate(identity(), transport(1), prepare, connected), a);
+  assert.equal(calls, 0);
+  c.detach(a);
+  assert.ok(await c.activate(identity(1, "session-b"), transport(1), prepare, connected));
+  assert.equal(calls, 1);
+});
+
+test("conflicting replacement does not fence either existing session", async () => {
+  const c = new ResumeBindings(10, () => 0);
+  const a = (await c.activate(identity(), transport(1), ready, connected))!;
+  const b = (await c.activate(identity(1, "session-b"), transport(2), ready, connected))!;
+  assert.equal(await c.activate(identity(2), transport(2), ready, connected), null);
+  assert.ok(c.isCurrent(a));
+  assert.ok(c.isCurrent(b));
+  c.detach(b);
+  const next = (await c.activate(identity(2), transport(2), ready, connected))!;
+  assert.ok(c.isCurrent(next));
+  assert.equal(c.isCurrent(a), false);
+  assert.ok(await c.activate(identity(1, "session-c"), transport(1), ready, connected));
+});
+
+test("late failed prepare and old disconnect cannot release a different session owner", async () => {
+  const c = new ResumeBindings(10, () => 0), g = gate();
+  const pending = c.activate(identity(), transport(1), async () => {
+    await g.promise; throw Error("late failure");
+  }, connected);
+  const rejected = assert.rejects(pending, /late failure/);
+  assert.ok(c.disconnect("session-a", transport(1)));
+  const b = (await c.activate(identity(1, "session-b"), transport(1), ready, connected))!;
+  g.resolve(); await rejected;
+  assert.ok(c.disconnect("session-a", transport(1)));
+  assert.ok(c.isCurrent(b));
+  assert.equal(await c.activate(identity(1, "session-c"), transport(1), ready, connected), null);
+});
+
+test("late success after same-transport generation replacement preserves reservation", async () => {
+  const c = new ResumeBindings(10, () => 0), g = gate();
+  const pending = c.activate(identity(), transport(1), () => g.promise, connected);
+  const next = (await c.activate(identity(2), transport(1), ready, connected))!;
+  g.resolve();
+  assert.equal(await pending, null);
+  assert.ok(c.isCurrent(next));
+  assert.equal(await c.activate(identity(1, "session-b"), transport(1), ready, connected), null);
+});
+
+test("expiry sweep and late pending completion cannot erase a new transport owner", async () => {
+  let now = 0;
+  const c = new ResumeBindings(10, () => now), g = gate();
+  const pending = c.activate(identity(), transport(1), () => g.promise, connected);
+  now = 1000;
+  const fresh = { ...identity(1, "session-b"), expiresAt: new Date(2000) };
+  const b = (await c.activate(fresh, transport(1), ready, connected))!;
+  g.resolve();
+  assert.equal(await pending, null);
+  c.sweep();
+  assert.ok(c.isCurrent(b));
+  assert.equal(await c.activate({ ...fresh, sessionId: "session-c" }, transport(1), ready, connected), null);
+});
+
+test("failed, disconnected and expired activations release transport but retain fences", async () => {
+  for (const mode of ["throw", "disconnect", "expire"]) {
+    let now = 0;
+    const c = new ResumeBindings(10, () => now);
+    const result = c.activate(identity(), transport(1), async () => {
+      if (mode === "throw") throw Error("prepare");
+      if (mode === "expire") now = 1000;
+    }, () => mode !== "disconnect");
+    if (mode === "throw") await assert.rejects(result, /prepare/);
+    else assert.equal(await result, null);
+    assert.equal(await c.activate(identity(), transport(1), ready, connected), null);
+    const b = await c.activate({ ...identity(1, "session-b"), expiresAt: new Date(2000) },
+      transport(1), ready, connected);
+    assert.ok(b && c.isCurrent(b));
+  }
+});
+
+
 const identity = (generation = 1, sessionId = "session-a"): ResumeIdentity => ({
   sessionId, generation, roomId: "candy986", username: "Alice", authVersion: 1,
   issuedAt: new Date(0), expiresAt: new Date(1000),

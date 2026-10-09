@@ -147,9 +147,10 @@ try {
     const session = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 3);
     assert.ok(session);
     const credential = { roomId: session.roomId, sessionId: session.sessionId, token: session.token };
-    const identity = await first.advanceGeneration(credential, 0, opA, socketA);
+    const transportId = "transport_" + session.sessionId;
+    const identity = await first.advanceGeneration(credential, 0, opA, transportId);
     assert.ok(identity);
-    const binding = await bindings.activate(identity, socketA, async () => {}, () => true);
+    const binding = await bindings.activate(identity, transportId, async () => {}, () => true);
     assert.ok(binding);
     return { credential, binding };
   };
@@ -256,9 +257,9 @@ try {
   const currentSession = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
   assert.ok(currentSession);
   const currentIdentity = await first.advanceGeneration({ roomId: currentSession.roomId,
-    sessionId: currentSession.sessionId, token: currentSession.token }, 0, opA, socketA);
+    sessionId: currentSession.sessionId, token: currentSession.token }, 0, opA, "transport_" + currentSession.sessionId);
   assert.ok(currentIdentity);
-  const currentBinding = await bindings.activate(currentIdentity, socketA, async () => {}, () => true);
+  const currentBinding = await bindings.activate(currentIdentity, "transport_" + currentIdentity.sessionId, async () => {}, () => true);
   assert.ok(currentBinding);
   const writer = new ResumeMessageWriter(gate);
   const saved = await writer.save(currentBinding, "  literal ' $1 text  ");
@@ -280,9 +281,13 @@ try {
   const sibling = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
   assert.ok(sibling);
   const siblingIdentity = await first.advanceGeneration({ roomId: sibling.roomId,
-    sessionId: sibling.sessionId, token: sibling.token }, 0, opA, socketB);
+    sessionId: sibling.sessionId, token: sibling.token }, 0, opA, "transport_" + sibling.sessionId);
   assert.ok(siblingIdentity);
-  const siblingBinding = await bindings.activate(siblingIdentity, socketB, async () => {}, () => true);
+  let conflictingPrepare = false;
+  check(await bindings.activate(siblingIdentity, currentBinding.transportId,
+    async () => { conflictingPrepare = true; }, () => true) === null);
+  check(!conflictingPrepare && bindings.isCurrent(currentBinding));
+  const siblingBinding = await bindings.activate(siblingIdentity, "transport_" + siblingIdentity.sessionId, async () => {}, () => true);
   assert.ok(siblingBinding);
   const siblingSaved = await writer.save(siblingBinding, "agent");
   check(siblingSaved.authorized && secondSaved.authorized &&
@@ -357,9 +362,9 @@ try {
   const retrySession = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
   assert.ok(retrySession);
   const retryCredential = { roomId: "retry123", sessionId: retrySession.sessionId, token: retrySession.token };
-  const retryIdentity = await first.advanceGeneration(retryCredential, 0, opA, socketA);
+  const retryIdentity = await first.advanceGeneration(retryCredential, 0, opA, "transport_" + retrySession.sessionId);
   assert.ok(retryIdentity);
-  const retryBinding = await bindings.activate(retryIdentity, socketA, async () => {}, () => true);
+  const retryBinding = await bindings.activate(retryIdentity, "transport_" + retryIdentity.sessionId, async () => {}, () => true);
   assert.ok(retryBinding);
   const retryCount = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'retry123'")).rows[0].count);
   const parallelPool = new Pool({ connectionString: process.env.RESUME_TEST_DATABASE_URL,
@@ -380,9 +385,9 @@ try {
     check((await writer.saveOnce(retryBinding, "other-key", "text")).authorized);
     const peer = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
     assert.ok(peer);
-    const peerIdentity = await first.advanceGeneration({ roomId: peer.roomId, sessionId: peer.sessionId, token: peer.token }, 0, opA, socketB);
+    const peerIdentity = await first.advanceGeneration({ roomId: peer.roomId, sessionId: peer.sessionId, token: peer.token }, 0, opA, "transport_" + peer.sessionId);
     assert.ok(peerIdentity);
-    const peerBinding = await bindings.activate(peerIdentity, socketB, async () => {}, () => true);
+    const peerBinding = await bindings.activate(peerIdentity, "transport_" + peerIdentity.sessionId, async () => {}, () => true);
     assert.ok(peerBinding);
     check((await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
     await a.query("INSERT INTO messages (room_id, username, content, client_message_id) VALUES ('retry123', 'Writer', 'text', 'same-key')");
@@ -400,9 +405,9 @@ try {
     const lostAckWriter = new ResumeMessageWriter(new ResumeOperationGate(lostAckPool, bindings));
     await assert.rejects(lostAckWriter.saveOnce(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
     check(commitAttempts === 1 && await retryCount() === 5);
-    const successorIdentity = await first.advanceGeneration(retryCredential, 1, opB, socketB);
+    const successorIdentity = await first.advanceGeneration(retryCredential, 1, opB, "transport_" + retrySession.sessionId + "_successor");
     assert.ok(successorIdentity);
-    const successor = await bindings.activate(successorIdentity, socketB, async () => {}, () => true);
+    const successor = await bindings.activate(successorIdentity, "transport_" + successorIdentity.sessionId + "_successor", async () => {}, () => true);
     assert.ok(successor);
     check(!(await writer.saveOnce(retryBinding, "lost-ack", "durable")).authorized);
     const resolved = await writer.saveOnce(successor, "lost-ack", "durable");
@@ -463,9 +468,9 @@ try {
   // cannot resurrect the deleted session, even with a valid bearer.
   const target = fixtures[3];
   const targetCredential = { roomId: target.roomId, sessionId: target.sessionId, token: target.token };
-  const targetIdentity = await first.advanceGeneration(targetCredential, 0, opA, socketA);
+  const targetIdentity = await first.advanceGeneration(targetCredential, 0, opA, "transport_" + target.sessionId);
   assert.ok(targetIdentity);
-  const targetBinding = await bindings.activate(targetIdentity, socketA, async () => {}, () => true);
+  const targetBinding = await bindings.activate(targetIdentity, "transport_" + targetIdentity.sessionId, async () => {}, () => true);
   assert.ok(targetBinding);
   await a.query("BEGIN");
   await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [target.sessionId]);
@@ -492,9 +497,9 @@ try {
   // it, then the gate itself rejects and rolls back before publication.
   const busy = await first.issueAfterAuthenticatedJoin("clean123", "Busy", 1);
   assert.ok(busy);
-  const busyIdentity = await first.advanceGeneration({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token }, 0, opA, socketA);
+  const busyIdentity = await first.advanceGeneration({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token }, 0, opA, "transport_" + busy.sessionId);
   assert.ok(busyIdentity);
-  const busyBinding = await bindings.activate(busyIdentity, socketA, async () => {}, () => true);
+  const busyBinding = await bindings.activate(busyIdentity, "transport_" + busyIdentity.sessionId, async () => {}, () => true);
   assert.ok(busyBinding);
   const busyResult = await gate.run(busyBinding, async transaction => {
     // Change the fixture expiry within the owning transaction. Another worker
