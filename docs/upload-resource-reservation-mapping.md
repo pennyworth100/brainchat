@@ -1,5 +1,10 @@
 # Shared upload reservation: transaction and schema mapping
 
+Follow-up: the [private policy pin](upload-resource-policy-pin.md) implements
+immutable trusted-policy capture and locked-policy quote recomputation only.
+Connection authority, application vector SQL, additive constraints and physical
+admission remain unimplemented; the fixture below is not promoted to runtime.
+
 2026-10-09; source baseline `553c8af6226de2c936f8230619f77e054ab76ef1`,
 draft 3.0.11. **Design mapping only: no migration, budget seed, public wiring,
 refund, merge or deployment.** This is the concrete successor to the
