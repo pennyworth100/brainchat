@@ -45,6 +45,10 @@ jobs:
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py
+      - name: Real operation-gate socket loss (owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: npm run test:operation-wire
       - name: Retain fixture evidence (no keys or database files)
         if: always()
         uses: actions/upload-artifact@v4

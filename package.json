@@ -7,6 +7,7 @@
     "dev": "tsx server.ts",
     "build": "next build",
     "test": "node --import tsx --test src/**/*.test.ts && npm --prefix plugins/openclaw-dimle test",
+    "test:operation-wire": "python3 scripts/qa-operation-wire-fixture.py",
     "start": "node --import tsx server.ts",
     "db:migrate": "node --import tsx src/lib/db/migrate.ts",
     "db:generate": "drizzle-kit generate"
