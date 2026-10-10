@@ -11,7 +11,7 @@ const validText = (value: unknown): value is string => typeof value === "string"
 /** Inputs are trusted provisioning/server operation data, never request-selected
  * policy, charges, SQL or table names. Capture synchronously before any await.
  * Return value is ONLY for runUploadLedgerTransaction; never call independently.
- * Schema is a future additive migration, intentionally not installed/activated.
+ * Schema is additive migration 0009, intentionally not installed/activated live.
  */
 export function createUploadResourceSqlWork(
   pin: UploadResourcePolicyPin, policy: unknown, provenance: Provenance,

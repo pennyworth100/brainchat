@@ -1,7 +1,8 @@
 # Fixed-table resource accounting callback (inactive draft)
 
 `createUploadResourceSqlWork` composes the domain evaluator with the existing
-transaction lifecycle. It has **no runtime consumer, migration or storage grant**.
+transaction lifecycle. It has **no runtime consumer or storage grant**.
+Empty additive migration 0009 is not installed live.
 Only use the callback inside `runUploadLedgerTransaction`. A successful callback
 means prepared accounting, not committed accounting or permission to write files.
 
@@ -17,9 +18,9 @@ No retry, refund, upsert, replay, DDL, filesystem effect or transaction control 
 Errors or unexpected affected rows deny and the transaction wrapper rolls back;
 dispatched COMMIT uncertainty retains its UUID and both possible liabilities.
 
-## Required next schema and verification gates
+## Schema and verification gates
 
-Tables are intentionally not yet installed. Next additive migration must create
+Tables are intentionally not installed live. Additive migration 0009 creates
 empty `public.upload_resource_domains`, `upload_resource_policies` and
 `upload_resource_attempts`, leaving migration 0008 immutable. Domain primary key:
 database_identity/schema_identity/quota_domain; policy primary key additionally
@@ -33,9 +34,11 @@ least-privilege role ownership remain unverified. Policy changes and generation
 transitions MUST take the same domain lock, preserving liabilities and immutable
 attempt snapshots. Domain updates are not proof of a physical writer barrier.
 
-Before wiring storage, execute isolated real-PostgreSQL tests for concurrent
+The [schema proof](upload-resource-ledger-schema.md) executes actual migration,
+callback, transaction and lease on isolated real PostgreSQL for concurrent
 namespaces, capacity rejection, INSERT/UPDATE failure rollback, operation conflict,
-generation rollover with a blocked waiter, and ambiguous COMMIT. Fake-query tests
+generation rollover with a blocked waiter, and ambiguous COMMIT. This uses an
+explicit synthetic provider binding, not the real TLS authority. Fake-query tests
 only establish sequencing/decoding/parameters, never database atomicity or locks.
 Old singleton or vector experiment results are not this implementation's evidence.
 Provider TLS/cluster identity, physical fencing and all W01–W16 activation gates
