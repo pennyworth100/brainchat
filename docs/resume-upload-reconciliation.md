@@ -396,3 +396,19 @@ adapter throws synchronously. One close failure cannot skip other handles or
 expose raw exception details. No retry or claim of successfully closing a failed
 handle is made. Pending kernel I/O/close still has no hard wall-time bound and is
 not cancelled. No runtime integration or live volume access is added.
+# Isolated evidence composition regression
+
+`RESUME_TEST_DATABASE_URL=<isolated database> node --import tsx scripts/qa-upload-evidence.ts`
+creates a random schema and temporary upload root, then composes the **original**
+database, root and supplied-key content collector reports through the private
+evidence serializer. CI runs this fixture independently of public HTTP handlers.
+It preserves duplicate receipts, duplicate/conflicting messages, tombstones,
+DB-positive unread blobs and root-positive unattributed keys. A fully attempted
+input list coexists with incomplete DB/root observations; no aggregate PASS,
+absence, ownership or reclamation result is produced. Full serialized captures
+are included in the fixture output, with independently captured times, IDs and
+limits. Provenance remains caller-asserted and cross-store stability unproven.
+The fixture checks DB rows and file bytes/names remain unchanged (read atime is
+not asserted unchanged), then removes only its own schema and temporary root.
+This proves composition, not live-volume identity, a DB/FS snapshot, a writer
+barrier, backup/recovery or permission to activate reconciliation.
