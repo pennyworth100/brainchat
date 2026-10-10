@@ -238,8 +238,9 @@ remain identical. Cleanup awaits any pending query even on assertion failure.
 
 Local PostgreSQL 18.1: **79 assertions PASS**, TLSv1.3; database/role dropped and
 owned cluster stopped. The previous 65-assertion commit `f078d97` independently
-passed both full CI workflows, including PG16.15/18.6. The new pending-query case
-requires its own matrix results; prior CI is not evidence for this change.
+passed both full CI workflows, including PG16.15/18.6. That prior CI is not
+evidence for the pending-query addition; its later matrix coverage is recorded
+in the independently audited 112-assertion results below.
 This is actual in-flight SQL termination, not a TCP blackhole, COMMIT-response
 loss, transparent reconnection or automatic recovery. UNKNOWN replay and all
 physical/managed-provider activation gates remain blocked.
@@ -262,8 +263,9 @@ snapshots. The replacement PID's log contains neither UNKNOWN UUID. New pins and
 old-pin checkouts on the still-open poisoned provider remain denied without SQL.
 
 Local PostgreSQL 18.1: **97 assertions PASS**, TLSv1.3, typecheck PASS, owned
-database/role dropped and cluster stopped. PG16/18 CI results must be verified
-separately. This proves explicit replacement composition in a trusted disposable
+database/role dropped and cluster stopped. Later PG16/18 matrix coverage is
+recorded in the independently audited 112-assertion results below.
+This proves explicit replacement composition in a trusted disposable
 fixture, **not automatic recovery**, endpoint/failover provenance, network-fault
 recovery, UNKNOWN replay safety or physical fencing. There is no runtime wiring,
 live migration, seed, deployment, storage IO or permission change outside the
@@ -295,12 +297,28 @@ backend to disappear; the existing five-second server statement timeout assists
 server cleanup, not client network settlement. The Python child watchdog remains
 120 seconds, followed by owned-cluster shutdown; no wall-clock guarantee is
 claimed for the production provider or for SIGKILL/host loss. PASS is emitted
-only after the random database and role have been dropped. PG16/18 CI results
-must be verified independently before claiming matrix coverage for this case.
+only after the random database and role have been dropped.
 
 Corrected local PostgreSQL 18.1 run: **112 assertions PASS**, TLSv1.3, one
 connection, client rejection observed in 0 ms (millisecond clock resolution),
-separate backend cleanup in 5009 ms, database/role dropped and cluster stopped.
+separate backend cleanup in 5000 ms, database/role dropped and cluster stopped.
 The full local suite also passed 579 application + 5 plugin tests, typecheck,
 build and production-only dependency audit (0 vulnerabilities). No claim is
 made that the development dependency tree is vulnerability-free.
+
+At code head `295905e01df705f12670fbc33cd433edacb8dec8`, both complete CI
+workflows passed: [PR 38041386957](https://github.com/pennyworth100/brainchat/actions/runs/38041386957)
+and [push 38041383774](https://github.com/pennyworth100/brainchat/actions/runs/38041383774).
+All four PG16.15/18.6 TLSv1.3 archives were independently verified against their
+GitHub SHA-256 metadata: **112 assertions PASS each**, including the earlier
+pending-query termination and explicit-replacement cases. Full reports and
+PID-scoped multiline server logs were reviewed in the
+[independent audit](https://github.com/pennyworth100/brainchat/pull/20#issuecomment-6096240825).
+Observed client rejection was **0–1 ms** at millisecond clock resolution;
+separate backend cleanup was **5009–5021 ms**. These are fixture measurements,
+not a production latency bound: client settlement is not backend termination,
+and neither proves a silent-network-blackhole bound. Each fixture verified
+unchanged ledger rows/liabilities, no reconnect, backend disappearance before
+database/role removal and owned-cluster shutdown. The original UNKNOWN outcomes
+remain UNKNOWN without replay. All network-fault, managed-provider provenance,
+physical fencing and production-approval gates remain unchanged.
