@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createServer, createConnection, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
 import { createUploadLedgerProvider } from "../src/lib/upload-ledger-provider";
@@ -26,6 +27,7 @@ async function main() {
   const suffix = randomBytes(8).toString("hex");
   const database = "provider_qa_" + suffix, role = "provider_unprivileged_" + suffix;
   let db: Pool | undefined, created = false, roleCreated = false, checks = 0;
+  let resultReport: Record<string, unknown> | undefined;
   const providers: ReturnType<typeof createUploadLedgerProvider>[] = [];
   const check = (value: unknown) => { assert.ok(value); checks++; };
   try {
@@ -313,19 +315,116 @@ async function main() {
     check(log().slice(cursor).length === 0); // replacement never revives poisoned provider
     await busy.close();
     await replacement.close();
+    // Opaque TCP forwarding: TLS remains end-to-end to OUR fixture certificate.
+    // One provider/one connection only; never target an external endpoint/PID.
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const cut = () => { for (const socket of sockets) socket.destroy(); };
+    const proxy = createServer(client => {
+      sockets.add(client);
+      client.on("close", () => sockets.delete(client));
+      client.on("error", cut);
+      if (++connections !== 1) { client.destroy(); return; }
+      const upstream = createConnection({ host: "127.0.0.1", port: manifest.port });
+      sockets.add(upstream);
+      upstream.on("close", () => sockets.delete(upstream));
+      upstream.on("error", cut);
+      client.pipe(upstream).pipe(client);
+    });
+    let transport: Record<string, unknown> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        proxy.once("error", reject);
+        proxy.listen(0, "127.0.0.1", resolve);
+      });
+      const address = proxy.address();
+      assert.ok(address && typeof address !== "string");
+      const network = make({ user: role, port: address.port }), networkPin = network.pin(policy)!;
+      const acquiredNetwork = await network.checkout(networkPin);
+      check(acquiredNetwork.status === "acquired");
+      if (acquiredNetwork.status !== "acquired") throw Error("Proxy fixture checkout denied");
+      const lease = acquiredNetwork.lease;
+      const identity = (await lease.query("SELECT pg_backend_pid() AS pid, ssl, version FROM pg_stat_ssl WHERE pid=pg_backend_pid()")).rows[0];
+      check(identity.ssl === true && /^TLSv1\.[23]$/.test(identity.version));
+      const sql = "SELECT pg_catalog.pg_sleep(30) /* owned-tls-transport-disconnect */";
+      let networkSettled = false, networkDestroyed = false;
+      cursor = log().length;
+      const pendingNetwork = lease.query(sql).then(
+        () => { networkSettled = true; return { rejected: false, code: "", message: "" }; },
+        (error: { code?: string; message?: string }) => {
+          networkSettled = true;
+          return { rejected: true, code: error.code || "", message: error.message || "" };
+        });
+      let activityEvidence: Record<string, unknown> | undefined;
+      let cutAt = 0, settledMs = 0;
+      try {
+        const deadline = Date.now() + 2000;
+        do {
+          const row = (await db.query("SELECT datname,usename,state,query,wait_event_type,wait_event FROM pg_stat_activity WHERE pid=$1", [identity.pid])).rows[0];
+          if (row?.datname === database && row.usename === role && row.state === "active" &&
+              row.query === sql && row.wait_event_type === "Timeout" && row.wait_event === "PgSleep") {
+            activityEvidence = row; break;
+          }
+          await delay(10);
+        } while (!networkSettled && Date.now() < deadline);
+        check(activityEvidence !== undefined && !networkSettled && connections === 1 && sockets.size === 2);
+        check(lease.finalize(true) === "query-pending");
+        cutAt = Date.now(); cut(); // disconnect actual transport, NOT pg_terminate_backend
+        const outcome = await pendingNetwork;
+        settledMs = Date.now() - cutAt;
+        check(outcome.rejected && !["57014", "57P01"].includes(outcome.code) && settledMs < 2000);
+        await waitPoisoned(network);
+      } finally {
+        cut(); // also disconnect on failed observation before awaiting settlement
+        await pendingNetwork;
+        networkDestroyed = lease.finalize(true) === "destroyed";
+      }
+      check(networkSettled && networkDestroyed);
+      check(lease.finalize(true) === "already-finalized");
+      const networkLog = log().slice(cursor).split("\n").filter(line => line.includes("[" + identity.pid + "]")).join("\n");
+      check(networkLog.includes(sql));
+      check(!/(?:statement:|execute [^:]*:)\s*(BEGIN|INSERT|UPDATE|DELETE|COMMIT)\b/i.test(networkLog));
+      check(!networkLog.includes("terminating connection due to administrator command"));
+      cursor = log().length;
+      check(network.pin(policy) === null && (await network.checkout(networkPin)).status === "failed");
+      check(log().slice(cursor).length === 0 && connections === 1);
+      check(JSON.stringify(await state()) === JSON.stringify(replacedState));
+      transport = { mode: "opaque-loopback-tcp-disconnect", pid: identity.pid, tls: identity.version,
+        observed: activityEvidence, outcome: await pendingNetwork, connections, settledMs,
+        pendingFinalize: "query-pending", settledBeforeDestroy: networkSettled, destroyedOnce: networkDestroyed,
+        futureCheckout: "failed", ledgerUnchanged: true, administrativeTermination: false };
+      await network.close();
+      // Client rejection is immediate, but PG may still be sleeping until its
+      // server statement timeout. Independently await backend disappearance for
+      // cleanup; this is NOT the client's network-settlement bound.
+      const cleanupStarted = Date.now(), cleanupDeadline = cleanupStarted + 7000;
+      let backendGone = false;
+      do {
+        backendGone = (await db.query("SELECT pid FROM pg_stat_activity WHERE pid=$1", [identity.pid])).rowCount === 0;
+        if (backendGone) break;
+        await delay(25);
+      } while (Date.now() < cleanupDeadline);
+      check(backendGone);
+      transport.backendGoneBeforeDrop = backendGone;
+      transport.backendCleanupMs = Date.now() - cleanupStarted;
+    } finally {
+      cut();
+      await new Promise<void>((resolve, reject) => proxy.close(error => error ? reject(error) : resolve()));
+    }
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
-    console.log(JSON.stringify({ status: "PASS", checks, version, tls: ssl.version,
+    resultReport = { status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
       bootstrapRolePositiveOnly: false, fixtureLimitedRolePositive: true,
       fixtureOnlyExplicitGrants: true, sameLeaseProbeBeforeBegin: true,
       committed: valid.result, lostAcknowledgement: unknown.result,
       finalLiability: { bytes: 30, objects: 6 },
       backendTermination: failures, terminationPreservedLedger: true,
+      transportDisconnect: transport,
       explicitReplacement: { pid: fresh.pid, outcome: fresh.result, sameLeaseProbeBeforeBegin: true,
         commitCount: 1, insertCount: 1, originalRowsUnchanged: true, retainedUnknown: [unknown.result, terminated],
         unknownReplay: false, poisonedProviderRevived: false, automaticRecovery: false },
       actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "transaction", "SQL callback", "lease"],
-      excluded: ["managed-provider privileges", "clone uniqueness", "physical fencing", "network fault injection", "live migration", "storage authority"] }));
+      excluded: ["managed-provider privileges", "clone uniqueness", "physical fencing", "TCP blackhole", "COMMIT packet loss", "live migration", "storage authority"] };
   } finally {
     for (const provider of providers) await provider.close();
     if (db) await db.end();
@@ -333,5 +432,7 @@ async function main() {
     if (roleCreated) await admin.query('DROP ROLE "' + role + '"');
     await admin.end();
   }
+  // Never print PASS before database/role cleanup succeeds.
+  console.log(JSON.stringify(resultReport));
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

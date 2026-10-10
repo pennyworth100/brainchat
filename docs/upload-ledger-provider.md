@@ -268,3 +268,39 @@ fixture, **not automatic recovery**, endpoint/failover provenance, network-fault
 recovery, UNKNOWN replay safety or physical fencing. There is no runtime wiring,
 live migration, seed, deployment, storage IO or permission change outside the
 fixture. All activation gates above remain required.
+
+### Owned transport disconnect during a pending read
+
+The fixture now forwards exactly one provider connection through an ephemeral
+loopback TCP proxy to its own generated cluster. It forwards opaque bytes: the
+provider still verifies the original fixture certificate end-to-end (TLSv1.3),
+and neither proxy nor test disables certificate verification. The random
+database/limited role, backend PID, exact read-only sleep query and active
+`Timeout/PgSleep` state must be independently observed before cutting both
+owned sockets. No administrative backend termination triggers this case.
+
+Pending finalization must return `query-pending`. The real query must reject
+within two seconds of the explicit disconnect, without SQLSTATE 57P01 or 57014;
+only after settlement is its lease destroyed once. The still-open poisoned
+provider denies pins/checkouts without reconnecting. PID-scoped server logs
+contain no BEGIN/mutation/COMMIT; all ledger rows/liabilities remain unchanged.
+This proves explicit transport disconnection, **not** a silent TCP blackhole,
+COMMIT packet loss, automatic recovery, replay safety or physical fencing.
+
+The first local attempt passed all 111 behavioral checks but **failed cleanup**:
+the server was still sleeping when DROP DATABASE ran (55006). The outer runner
+stopped its owned cluster. Client disconnection does not imply server-query
+termination. The fixture now separately waits up to seven seconds for that
+backend to disappear; the existing five-second server statement timeout assists
+server cleanup, not client network settlement. The Python child watchdog remains
+120 seconds, followed by owned-cluster shutdown; no wall-clock guarantee is
+claimed for the production provider or for SIGKILL/host loss. PASS is emitted
+only after the random database and role have been dropped. PG16/18 CI results
+must be verified independently before claiming matrix coverage for this case.
+
+Corrected local PostgreSQL 18.1 run: **112 assertions PASS**, TLSv1.3, one
+connection, client rejection observed in 0 ms (millisecond clock resolution),
+separate backend cleanup in 5009 ms, database/role dropped and cluster stopped.
+The full local suite also passed 579 application + 5 plugin tests, typecheck,
+build and production-only dependency audit (0 vulnerabilities). No claim is
+made that the development dependency tree is vulnerability-free.
