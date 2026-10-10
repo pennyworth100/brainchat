@@ -148,7 +148,7 @@ only reports and server logs, never private keys or database files. The separate
 runners and runs this owned fixture with Node 24. Each leg uses its explicit
 versioned binary directory and retains a distinct `ledger-tls-pg<major>` artifact.
 Fail-fast is disabled so both versions produce independent evidence. PG16 uses
-Ubuntu's repository; PG18 first enables the official PGDG repository with the
+the runner's existing installation/package sources; PG18 first enables the official PGDG repository with the
 distribution-packaged `postgresql-common` setup helper, preserving apt signature
 verification ([official setup](https://www.postgresql.org/download/linux/ubuntu/)).
 The first matrix attempt failed before PG18 fixture creation because Ubuntu's
@@ -172,8 +172,17 @@ should grant these permissions.
 
 The initial PostgreSQL 16.15 CI fixture passed all 41 assertions with TLSv1.3
 and confirmed cluster cleanup (both workflows for commit `02b87c4` succeeded).
-Next: consume both PostgreSQL 16/18 matrix reports and verify their server versions,
-41 assertions and cleanup independently, without waiving permission review.
+The repaired matrix at `e274006` independently passed on PostgreSQL 16.15 and
+18.6, 41 assertions each, TLSv1.3. Both artifacts from
+[run 38034830511](https://github.com/pennyworth100/brainchat/actions/runs/38034830511)
+were downloaded and their SHA-256 digests checked against GitHub metadata.
+Reports confirmed limited-role composition and `clusterStopped:true`; server
+logs independently confirmed DROP DATABASE, DROP ROLE and server shutdown.
+The PG16 report identifies a preinstalled PGDG build, despite the runner's default
+apt sources lacking the PG18 package. Neither minor versions nor package source
+availability are assumed from the Ubuntu image name alone.
+Next: retain this matrix and address isolated network/pool recovery evidence
+without waiving managed-provider permission review or physical fencing gates.
 Managed-provider support, trusted
 endpoint/clone provenance, pool/network failure recovery and physical fencing
 remain independent gates. No public consumer, IO authority, live migration,
