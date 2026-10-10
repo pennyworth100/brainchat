@@ -12,6 +12,17 @@ It does not parse multipart, validate a file, publish a message or release lease
   iterator finalization. No per-chunk deadline renewal.
 - Forward one copied chunk at a time, awaiting the sink before the next read.
   These bounds do not constrain allocations made upstream by the transport.
+- Optional fifth argument `finish(signal)` runs once only after exact EOF and
+  successful writes, before the request operation settles. Use it to call the
+  maintained parser's `end()`, validate its final state and await final bounded
+  sink work. It shares the original absolute deadline (no renewed timer).
+  Rejection aborts the source; an uncooperative finalizer keeps the operation
+  pending until actual settlement. This is a hook, not a multipart implementation.
+- File-end or parser `onDone` is NOT permission to finalize a storage capability,
+  dispatch a DB write, publish or release a lease. A real HTTP counterexample
+  shows both callbacks before Content-Length EOF, then disconnect, deadline,
+  delayed excess part or sink failure. Commit belongs after the whole operation,
+  parser validation and storage durability, never inside `finish`.
 - On failure/deadline signal cancellation and call the trusted transport abort
   hook once. Await actual next/write settlement, iterator return, and abort hook
   settlement. A source/sink/finalizer ignoring cancellation keeps the operation

@@ -12,10 +12,14 @@ type Source = {
 // PRIVATE prerequisite only: call AFTER framing, bearer admission and disk
 // reservation. Not a multipart parser, file validator, HTTP route or lease owner.
 // Sink must honor serial backpressure and settle all its work before returning.
+// Optional finish runs only after exact EOF, under the SAME deadline. Use it
+// for parser.end() and awaited final parser/sink work, never DB commit, publication
+// or lease release. Parser file-end/onDone alone is not request completion.
 // Never wrap this promise in a timeout that releases upload/disk leases.
 export async function consumeResumeRequest(source: Source, framing: ResumeUploadFraming,
     write: (chunk: Uint8Array, signal: AbortSignal) => Promise<void>,
-    timeoutMs = MAX_RESUME_BODY_TIME_MS): Promise<number> {
+    timeoutMs = MAX_RESUME_BODY_TIME_MS,
+    finish?: (signal: AbortSignal) => Promise<void>): Promise<number> {
   const length = framing.contentLength; // snapshot before any await
   if (!Number.isSafeInteger(length) || length < 1 || length > MAX_RESUME_REQUEST_BYTES ||
       !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_RESUME_BODY_TIME_MS) {
@@ -61,10 +65,15 @@ export async function consumeResumeRequest(source: Source, framing: ResumeUpload
       await write(Uint8Array.from(chunk), controller.signal);
       check(); // includes time spent backpressured in the sink
     }
+    // Parser finalization can emit buffered bytes or reject incomplete syntax.
+    // Await real settlement; deadline cancellation does not abandon its work.
+    check();
+    await finish?.(controller.signal);
+    check();
   } catch (error) {
     fail(error);
   } finally {
-    // next/write have settled before return, including when abort was requested.
+    // next/write/finish have settled before return, including after abort.
     // The deadline stays armed through finalization. No early success/refund.
     try {
       const closed = await iterator?.return?.();

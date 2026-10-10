@@ -155,3 +155,57 @@ test("real stalled Node Readable deadline destroys transport before rejection", 
   await assert.rejects(consume(source, frame(1), async () => assert.fail("unexpected body"), 10), /deadline/);
   assert.equal(closed, true); assert.equal(stream.destroyed, true);
 });
+
+test("parser finish is awaited once after exact EOF, within the request operation", async () => {
+  const f = fixture([Uint8Array.of(1)]);
+  const entered = deferred(), release = deferred();
+  let finishes = 0, complete = false;
+  const pending = consume(f.source, frame(1), async () => {}, 1000, async signal => {
+    finishes++; assert.equal(signal.aborted, false); entered.resolve(); await release.promise;
+  }).then(value => { complete = true; return value; });
+  // A separate event-loop turn detects an ignored finish hook without hanging.
+  await tick();
+  assert.equal(finishes, 1);
+  await entered.promise; assert.equal(complete, false);
+  release.resolve(); assert.equal(await pending, 1);
+  assert.deepEqual(f.counts(), { aborts: 0, returns: 1, reads: 1 });
+});
+
+test("parser finish is skipped after framing length, read or write failure", async () => {
+  let finishes = 0;
+  const finish = async () => { finishes++; };
+  for (const [values, length] of [
+    [[Uint8Array.of(1)], 2], [[Uint8Array.of(1, 2)], 1],
+  ] as const) {
+    await assert.rejects(consume(fixture([...values]).source, frame(length), async () => {}, 1000, finish));
+  }
+  await assert.rejects(consume(fixture([Uint8Array.of(1)]).source, frame(1),
+    async () => { throw Error("sink failed"); }, 1000, finish), /sink failed/);
+  const source = { chunks: { async *[Symbol.asyncIterator]() { throw Error("read failed"); yield Uint8Array.of(1); } }, async abort() {} };
+  await assert.rejects(consume(source, frame(1), async () => {}, 1000, finish), /read failed/);
+  assert.equal(finishes, 0);
+});
+
+test("parser finish rejection aborts and waits for actual abort settlement", async () => {
+  const f = fixture([Uint8Array.of(1)]), aborted = deferred(), release = deferred();
+  let complete = false, finishes = 0;
+  const source = { ...f.source, async abort() { await f.source.abort(); aborted.resolve(); await release.promise; } };
+  const rejected = assert.rejects(consume(source, frame(1), async () => {}, 1000, async () => {
+    finishes++; throw Error("truncated multipart");
+  }), /truncated multipart/).then(() => { complete = true; });
+  await aborted.promise; await tick(); assert.equal(complete, false);
+  release.resolve(); await rejected;
+  assert.equal(finishes, 1); assert.equal(f.counts().aborts, 1);
+});
+
+test("parser finish shares the absolute deadline and cannot settle early on abort", async () => {
+  const f = fixture([Uint8Array.of(1)]), entered = deferred(), release = deferred(), aborted = deferred();
+  let signal: AbortSignal | undefined, complete = false;
+  const source = { ...f.source, async abort() { await f.source.abort(); aborted.resolve(); } };
+  const rejected = assert.rejects(consume(source, frame(1), async () => {}, 20, async s => {
+    signal = s; entered.resolve(); await release.promise;
+  }), /deadline/).then(() => { complete = true; });
+  await entered.promise; await aborted.promise; await tick();
+  assert.equal(signal?.aborted, true); assert.equal(complete, false);
+  release.resolve(); await rejected; assert.equal(f.counts().aborts, 1);
+});
