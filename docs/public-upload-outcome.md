@@ -44,8 +44,37 @@ No age-based deletion or negative single-read DB lookup is safe reclamation.
 An HTTP 200 after notification failure means persisted, not delivered to all
 participants; history remains the recovery source. There is no outbox/durable
 upload-idempotency receipt, fsync durability proof, global writer drain or
-production incident claim. Delayed touchRoom and parser-owned late cleanup
-remain separate gates. Runtime source changes stay in the unmerged draft.
+production incident claim. The deferred touchRoom proof below and parser-owned
+late cleanup do not establish a common writer barrier. Runtime source changes
+stay in the unmerged draft.
+
+## Deferred room activity: HTTP completion is not writer settlement
+
+Two additional actual-source scenarios pause the `touchRoom` UPDATE in the
+query adapter **before submission to PostgreSQL**. After reading the complete
+HTTP 200 body, an independent SQL pool observes one committed message while the
+room activity timestamp is still the sentinel value. Exactly one intercepted
+query is outstanding. There is no timing sleep or assumed response-order delay.
+
+| Release of paused UPDATE | HTTP already complete | Before release | After settlement |
+| --- | --- | --- | --- |
+| Execute the real UPDATE | 200; stored message ID | One message; timestamp unchanged; one pending query | Timestamp changed; one message; zero pending queries |
+| Reject before submitting UPDATE | 200; stored message ID | One message; timestamp unchanged; one pending query | Timestamp unchanged; one message; zero pending queries |
+
+Both scenarios retain exactly one file with exact fixture bytes, perform one
+INSERT and one emit, and perform zero unlinks. The rejection variant demonstrates
+that the existing `touchRoom(...).catch(() => {})` can leave stale room activity
+despite a successful upload. It is not a failed message save or a live incident.
+The gate is released on assertion failure too; intercepted work settles before
+schema/file teardown. The five byte-preservation scenarios remain in this same
+seven-scenario CI harness.
+
+This is deterministic adapter-level scheduling/rejection, not a PostgreSQL lock,
+network fault, crash, physical I/O drain or production maintenance barrier test.
+The harness's pending-query set is test instrumentation, not an application
+all-writer registry. No runtime seam or behavioral change is introduced here.
+Next: characterize parser-owned late cleanup and define explicit completion
+ownership for deferred work before designing a shared quiescence contract.
 
 ## Historical counterexample result (before correction, 2026-10-09)
 
@@ -112,6 +141,7 @@ an explicit bounded-storage/admission policy before wider activation; preserving
 bytes alone is not a quota/barrier/recovery solution. Audit definite pre-write
 failure cleanup separately rather than inferring failure from any thrown error.
 
-Delayed touchRoom, late Multer callbacks, delayed unlink and common all-writer
-drain remain separate unproven gates. No global barrier, production repair,
-runtime change, dependency update or deployment is introduced by this proof.
+The newer deferred touchRoom proof above characterizes one pending query; late
+Multer callbacks, delayed unlink and common all-writer drain remain separate
+unproven gates. No global barrier, production repair, runtime change, dependency
+update or deployment is introduced by these characterization tests.

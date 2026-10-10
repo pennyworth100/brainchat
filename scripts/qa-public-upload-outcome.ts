@@ -50,6 +50,9 @@ async function main() {
   const query = pool.query.bind(pool);
   let mode = "normal", insertAttempts = 0, committed = 0, emitted = 0, created = false;
   const writes = new Set<Promise<unknown>>(), unlinks: Promise<unknown>[] = [];
+  let releaseTouch: (() => void) | undefined;
+  let touchGate: Promise<void> | undefined;
+  let touchAttempts = 0, touchCompleted = 0;
   const errors: string[] = [];
   // Throw ONLY after the real PG query resolves: an acknowledged autocommit
   // happened, but its result is deliberately hidden from Drizzle/the handler.
@@ -57,12 +60,20 @@ async function main() {
   (pool as unknown as { query: (...args: any[]) => Promise<any> }).query = (...args: any[]) => {
     const sql = typeof args[0] === "string" ? args[0] : args[0].text;
     const insert = /^insert into "messages"/i.test(sql);
+    const touch = /^update "rooms"/i.test(sql);
+    const queryMode = mode;
     const work = (async () => {
+      if (touch) {
+        touchAttempts++;
+        if (touchGate) await touchGate;
+        if (queryMode === "delayed-touch-reject") throw Error("injected deferred UPDATE rejection");
+      }
       if (insert) {
         insertAttempts++;
         if (mode === "before-insert") throw Error("injected pre-insert rejection");
       }
       const result = await (query as (...args: any[]) => Promise<any>)(...args);
+      if (touch) touchCompleted++;
       if (insert) {
         committed++;
         if (mode === "after-commit") throw Error("injected lost INSERT result after autocommit");
@@ -110,8 +121,14 @@ async function main() {
     await pool.query("ALTER TABLE messages ADD COLUMN client_message_id text");
     await pool.query("INSERT INTO rooms (id) VALUES ('proof123')");
     let expectedFiles = 0;
-    for (const scenario of ["normal", "before-insert", "after-commit", "after-save-emit", "after-save-response"]) {
+    for (const scenario of ["normal", "before-insert", "after-commit", "after-save-emit", "after-save-response",
+      "delayed-touch-complete", "delayed-touch-reject"]) {
       mode = scenario; insertAttempts = 0; committed = 0; emitted = 0; unlinks.length = 0;
+      assert.equal(writes.size, 0, "previous scenario has no outstanding intercepted queries");
+      touchAttempts = 0; touchCompleted = 0;
+      const delayedTouch = scenario.startsWith("delayed-touch-");
+      touchGate = delayedTouch ? new Promise<void>(resolve => { releaseTouch = resolve; }) : undefined;
+      await admin.query(`UPDATE "${schema}".rooms SET last_active_at = '2000-01-01' WHERE id = 'proof123'`);
       const body = new FormData(), bytes = "fixture:" + scenario;
       body.append("file", new Blob([bytes], { type: "text/plain" }), scenario + ".txt");
       let response: Response | undefined;
@@ -128,6 +145,33 @@ async function main() {
       assert.equal(responseLost, scenario === "after-save-response");
       const payload: { code?: string; error?: string; message?: { id: number } } =
         response ? await response.json() : {};
+      let deferredEvidence: object | undefined;
+      if (delayedTouch) {
+        // HTTP body has completed, but the actual-source touchRoom query is
+        // held BEFORE submission to PG. An independent pool observes both facts.
+        assert.equal(response?.status, 200);
+        assert.equal(touchAttempts, 1); assert.equal(touchCompleted, 0);
+        assert.equal(writes.size, 1, "HTTP completion is not deferred-writer settlement");
+        const observe = async () => (await admin.query(`SELECT
+          last_active_at = '2000-01-01'::timestamp AS untouched,
+          (SELECT count(*)::int FROM "${schema}".messages WHERE content::jsonb->>'name' = $1) AS messages
+          FROM "${schema}".rooms WHERE id = 'proof123'`, [scenario + ".txt"])).rows[0];
+        const beforeRelease = await observe();
+        assert.deepEqual(beforeRelease, { untouched: true, messages: 1 });
+        assert.equal(payload.message?.id, (await admin.query(`SELECT id FROM "${schema}".messages
+          WHERE content::jsonb->>'name' = $1`, [scenario + ".txt"])).rows[0].id);
+        const pending = [...writes];
+        releaseTouch!(); releaseTouch = undefined;
+        const settled = await Promise.allSettled(pending);
+        const expectedStatus = scenario === "delayed-touch-reject" ? "rejected" : "fulfilled";
+        assert.deepEqual(settled.map(result => result.status), [expectedStatus]);
+        const afterSettlement = await observe();
+        assert.deepEqual(afterSettlement, { untouched: expectedStatus === "rejected", messages: 1 });
+        assert.equal(touchCompleted, expectedStatus === "fulfilled" ? 1 : 0);
+        assert.equal(writes.size, 0);
+        deferredEvidence = { outstandingAtHttpCompletion: 1, beforeRelease,
+          settlement: expectedStatus, afterSettlement, outstandingAfterSettlement: writes.size };
+      }
       await Promise.allSettled([...writes]);
       const cleanup = await Promise.allSettled(unlinks);
       assert.ok(cleanup.every(r => r.status === "fulfilled"));
@@ -136,14 +180,14 @@ async function main() {
         WHERE content::jsonb->>'name' = $1`, [scenario + ".txt"])).rows;
       const expectedRows = scenario === "before-insert" ? 0 : 1;
       assert.equal(rows.length, expectedRows); assert.equal(committed, expectedRows);
-      const acknowledged = scenario === "normal" || scenario === "after-save-emit";
+      const acknowledged = scenario === "normal" || scenario === "after-save-emit" || delayedTouch;
       assert.equal(response?.status, responseLost ? undefined : acknowledged ? 200 : 500);
       if (!acknowledged && !responseLost) {
         assert.equal(payload.code, "UPLOAD_OUTCOME_UNKNOWN");
         assert.ok(typeof payload.error === "string");
         assert.doesNotMatch(payload.error, /please try again/i);
       }
-      assert.equal(emitted, scenario === "normal" || responseLost ? 1 : 0);
+      assert.equal(emitted, scenario === "normal" || responseLost || delayedTouch ? 1 : 0);
       assert.equal(unlinks.length, 0, "no cleanup on ambiguous persistence or post-save errors");
       let blobExists = false;
       if (rows.length) {
@@ -173,7 +217,7 @@ async function main() {
       results.push({ scenario, http: response?.status ?? null, responseLost, insertAttempts, committed,
         independentlyObservedRows: rows.length, referencedBlobExists: rows.length ? blobExists : null,
         retainedExactFiles: scenarioFiles,
-        emitted, cleanupCalls: unlinks.length });
+        emitted, cleanupCalls: unlinks.length, deferredEvidence });
     }
     assert.deepEqual(errors, ["before-insert", "after-commit", "after-save-emit", "after-save-response"]);
     console.log(JSON.stringify({ result: "BYTE_PRESERVATION_PASS", scenarios: results,
@@ -183,6 +227,8 @@ async function main() {
       scope: "actual AST-extracted storage/save/handler; real HTTP/multipart/PG/files; substituted admission and event emitter; minimal schema; no live state",
     }, null, 2));
   } finally {
+    // Release injected work even on assertion failure, before fixture teardown.
+    releaseTouch?.();
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await Promise.allSettled([...writes, ...unlinks]);
     await pool.end();
