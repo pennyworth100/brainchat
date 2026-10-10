@@ -1,6 +1,53 @@
-# Public upload: committed write followed by destructive error cleanup
+# Public upload: preservation after uncertain persistence
 
-## Result (2026-10-09)
+## Draft correction (2026-10-09, supersedes the historical result below)
+
+The PR #20 / 3.0.11 draft now retains accepted file bytes if `saveMessage`
+rejects. It cannot distinguish a definite rollback from a committed INSERT
+whose result was lost, so even the injected pre-INSERT rejection retains bytes.
+HTTP 500 carries `UPLOAD_OUTCOME_UNKNOWN` and tells the user to check history;
+it does not advise a blind retry. The browser surfaces the error without a retry.
+Notification exceptions are handled separately after an acknowledged save:
+the upload returns HTTP 200 with the stored message. Failure to deliver an HTTP
+response likewise has no byte-cleanup path. No retry, replay, refund or delete
+is introduced. No live repair, merge or deployment is part of this correction.
+
+| Injected condition | HTTP | Independent DB rows | Exact retained files | Completed emits | Unlinks |
+| --- | --- | --- | --- | --- | --- |
+| None | 200 | 1 | 1 | 1 | 0 |
+| Reject before INSERT | 500, unknown | 0 | 1 | 0 | 0 |
+| Hide result after real autocommit | 500, unknown | 1 | 1 | 0 | 0 |
+| Throw during emit after save | 200 | 1 | 1 | 0 | 0 |
+| Throw during response after save | Connection closed | 1 | 1 | 1 | 0 |
+
+The same real HTTP/PG/filesystem harness below now enforces byte preservation,
+not reproduction of data loss. It checks referenced bytes and independently
+enumerates every fixture file (including the no-row outcome), exact contents,
+exactly one INSERT attempt, response/message identity and zero cleanup calls.
+The response-failure case injects a throwing `res.json` after save and verifies
+an actual closed HTTP connection (not a timeout), with DB row/bytes preserved.
+All fixtures are removed only by test teardown, never by the handler.
+
+### Activation gate: retained storage is not bounded globally
+
+Existing admission limits one file/part per request, 100 MiB maximum, and an
+IP/socket-keyed rate limiter. These are NOT a singleton-volume capacity/inode
+budget: new sockets, concurrent requests, successful uploads and retained failed
+uploads can accumulate. Removing error cleanup adds retained no-row files.
+The private resume ledger is not wired to this legacy public path; it must not
+be presented as bounding these bytes. This draft must not be activated on the
+strength of preservation tests alone. Next: design/test a fail-closed shared
+admission/storage budget covering existing bytes and every writer, with explicit
+volume/namespace ownership, headroom and inode accounting before activation.
+No age-based deletion or negative single-read DB lookup is safe reclamation.
+
+An HTTP 200 after notification failure means persisted, not delivered to all
+participants; history remains the recovery source. There is no outbox/durable
+upload-idempotency receipt, fsync durability proof, global writer drain or
+production incident claim. Delayed touchRoom and parser-owned late cleanup
+remain separate gates. Runtime source changes stay in the unmerged draft.
+
+## Historical counterexample result (before correction, 2026-10-09)
 
 **Two counterexamples reproduced; not fixed or deployed.** The public upload
 handler catches persistence AND post-save errors in one block, then unlinks the
@@ -50,9 +97,9 @@ Production-release source `4520b649a247e18c1bb30732ba11e40dfaede0e1`
 contains the same catch/unlink pattern at server.ts:344–354. That is source
 exposure evidence, **not a reproduction or data-loss incident on production**.
 
-## Interpretation and next correction
+## Historical interpretation (superseded by draft correction above)
 
-The CI characterization succeeds when it reproduces the existing defect; green
+The original CI characterization succeeded when it reproduced the defect; green
 CI is **not a data-preservation acceptance gate**. A correction must deliberately
 replace these two expected-loss assertions with preserved-byte invariants.
 The public request currently has no durable idempotent upload receipt: returning

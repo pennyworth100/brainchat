@@ -15,6 +15,13 @@ budget provision, refund, deletion, repair or listener action was performed.
 
 ## Coverage matrix
 
+**Later draft delta:** the [public upload correction](public-upload-outcome.md)
+removes W08 handler unlink, preserves uncertain outcomes and separates emit
+errors from persistence. The matrix links below deliberately retain the audited
+historical revision; they are not current-source line numbers. W07 parser-owned
+cleanup and all-writer drain/budget gaps remain. The correction changes runtime
+source only in the unmerged draft; it is not deployed.
+
 “Public” means wired in the audited server source, not newly deployed.
 “Private” means foundation callable by trusted code/tests, not wired by server.ts.
 Every row below is **uncovered by a common cross-store maintenance barrier**.
@@ -97,13 +104,14 @@ error. Check DB file reference and owned temporary blob independently. Also
 retain explicit cases for delayed touchRoom, late Multer cleanup and delayed
 unlink: request completion alone cannot mean writer settlement.
 
-The committed-but-unacknowledged public upload regression (W08) is now
-[reproduced in isolation](public-upload-outcome.md): a real committed row remains
-after catch cleanup removes its blob. Throwing during emit after successful save
-produces the same dangling reference. These are injected counterexamples, not
-live incidents. The next slice is the smallest correction preserving bytes on
-uncertain outcomes and separating post-save publication errors; no blind replay
-or deletion is acceptable recovery. Deferred-writer drain remains unproven.
+The committed-but-unacknowledged public upload regression (W08) was
+[reproduced and corrected in the draft](public-upload-outcome.md): the harness
+now requires exact retained bytes after lost INSERT results and emit failures.
+These are isolated injected conditions, not live incidents. Unknown/no-row files
+are retained too; existing per-request/rate limits do not bound total storage.
+The next slice is fail-closed shared storage admission before activation; no
+blind replay or deletion is acceptable recovery. Deferred-writer drain remains
+unproven.
 
 Later barrier work must close admission across public HTTP/socket writers,
 private reservation/storage/receipt writers, maintenance/SQL/replicas and startup;

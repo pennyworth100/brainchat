@@ -412,17 +412,31 @@ async function main() {
         size: req.file.size,
         mime: req.file.mimetype || "application/octet-stream",
       };
+      const { roomId, username } = res.locals.uploadIdentity;
+      let message: Awaited<ReturnType<typeof saveMessage>>;
       try {
-        // Authenticate before accepting bytes; then publish independently of
-        // the socket's lifetime (iOS may sleep while the HTTP upload finishes).
-        const { roomId, username } = res.locals.uploadIdentity;
-        const message = await saveMessage(roomId, username, "file", JSON.stringify(file));
+        message = await saveMessage(roomId, username, "file", JSON.stringify(file));
+      } catch (err) {
+        // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
+        // even when no row is visible: there is no safe retry/reclamation receipt.
+        console.error("upload persistence outcome unknown:", err);
+        return res.status(500).json({
+          code: "UPLOAD_OUTCOME_UNKNOWN",
+          error: "Attachment status is unknown. Check room history before uploading again.",
+        });
+      }
+      try {
+        // Publication failure cannot invalidate an acknowledged saved message.
         io.to(roomId).emit("chat-file", message);
+      } catch (err) {
+        console.error("upload notification error after save:", err);
+      }
+      // A response failure/disconnected client must never trigger byte cleanup.
+      try {
         res.json({ ...file, message });
       } catch (err) {
-        console.error("upload persistence error:", err);
-        fs.promises.unlink(req.file.path).catch(() => {});
-        res.status(500).json({ error: "Could not save the attachment. Please try again." });
+        console.error("upload response error after save:", err);
+        res.destroy();
       }
     }
   );

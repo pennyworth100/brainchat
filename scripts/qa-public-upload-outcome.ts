@@ -14,8 +14,8 @@ import { eq } from "drizzle-orm";
 import { rooms as roomsTable, messages as messagesTable } from "../src/lib/db/schema";
 import { createUploadParser } from "../src/lib/upload-parser";
 
-// Characterization, NOT a correctness test: currently proves a dangling DB
-// reference after a committed INSERT whose result is lost. No server startup,
+// Byte-preservation regression for unknown INSERT and post-save emit errors.
+// Not a quota, recovery or all-writer barrier test. No server startup,
 // production imports, authentication, Socket.IO transport or live volumes.
 async function main() {
   const connectionString = process.env.RESUME_TEST_DATABASE_URL;
@@ -94,6 +94,9 @@ async function main() {
   const app = express();
   app.post("/api/upload", (_req, res, next) => {
     // Deliberately substituted admission: tests begin after authentication.
+    if (mode === "after-save-response") {
+      res.json = () => { throw Error("injected response failure after save"); };
+    }
     res.locals.uploadIdentity = { roomId: "proof123", username: "Fixture" }; next();
   }, createUploadParser(context.storage, 1024), context.handler);
   const server = app.listen(0, "127.0.0.1");
@@ -106,14 +109,25 @@ async function main() {
       .replaceAll('"public".', '"' + schema + '".'));
     await pool.query("ALTER TABLE messages ADD COLUMN client_message_id text");
     await pool.query("INSERT INTO rooms (id) VALUES ('proof123')");
-    for (const scenario of ["normal", "before-insert", "after-commit", "after-save-emit"]) {
+    let expectedFiles = 0;
+    for (const scenario of ["normal", "before-insert", "after-commit", "after-save-emit", "after-save-response"]) {
       mode = scenario; insertAttempts = 0; committed = 0; emitted = 0; unlinks.length = 0;
       const body = new FormData(), bytes = "fixture:" + scenario;
       body.append("file", new Blob([bytes], { type: "text/plain" }), scenario + ".txt");
-      const response: Response = await fetch(`http://127.0.0.1:${address.port}/api/upload`, {
-        method: "POST", body, signal: AbortSignal.timeout(5000),
-      });
-      const payload = await response.json();
+      let response: Response | undefined;
+      let responseLost = false;
+      try {
+        response = await fetch(`http://127.0.0.1:${address.port}/api/upload`, {
+          method: "POST", body, signal: AbortSignal.timeout(5000),
+        });
+      } catch (error) {
+        assert.equal(scenario, "after-save-response");
+        assert.ok(error instanceof TypeError, "connection failure, not a test timeout");
+        responseLost = true;
+      }
+      assert.equal(responseLost, scenario === "after-save-response");
+      const payload: { code?: string; error?: string; message?: { id: number } } =
+        response ? await response.json() : {};
       await Promise.allSettled([...writes]);
       const cleanup = await Promise.allSettled(unlinks);
       assert.ok(cleanup.every(r => r.status === "fulfilled"));
@@ -122,9 +136,15 @@ async function main() {
         WHERE content::jsonb->>'name' = $1`, [scenario + ".txt"])).rows;
       const expectedRows = scenario === "before-insert" ? 0 : 1;
       assert.equal(rows.length, expectedRows); assert.equal(committed, expectedRows);
-      assert.equal(response.status, scenario === "normal" ? 200 : 500);
-      assert.equal(emitted, scenario === "normal" ? 1 : 0);
-      assert.equal(unlinks.length, scenario === "normal" ? 0 : 1);
+      const acknowledged = scenario === "normal" || scenario === "after-save-emit";
+      assert.equal(response?.status, responseLost ? undefined : acknowledged ? 200 : 500);
+      if (!acknowledged && !responseLost) {
+        assert.equal(payload.code, "UPLOAD_OUTCOME_UNKNOWN");
+        assert.ok(typeof payload.error === "string");
+        assert.doesNotMatch(payload.error, /please try again/i);
+      }
+      assert.equal(emitted, scenario === "normal" || responseLost ? 1 : 0);
+      assert.equal(unlinks.length, 0, "no cleanup on ambiguous persistence or post-save errors");
       let blobExists = false;
       if (rows.length) {
         const metadata = JSON.parse(rows[0].content);
@@ -133,20 +153,30 @@ async function main() {
         try {
           assert.equal(await fs.promises.readFile(file, "utf8"), bytes); blobExists = true;
         } catch (error) { assert.equal((error as NodeJS.ErrnoException).code, "ENOENT"); }
-        if (scenario === "normal") assert.equal(payload.message.id, rows[0].id);
+        if (acknowledged) assert.equal(payload.message?.id, rows[0].id);
       }
-      assert.equal(blobExists, scenario === "normal");
-      // Count all fixture files too: absence is not just a wrong-path check.
+      assert.equal(blobExists, rows.length > 0);
+      // Independently find exact retained bytes even when no DB row exists.
       let allFiles = 0;
+      let scenarioFiles = 0;
       for (const token of await fs.promises.readdir(root)) {
-        allFiles += (await fs.promises.readdir(path.join(root, token))).length;
+        for (const name of await fs.promises.readdir(path.join(root, token))) {
+          allFiles++;
+          if (name === scenario + ".txt") {
+            scenarioFiles++;
+            assert.equal(await fs.promises.readFile(path.join(root, token, name), "utf8"), bytes);
+          }
+        }
       }
-      assert.equal(allFiles, 1, "only normal-case blob remains");
-      results.push({ scenario, http: response.status, insertAttempts, committed,
-        independentlyObservedRows: rows.length, blobExists, emitted, cleanupCalls: unlinks.length });
+      assert.equal(scenarioFiles, 1, "exactly one preserved file, including unknown/no-row outcome");
+      assert.equal(allFiles, ++expectedFiles, "all accepted bytes retained, no hidden duplicates");
+      results.push({ scenario, http: response?.status ?? null, responseLost, insertAttempts, committed,
+        independentlyObservedRows: rows.length, referencedBlobExists: rows.length ? blobExists : null,
+        retainedExactFiles: scenarioFiles,
+        emitted, cleanupCalls: unlinks.length });
     }
-    assert.deepEqual(errors, ["before-insert", "after-commit", "after-save-emit"]);
-    console.log(JSON.stringify({ result: "COUNTEREXAMPLES_CONFIRMED", scenarios: results,
+    assert.deepEqual(errors, ["before-insert", "after-commit", "after-save-emit", "after-save-response"]);
+    console.log(JSON.stringify({ result: "BYTE_PRESERVATION_PASS", scenarios: results,
       sourceSha: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
       serverSha256: crypto.createHash("sha256").update(source).digest("hex"),
       harnessSha256: crypto.createHash("sha256").update(await fs.promises.readFile("scripts/qa-public-upload-outcome.ts")).digest("hex"),
