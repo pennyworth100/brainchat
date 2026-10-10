@@ -61,10 +61,11 @@ reclamation of late/hung connections. Pool shutdown may wait for active leases.
 A registered policy pin can be checked out more than once. It is not a one-shot
 grant, policy freshness proof, durable attempt, admission or filesystem authority.
 The private lease still exposes general SQL to the trusted transaction
-service. No domain lock/policy read, capacity charge or attempt INSERT is
-implemented. The [transaction outcome helper](upload-ledger-transaction.md)
-now tracks COMMIT dispatch/acknowledgment and finalization, but does not implement
-reservation SQL. Callers must not issue arbitrary request SQL.
+service. The separately composed SQL callback now locks/rechecks the domain and
+policy, charges both dimensions and inserts the exact attempt UUID; the provider
+alone does none of these. The [transaction outcome helper](upload-ledger-transaction.md)
+tracks COMMIT dispatch/acknowledgment and finalization. Callers must not issue
+arbitrary request SQL.
 There is no inference from provider success to available budget or safe IO.
 
 ## Evidence and next bounded step
@@ -81,6 +82,47 @@ The private transaction helper now retains generated attempt identity and
 produces a committed accounting-only outcome. Any dispatched-COMMIT error or
 finalization failure remains UNKNOWN, without replay or IO admission. It does
 not prove an attempt was INSERTed; durability remains a SQL-composition contract.
-Next extract vector SQL and additive unseeded constraints; keep migration 0008
-immutable. All [physical release gates](upload-resource-reservation-mapping.md)
+Actual 0009/callback/transaction tests are documented in
+[the resource schema evidence](upload-resource-ledger-schema.md). Migration 0008
+remains immutable. All [physical release gates](upload-resource-reservation-mapping.md)
 remain blocked and must be independently evidenced.
+
+### Isolated real TLS composition (2026-10-10)
+
+`scripts/qa-upload-ledger-provider.ts` adds a separate 33-assertion PostgreSQL 18.1
+proof using the actual factory-owned pool, pin, lease, transaction and SQL callback.
+It is manually opted in, **not** a live deployment or a CI coverage claim.
+
+- A dedicated loopback PostgreSQL instance on port 55440 uses a one-day fixture
+  certificate with SAN `DNS:localhost,IP:127.0.0.1`, mandatory server SSL, and
+  `log_statement=all`. Set `LEDGER_TLS_FIXTURE` to its owned
+  `/private/tmp/dimle-provider-tls-20261010-<suffix>` directory containing
+  `server.crt` and `server.log`, then run
+  `node --import tsx scripts/qa-upload-ledger-provider.ts` with Node 24.
+  The script creates/drops a random database and nonsuperuser role. The dedicated
+  cluster is started/stopped by the fixture owner; never point this at shared PG.
+- The provider connects with `rejectUnauthorized:true` and the fixture trust
+  anchor. `pg_stat_ssl` reports TLSv1.3; omission of the trust anchor fails closed.
+  Foreign pins fail before connection, wrong binding fails at pinning, and a
+  wrong system ID fails after the real probe but before BEGIN or mutation.
+- PostgreSQL 18.1's default nonsuperuser role **can** execute
+  `pg_control_system()` in this fixture. An initial expectation of a default
+  denial failed and was corrected. The test records the baseline privilege,
+  then revokes PUBLIC EXECUTE **only in its disposable database** to prove the
+  actual SQLSTATE 42501/provider-denial path. No privileges/superuser status are
+  granted; this is not evidence of a managed-platform permission failure.
+- Positive composition uses the already-existing fixture bootstrap role, not
+  proof of application-role readiness. Server logs correlate the identity probe
+  and BEGIN to the same backend PID, in that order; search_path is pg_catalog.
+- One acknowledged real COMMIT persists its exact attempt UUID and 10 bytes /
+  2 objects. A second real COMMIT followed by an explicit post-query ACK exception
+  returns UNKNOWN, destroys once, issues no ROLLBACK/replay and retains its exact
+  durable UUID. Total liabilities remain 20 bytes / 4 objects. This is a controlled
+  exception seam, **not** packet loss, SIGKILL or network-fault evidence.
+
+Next: make this fixture reproducible in isolated CI (including supported PG
+versions) and verify a least-privilege positive composition without treating
+fixture grants as platform authorization. Managed-provider support, trusted
+endpoint/clone provenance, pool/network failure recovery and physical fencing
+remain independent gates. No public consumer, IO authority, live migration,
+seed, merge, deployment or listener action follows from this local PASS.
