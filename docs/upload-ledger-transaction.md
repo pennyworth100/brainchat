@@ -56,9 +56,14 @@ The [locked-domain evaluator](upload-resource-domain.md) now implements strict
 two-dimensional row decoding and exact policy recheck, without querying or
 mutating a database. It is not evidence that a domain lock was acquired.
 
-Next extract the isolated vector experiment into fixed-table application SQL and
-add unseeded constraints without changing migration 0008. Bind the attempt ID and
-exact policy snapshot under the canonical domain lock. Then verify against real
+Next add unseeded constraints without changing migration 0008. Then verify the
+fixed-table application SQL against real
 isolated PostgreSQL, including both capacity dimensions, rollback and ambiguous
 commit. Keep all [physical admission gates](upload-resource-reservation-mapping.md)
 closed; do not connect this accounting-only result to public middleware or storage.
+
+## Concrete SQL composition
+
+The inactive [fixed-table resource callback](upload-resource-sql.md) now implements
+the canonical domain lock, exact policy recheck, both charges and attempt INSERT.
+It is not wired to a route and its required empty additive schema is not installed.
