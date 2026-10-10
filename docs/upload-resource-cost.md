@@ -1,7 +1,7 @@
 # Public upload admission: resource cost contract
 
 2026-10-09; draft 3.0.11, parent `31b09d60a25baf1d57dbd657f76c3a081d7f6886`.
-Tests/documentation only. This defines inputs required before admission wiring;
+Private quote arithmetic/tests/documentation only. This defines inputs required before admission wiring;
 it neither supplies measured capacity nor enables a budget, cleanup or rollout.
 
 ## Source-derived bound and executed proof
@@ -62,7 +62,7 @@ physical reservation. Directory/parent growth, metadata, journaling/CoW and
 safety headroom remain outside that number. Never invent a fixed filesystem
 overhead multiplier from payload length or a single stat call.
 
-## Fail-closed quote/admission contract (not implemented)
+## Fail-closed quote/admission contract (admission not implemented)
 
 Treat resource liability as a vector, not one interchangeable counter:
 
@@ -123,8 +123,54 @@ Inspected installed dependency SHA-256:
 | multer/storage/disk.js | 756e3ca6eefb2824a8a275b10137a3baa6d75c45d65909a6432d8850be089a28 |
 | busboy/lib/types/multipart.js | ed88b51e44c230f124163a75ee87cba322584a2f0360eafc7b38727a33ec9268 |
 
-Next bounded implementation: a private, side-effect-free resource quote validator
-for explicit trusted policy inputs, with overflow/unknown-policy/identity-denial
-tests. Do not wire it to public upload or mistake its arithmetic for a grant.
+## Private quote implementation (2026-10-09 follow-up)
+
+[quoteUploadResources](../src/lib/upload-resource-quote.ts) now supplies only
+side-effect-free arithmetic over **trusted in-process policy assertions**.
+[Nine regressions](../src/lib/upload-resource-quote.test.ts) cover identity denial,
+missing inputs/overhead, boundaries, overflow, accessors, and immutable snapshots.
+It returns null on invalid input, or a frozen `upload-resource-quote-only` value.
+It has no capacity inputs, ledger, IO, clock, authority token or public caller.
+Repeated calls return quotes, not multiple reservations or admission grants.
+
+Required policy fields (none have defaults):
+
+| Field | Required meaning |
+| --- | --- |
+| `identity` | Exact nonempty opaque strings for database, schema, namespace, quotaDomain, policyVersion, writerGeneration; each must match a separately supplied expected identity |
+| `layout` | `provisioned-root-one-directory-one-file-v1`; caller attests the root is already provisioned and this layout bounds this operation |
+| `allocationModel` | `audited-rounded-copies-v1`; independently audited upper-bound model, not discovered filesystem geometry |
+| `stableExclusiveNamespace`, `allAllocationCostsBounded` | Both exactly true; assertions of external evidence, not evidence produced by this function |
+| `maxFileBytes` | Trusted configured parser maximum L, never client size/Content-Length |
+| `allocationUnitBytes`, `allocationCopies` | Positive safe integers for audited rounding unit and upper-bound data allocation multiplier |
+| `directoryAndParentBytes`, `metadataBytes`, `temporaryBytes` | Explicit nonnegative safe integer bounds, collectively covering all attributable non-file-data allocation; zero is an audited assertion, never a fallback |
+| `additionalObjects` | Explicit nonnegative object/inode cost beyond one directory plus one file; include any temporary, metadata or additional-copy objects if applicable |
+
+Calculation uses exact BigInt intermediates:
+`logical=L+1`, `file=ceil(logical/unit)*unit*copies`,
+`allocated=file+directoryAndParent+metadata+temporary`, `objects=2+additionalObjects`.
+All numeric inputs and returned totals fit nonnegative JS safe integers; minus
+zero, fractions, coercions and overflowing totals deny. L=0 still quotes one
+crossing byte and at least two objects. Unknown model/layout denies. Opaque
+identity equality does not canonicalize paths or verify mount/quota identity.
+Plain data records are required; known accessor/inherited fields are rejected.
+Hostile Proxies are outside this internal interface's trust boundary.
+
+The example numbers in tests are synthetic, **not Railway capacity or overhead**.
+This function does not prove the caller's assertions, enforce parser limits,
+validate live capacity, establish writer fencing or perform atomic accounting.
+Before any mkdir/write, a separate durable admission must validate current policy,
+identity, full capacity/headroom vector and all-writer enforcement, then reserve
+atomically and bind the operation to the grant. A quote alone can never activate
+public upload. Unknown capacity/headroom must deny that admission even if quote
+arithmetic succeeded. No seeding, refunds, scans, reclaim or public wiring added.
+
+Follow-up verification: 508 application + 5 plugin tests (513 total), typecheck,
+build and diff check PASS; production dependency audit zero vulnerabilities
+(not a dev-tree audit claim). Full command logs: resource-quote-20261009-checks.json,
+SHA-256 `6370453841459be65d93931fbc4b975a0d8eeeba920983a3c2231807b49fc8e9`.
+Parent `026967b724498874321e6d9232a5847a136c3455` push/PR CI both SUCCESS.
+No public server, schema, dependency or version change; no local PostgreSQL rerun.
+
 Actual shared multi-resource reservation, storage enforcement, all-writer fencing
 and paired recovery remain open in [the release gate](upload-observability-admission.md).
