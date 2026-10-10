@@ -147,9 +147,14 @@ only reports and server logs, never private keys or database files. The separate
 `ledger-tls` CI matrix installs PostgreSQL 16 and 18 on separate Ubuntu 24.04
 runners and runs this owned fixture with Node 24. Each leg uses its explicit
 versioned binary directory and retains a distinct `ledger-tls-pg<major>` artifact.
-Fail-fast is disabled so both versions produce independent evidence. Package
-minor versions follow the runner's apt repositories; the report records the actual
-server version. CI success must be observed, not inferred from local success.
+Fail-fast is disabled so both versions produce independent evidence. PG16 uses
+Ubuntu's repository; PG18 first enables the official PGDG repository with the
+distribution-packaged `postgresql-common` setup helper, preserving apt signature
+verification ([official setup](https://www.postgresql.org/download/linux/ubuntu/)).
+The first matrix attempt failed before PG18 fixture creation because Ubuntu's
+default apt repositories do not contain `postgresql-18`; it was not a TLS failure.
+Package minor versions follow those apt repositories; the report records the
+actual server version. CI success must be observed, not inferred from local success.
 
 Positive transactions now use the generated nonsuperuser role with no CREATEDB,
 CREATEROLE, REPLICATION, BYPASSRLS or superuser attribute. After verifying the
