@@ -60,9 +60,11 @@ reclamation of late/hung connections. Pool shutdown may wait for active leases.
 
 A registered policy pin can be checked out more than once. It is not a one-shot
 grant, policy freshness proof, durable attempt, admission or filesystem authority.
-The private lease still exposes general SQL to the trusted future transaction
-service. No domain lock/policy read, capacity charge, attempt INSERT or COMMIT
-state machine is implemented. Callers must not issue arbitrary request SQL.
+The private lease still exposes general SQL to the trusted transaction
+service. No domain lock/policy read, capacity charge or attempt INSERT is
+implemented. The [transaction outcome helper](upload-ledger-transaction.md)
+now tracks COMMIT dispatch/acknowledgment and finalization, but does not implement
+reservation SQL. Callers must not issue arbitrary request SQL.
 There is no inference from provider success to available budget or safe IO.
 
 ## Evidence and next bounded step
@@ -74,10 +76,11 @@ poisoning (including a late successful probe after an active error).
 They do **not** prove real TLS, PostgreSQL role privileges, failover, SIGKILL,
 pool resource reclamation or physical writer fencing.
 
-Next compose a private transaction state machine with this provider: retain
-durable attempt identity and `commitDispatched`; only acknowledged COMMIT plus
-successful finalization may produce a DB reservation. Any dispatched-COMMIT
-error/finalization failure remains UNKNOWN, without replay or IO admission.
-Then extract vector SQL and additive unseeded constraints; keep migration 0008
+The private transaction helper now retains generated attempt identity and
+`commitDispatched`; only acknowledged COMMIT plus successful finalization
+produces a committed accounting-only outcome. Any dispatched-COMMIT error or
+finalization failure remains UNKNOWN, without replay or IO admission. It does
+not prove an attempt was INSERTed; durability remains a SQL-composition contract.
+Next extract vector SQL and additive unseeded constraints; keep migration 0008
 immutable. All [physical release gates](upload-resource-reservation-mapping.md)
 remain blocked and must be independently evidenced.
