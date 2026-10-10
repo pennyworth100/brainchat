@@ -50,5 +50,12 @@ generation preserves old liabilities. Constraints include malformed snapshots,
 unsafe/fractional/zero costs, negative/out-of-envelope balances and restrictive
 deletion. Fixture costs and cut audit are synthetic, not physical observations.
 
+Restrictive deletion checks accept PostgreSQL 16's `23503` (foreign-key
+violation) and PostgreSQL 18's `23001` (restrict violation), but require the
+exact expected constraint name. They independently verify catalog `RESTRICT`
+actions for both UPDATE and DELETE and unchanged domain, policy and attempt
+rows after each rejected DELETE. The report includes server version and the
+observed SQLSTATEs. A different error (including a permission failure) fails QA.
+
 Still gated: real TLS provider composition, physical quotas/all-writer barrier,
 live migration lock/size/recovery audit, deployment and Max's production GO.

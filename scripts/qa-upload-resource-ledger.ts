@@ -26,6 +26,7 @@ async function main() {
     pool = new Pool({ connectionString: url.href, max: 16, connectionTimeoutMillis: 5000,
       options: "-c statement_timeout=10000 -c lock_timeout=5000" });
     const db = pool;
+    const postgresVersion = (await db.query("SHOW server_version")).rows[0].server_version;
     await db.query(readFileSync(new URL("../drizzle/0009_upload_resource_ledger.sql", import.meta.url), "utf8"));
     const identity = (namespace = "a", generation = "g1") => ({
       database: "owned-fixture/" + databaseName, schema: "public", quotaDomain: "volume",
@@ -167,9 +168,32 @@ async function main() {
     await deniedUnchanged(() => reserve("a", "g2", op)); // operation uniqueness survives generation change
     check((await reserve("a", "g2")).status === "committed");
     s = await state(); check(s.domains[0].outstanding_bytes === "130" && s.domains[0].outstanding_objects === "26");
-    await rejects("DELETE FROM public.upload_resource_policies WHERE namespace='a' AND writer_generation='g1'", undefined, "23001");
-    await rejects("DELETE FROM public.upload_resource_domains", undefined, "23001");
+    // PG16 reports foreign_key_violation (23503); PG18 reports
+    // restrict_violation (23001). Require the specific FK and actual preservation,
+    // not just any rejected DELETE (e.g. permissions or missing relation).
+    const restrictiveDeletes: { constraint: string; code: string }[] = [];
+    for (const [sql, constraint, table] of [
+      ["DELETE FROM public.upload_resource_policies WHERE namespace='a' AND writer_generation='g1'",
+        "resource_attempt_policy_fk", "upload_resource_attempts"],
+      ["DELETE FROM public.upload_resource_domains",
+        "resource_policy_domain_fk", "upload_resource_policies"],
+    ]) {
+      const fk = await db.query(`SELECT confdeltype, confupdtype FROM pg_catalog.pg_constraint
+        WHERE conrelid=$1::regclass AND conname=$2`, ["public." + table, constraint]);
+      assert.deepEqual(fk.rows, [{ confdeltype: "r", confupdtype: "r" }]); checks++;
+      const before = await state();
+      const policiesBefore = (await db.query("SELECT * FROM public.upload_resource_policies ORDER BY namespace, writer_generation")).rows;
+      await assert.rejects(db.query(sql), (error: { code?: string; constraint?: string }) => {
+        if (error.constraint !== constraint || !["23503", "23001"].includes(error.code || "")) return false;
+        restrictiveDeletes.push({ constraint, code: error.code! });
+        return true;
+      }); checks++;
+      assert.deepEqual(await state(), before); checks++;
+      assert.deepEqual((await db.query("SELECT * FROM public.upload_resource_policies ORDER BY namespace, writer_generation")).rows,
+        policiesBefore); checks++;
+    }
     console.log(JSON.stringify({ status: "PASS", checks, concurrent: { requests: 32, committed: 10, denied: 22 },
+      postgresVersion, restrictiveDeletes,
       finalLiability: { bytes: 130, objects: 26 }, observedGenerationWaiter: true,
       actual: ["migration0009", "SQL callback", "transaction", "lease", "PostgreSQL"],
       excluded: ["TLS provider", "physical fencing", "live migration", "storage authority"] }));
