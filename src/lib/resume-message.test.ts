@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
@@ -17,7 +18,8 @@ for (const scenario of ["existing", "corrupt-timestamp", "copied-binding", "poli
     let connections = 0, reachCommit!: () => void, finishCommit!: () => void;
     const reached = new Promise<void>(r => { reachCommit = r; });
     const finish = new Promise<void>(r => { finishCommit = r; });
-    const client = { query: async (sql: string) => {
+    const events = new EventEmitter();
+    const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string) => {
       calls.push(sql);
       assert.ok(!sql.startsWith("INSERT"), "existing receipt must never insert");
       if (sql.startsWith("SELECT r.payload_hash")) return { rows: [{ id: 9, username: "Guest",
@@ -63,7 +65,8 @@ for (const mode of ["plain", "durable", "outcome"]) for (const uncertain of [fal
     const committing = new Promise<void>(r => { reachCommit = r; });
     const finish = new Promise<void>(r => { finishCommit = r; });
     let inserts = 0, destroyed = false;
-    const client = {
+    const events = new EventEmitter();
+    const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
       query: async (sql: string, args?: unknown[]) => {
         if (sql.startsWith("INSERT INTO messages")) {
           inserts++;

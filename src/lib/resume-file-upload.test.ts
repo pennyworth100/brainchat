@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
@@ -28,7 +29,8 @@ async function fixture(t: TestContext, mode = "ok") {
   const commitEntered = new Promise<void>(r => { enteredCommit = r; });
   const writer = new ResumeFileWriter(new ResumeUploadOperationGate({ connect: async () => {
     connects++;
-    return { query: async (sql: string, args: unknown[] = []) => {
+    const events = new EventEmitter();
+    return { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string, args: unknown[] = []) => {
       if (sql.includes("SELECT r.payload_hash")) return { rows: [] };
       if (sql.startsWith("INSERT INTO messages")) {
         inserts++;

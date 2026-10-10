@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
@@ -49,7 +50,8 @@ for (const mode of ["insert", "replay-new-path", "lost-ack", "tombstone", "wrong
     let inserts = 0, lookups = 0, commits = 0, connects = 0;
     const writer = new ResumeFileWriter(new ResumeUploadOperationGate({ connect: async () => {
       connects++;
-      return { query: async (sql: string) => {
+      const events = new EventEmitter();
+      return { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string) => {
         if (sql.includes("SELECT r.payload_hash")) {
           lookups++; return { rows: ["insert", "lost-ack", "receipt-failure"].includes(mode) ? [] : [row] };
         }

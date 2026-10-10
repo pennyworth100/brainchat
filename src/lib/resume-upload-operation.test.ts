@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { PoolClient } from "pg";
@@ -18,7 +19,8 @@ for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-du
     const grant = admissions.admit(binding)!;
     let calls = 0, connects = 0;
     const commands: string[] = [];
-    const client = { query: (sql: string) => {
+    const events = new EventEmitter();
+    const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: (sql: string) => {
       commands.push(sql);
       if (sql === "COMMIT" && mode === "commit-sync") throw Error("sync");
       if (sql === "COMMIT" && mode === "commit-lost") return Promise.reject(Error("lost ack"));
@@ -72,7 +74,8 @@ test("pending upload COMMIT stays unsettled and retains capacity past deadline",
   let finish!: () => void, entered!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
   const commit = new Promise<void>(resolve => { finish = resolve; });
-  const client = { query: async (sql: string) => {
+  const events = new EventEmitter();
+  const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string) => {
     if (sql === "COMMIT") { entered(); await commit; }
     return { rowCount: 1 };
   }, release: () => {} } as unknown as PoolClient;

@@ -70,7 +70,13 @@ async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
     if (!isCurrent()) return { authorized: false };
     const client = await pool.connect();
     let destroy = false;
+    let connectionError: Error | undefined;
+    // pg-pool owns idle errors only. Own checked-out errors through release,
+    // including gaps between queries while caller work awaits.
+    const onClientError = (error: Error) => { destroy = true; connectionError ??= error; };
+    const assertHealthy = () => { if (connectionError) throw connectionError; };
     try {
+      client.on("error", onClientError);
       await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
       // Same lock order as generation CAS: room policy, then session.
       await client.query("SELECT id FROM rooms WHERE id = $1 FOR SHARE", [binding.roomId]);
@@ -86,6 +92,7 @@ async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
             AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
         `, [binding.sessionId, binding.roomId, binding.username, binding.authVersion,
           binding.generation, binding.transportId]);
+        assertHealthy();
         return result.rowCount === 1 && isCurrent();
       };
       if (!await valid()) {
@@ -100,14 +107,22 @@ async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
         return { authorized: false };
       }
       // Mark BEFORE calling the driver, including synchronous driver failures.
+      assertHealthy();
       beforeCommit();
       await client.query("COMMIT");
+      assertHealthy();
       return { authorized: true, value };
     } catch (error) {
       destroy = true; // discard uncertain/failed checkout, never return success
       try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
       throw error;
     } finally {
-      client.release(destroy);
+      try {
+        client.release(destroy);
+        assertHealthy();
+      } finally {
+        // Preserve other owners; pg-pool has resumed ownership or destroyed.
+        client.removeListener("error", onClientError);
+      }
     }
   }

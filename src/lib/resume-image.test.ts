@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
@@ -44,7 +45,8 @@ for (const mode of ["new", "retry", "uncertain", "tombstone", "wrong-room", "wro
     const reached = new Promise<void>(r => { reach = r; });
     const finish = new Promise<void>(r => { release = r; });
     const calls: string[] = [];
-    const client = { query: async (sql: string, args?: unknown[]) => {
+    const events = new EventEmitter();
+    const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string, args?: unknown[]) => {
       calls.push(sql);
       if (sql.includes("SELECT r.payload_hash")) return { rows: ["new", "uncertain"].includes(mode) ? [] : [row] };
       if (sql.startsWith("INSERT INTO messages")) {

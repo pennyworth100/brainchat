@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { PoolClient } from "pg";
@@ -16,7 +17,8 @@ for (const mode of ["success", "copied", "checkout", "begin", "work", "rollback-
     const failure = new Error(mode);
     const commands: string[] = [];
     let connects = 0, callbacks = 0, released: boolean | undefined;
-    const client = {
+    const events = new EventEmitter();
+    const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
       query: (sql: string) => {
         commands.push(sql);
         if (mode === "commit-sync" && sql === "COMMIT") throw failure;
@@ -66,7 +68,8 @@ test("pending COMMIT cannot yield a no-commit outcome on disconnect", async () =
   let finish!: () => void, started!: () => void;
   const entered = new Promise<void>(resolve => { started = resolve; });
   const commit = new Promise<void>(resolve => { finish = resolve; });
-  const client = { query: async (sql: string) => {
+  const events = new EventEmitter();
+  const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events), query: async (sql: string) => {
     if (sql === "COMMIT") { started(); await commit; }
     return { rowCount: 1 };
   }, release: () => {} } as unknown as PoolClient;

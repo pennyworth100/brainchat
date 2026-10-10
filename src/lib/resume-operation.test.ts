@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Pool, PoolClient } from "pg";
@@ -13,7 +14,8 @@ test("uncertain COMMIT throws, destroys checkout and never returns authorization
   assert.ok(binding);
   const commands: string[] = [];
   let destroyed = false;
-  const client = {
+  const events = new EventEmitter();
+  const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
     query: async (sql: string) => {
       commands.push(sql);
       if (sql === "COMMIT") throw new Error("uncertain commit");
@@ -37,7 +39,8 @@ test("disconnect while waiting for checkout prevents callback inside transaction
   }, "transport_A_123456", async () => {}, () => true);
   assert.ok(binding);
   const commands: string[] = [];
-  const client = {
+  const events = new EventEmitter();
+  const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
     query: async (sql: string) => { commands.push(sql); return { rowCount: 1 }; },
     release: () => {},
   } as unknown as PoolClient;

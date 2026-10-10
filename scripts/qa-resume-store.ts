@@ -423,7 +423,7 @@ try {
         const result = await (real.query as Function).apply(real, args);
         if (args[0] === "COMMIT") { commitAttempts++; throw new Error("lost COMMIT ack"); }
         return result;
-      }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
     } };
     const lostAckWriter = new ResumeMessageWriter(new ResumeOperationGate(lostAckPool, bindings));
     await assert.rejects(lostAckWriter.saveOnceWithOutcome(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
@@ -723,7 +723,7 @@ try {
       const result = await (real.query as Function).apply(real, args);
       if (args[0] === "COMMIT") { outcomeCommitAttempts++; throw new Error("lost outcome ack"); }
       return result;
-    }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
   } }, admissionBindings);
   const unknownCommit = await outcomeLostAck.runWithOutcome(outcomeBinding,
     tx => insertResumeTextMessage(tx, outcomeBinding, "outcome-durable"));
@@ -772,7 +772,7 @@ try {
         const result = await (real.query as Function).apply(real, args);
         if (args[0] === "COMMIT") { commits++; throw Error("lost upload ACK"); }
         return result;
-      }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
     } }, uploads) : uploadGate;
     // Mutations commit while the operation is demonstrably blocked on its lock.
     const contention = ["durable-successor", "revoke", "expiry", "policy"].includes(mode);
@@ -865,7 +865,7 @@ try {
       const result = await (real.query as Function).apply(real, args);
       if (args[0] === "COMMIT") throw Error("lost file ACK");
       return result;
-    }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
   } }, uploads));
   const uncertainFile = await uncertainFiles.saveOnceWithOutcome(fileFixture.grant, "file-unknown", file);
   check(!uncertainFile.completed && uncertainFile.commit === "unknown");

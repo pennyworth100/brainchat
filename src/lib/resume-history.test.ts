@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Pool, PoolClient } from "pg";
@@ -17,7 +18,8 @@ async function fixture() {
     duringRead: async () => {}, failCommit: false,
     rows: [{ id: 2, type: "image", username: "A", content: '{"url":"/uploads/a.png","id":999,"username":"spoof"}', ts: new Date(500) },
       { id: 1, type: "message", username: "B", content: "hello", ts: new Date(400) }] };
-  const client = {
+  const events = new EventEmitter();
+  const client = { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
     query: async (sql: string, params?: unknown[]) => {
       commands.push(sql);
       if (sql.includes("FROM messages")) {

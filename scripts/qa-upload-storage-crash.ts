@@ -63,7 +63,7 @@ async function main() {
         const result = await real.query(sql, values);
         if (sql === "COMMIT") throw Error("controlled file COMMIT acknowledgement loss");
         return result;
-      }, release: real.release.bind(real) } as unknown as PoolClient;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as PoolClient;
     } }, admissions);
     const upload = new ResumeFileUpload(new ObservedStorage(root, admissions,
       new ResumeUploadReservations(pool)), new ResumeFileWriter(gate));
