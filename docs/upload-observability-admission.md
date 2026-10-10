@@ -30,7 +30,10 @@ untrusted error shape or post-removal mutable file metadata as durable identity.
 
 Dependency fingerprints and inspected versions are recorded in
 [writer coverage](upload-writer-coverage.md#dependency-evidence-installed-locked-tree-not-vendored-source).
-This is source-derived behavior, not a new OS-error reproduction.
+The original finding was source-derived. The subsequent
+[real disk removal regression](upload-disk-removal-metadata.md) now confirms
+metadata deletion and callback counts using owned namespace substitutions and
+real OS unlink errors; it does not reproduce an ordinary-file permission failure.
 
 A future observer must capture a bounded, immutable operation/namespace identity
 **before** invoking storage work/removal, record completion/error separately, and
@@ -98,13 +101,14 @@ This is a release contract to implement and prove, **not a completed barrier API
 
 ## Exact next bounded implementation slice
 
-Before attempting live quota initialization or all-writer fencing, add an isolated
-regression using the **real configured disk removal method** and an owned fixture
-to characterize failure metadata after removal is entered (including deleted
-file.path). Then design the bounded internal event envelope from those facts.
+The isolated **real disk removal** metadata slice and proposed bounded internal
+event envelope are recorded in [the follow-up](upload-disk-removal-metadata.md).
+Next review conservative public-parser resource cost, including the observed
+fileSize+1 crossing byte, directory/file inodes and retained failure bytes.
 Keep public responses generic and preserve callback counts/byte retention.
-This narrows an actual observability uncertainty; it does not authorize retry,
-cleanup, runtime wiring, a volume scan, merge, staging activation or production.
+This narrows actual uncertainty; it does not authorize retry, cleanup, runtime
+wiring, a volume scan, merge, staging activation or production.
 
 PR #20 remains draft/unmerged. Existing production exposure and paired-backup
-gates remain open. No version bump is needed for this documentation-only change.
+gates remain open. This follow-up changes tests/documentation only; the draft
+product version remains 3.0.11 and server.ts is unchanged.
