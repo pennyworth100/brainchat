@@ -218,3 +218,28 @@ not transparent reconnection, TCP blackhole/packet loss, a lost COMMIT response,
 SIGKILL cleanup, managed-platform privileges or physical writer fencing. Creating
 a replacement provider safely after an outage remains a separate operational
 recovery/provenance gate; this test grants no permission to replay UNKNOWN work.
+
+### Termination during a pending SQL query
+
+A third limited-role provider dispatches a real `SELECT pg_catalog.pg_sleep(30)`
+and immediately attaches fulfillment/rejection handlers. Before terminating its
+exact owned PID, an independent bootstrap connection observes the random database,
+limited role, `state=active`, exact query text and `Timeout/PgSleep` in
+`pg_stat_activity`. A two-second observation deadline is shorter than the existing
+five-second server statement timeout; missing that evidence fails the test.
+
+Finalization while SQL is pending returns `query-pending`, without releasing the
+lease. Administrative termination rejects the actual query with SQLSTATE `57P01`
+(not statement timeout); only after settlement is the lease destroyed once. A
+second finalization returns `already-finalized`. New pins/old-pin checkouts fail
+closed; server logs show the exact PID's sleep and termination, no transaction or
+mutation, and no subsequent connection probe/replay. Independent ledger snapshots
+remain identical. Cleanup awaits any pending query even on assertion failure.
+
+Local PostgreSQL 18.1: **79 assertions PASS**, TLSv1.3; database/role dropped and
+owned cluster stopped. The previous 65-assertion commit `f078d97` independently
+passed both full CI workflows, including PG16.15/18.6. The new pending-query case
+requires its own matrix results; prior CI is not evidence for this change.
+This is actual in-flight SQL termination, not a TCP blackhole, COMMIT-response
+loss, transparent reconnection or automatic recovery. UNKNOWN replay and all
+physical/managed-provider activation gates remain blocked.

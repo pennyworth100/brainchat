@@ -230,6 +230,59 @@ async function main() {
     await idle.close();
     check(JSON.stringify(await state()) === JSON.stringify(baseline));
     failures.push({ mode: "idle-in-pool", pid: idlePid, futureCheckout: "failed", pin: null });
+
+    // Unlike the preceding transaction, SQL is genuinely pending at termination.
+    const busy = make({ user: role }), busyPin = busy.pin(policy)!;
+    const busyLease = await busy.checkout(busyPin);
+    check(busyLease.status === "acquired");
+    if (busyLease.status !== "acquired") throw Error("Busy fixture checkout denied");
+    const busyPid = (await busyLease.lease.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    const sleepSql = "SELECT pg_catalog.pg_sleep(30) /* owned-provider-pending-query */";
+    let settled = false, destroyed = false;
+    cursor = log().length;
+    // Attach BOTH handlers at dispatch; never leave a rejection unobserved.
+    const pending = busyLease.lease.query(sleepSql).then(
+      () => { settled = true; return { rejected: false, code: "" }; },
+      (error: { code?: string }) => { settled = true; return { rejected: true, code: error.code || "" }; },
+    );
+    let observed: Record<string, unknown> | undefined;
+    try {
+      const deadline = Date.now() + 2000;
+      do {
+        const activity = await db.query(
+          "SELECT datname,usename,state,query,wait_event_type,wait_event FROM pg_stat_activity WHERE pid=$1 AND pid<>pg_backend_pid()",
+          [busyPid]);
+        const row = activity.rows[0];
+        if (row?.datname === database && row.usename === role && row.state === "active" &&
+            row.query === sleepSql && row.wait_event_type === "Timeout" && row.wait_event === "PgSleep") {
+          observed = row; break;
+        }
+        await delay(10);
+      } while (!settled && Date.now() < deadline);
+      check(observed !== undefined && !settled);
+      check(busyLease.lease.finalize(true) === "query-pending"); // no premature release
+      await terminateOwned(busyPid);
+      const outcome = await pending;
+      check(outcome.rejected && outcome.code === "57P01"); // not statement_timeout
+      await waitPoisoned(busy);
+    } finally {
+      // Even a failed assertion waits for query settlement before destroying once.
+      await pending;
+      destroyed = busyLease.lease.finalize(true) === "destroyed";
+    }
+    check(settled && destroyed);
+    check(busyLease.lease.finalize(true) === "already-finalized");
+    const busyLog = log().slice(cursor).split("\n").filter(line => line.includes("[" + busyPid + "]")).join("\n");
+    check(busyLog.includes(sleepSql) && busyLog.includes("terminating connection due to administrator command"));
+    check(!/statement: (BEGIN|INSERT|UPDATE|DELETE|COMMIT)/.test(busyLog));
+    cursor = log().length;
+    check((await busy.checkout(busyPin)).status === "failed");
+    check(log().slice(cursor).length === 0); // no reconnect/probe/mutation/replay
+    await busy.close();
+    check(JSON.stringify(await state()) === JSON.stringify(baseline));
+    failures.push({ mode: "pending-query", pid: busyPid, observed,
+      outcome: await pending, pendingFinalize: "query-pending", settledBeforeDestroy: settled,
+      destroyedOnce: destroyed, futureCheckout: "failed", pin: null });
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     console.log(JSON.stringify({ status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
