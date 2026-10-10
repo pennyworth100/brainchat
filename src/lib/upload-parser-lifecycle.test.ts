@@ -17,8 +17,12 @@ function gate() {
 // Real loopback HTTP, Busboy, Multer 2.4 and disk writes. Gates control callback
 // ordering, not clocks. These characterize middleware completion, not a global
 // writer barrier, crash durability, fsync or every descriptor in the process.
-for (const mode of ["destination", "filename", "visible-path", "info-only"] as const) {
-  test(`aborted upload lifecycle: ${mode}`, { timeout: 8000 }, async (t) => {
+for (const [mode, removeFailure] of [
+  ["destination", false], ["filename", false],
+  ["visible-path", false], ["info-only", false],
+  ["visible-path", true], ["info-only", true],
+] as const) {
+  test(`aborted upload lifecycle: ${mode}${removeFailure ? " removal failure" : ""}`, { timeout: 8000 }, async (t) => {
     const root = await mkdtemp(path.join(tmpdir(), "dimle-lifecycle-"));
     const namingEntered = gate(), releaseNaming = gate();
     const storageEntered = gate(), releaseStorage = gate(), storageReturned = gate();
@@ -27,7 +31,11 @@ for (const mode of ["destination", "filename", "visible-path", "info-only"] as c
     const events: string[] = [];
     const naming = mode === "destination" || mode === "filename";
     let parserCalls = 0, removeCalls = 0, handleCalls = 0;
-    let parserError: Error | undefined, handleError: { code?: string } | null | undefined;
+    type RemovalError = Error & { code?: string; field?: string; file?: Express.Multer.File };
+    const injectedError: RemovalError = Object.assign(new Error("controlled removal failure"), { code: "EACCES" });
+    let parserError: (Error & { storageErrors?: RemovalError[] }) | undefined;
+    let handleError: { code?: string } | null | undefined;
+    let storageErrorsAtParser: RemovalError[] | undefined;
     let sourceFile: Express.Multer.File | undefined;
     let pathAtAbort: string | undefined;
     const disk = multer.diskStorage({
@@ -66,11 +74,16 @@ for (const mode of ["destination", "filename", "visible-path", "info-only"] as c
         removeCalls++;
         events.push("remove-enter");
         removeEntered.resolve();
-        void releaseRemove.promise.then(() => disk._removeFile(req, file, (err) => {
-          events.push("remove-return");
-          cb(err);
-          removeReturned.resolve();
-        }));
+        void releaseRemove.promise.then(() => {
+          const finish = (err: Error | null) => {
+            events.push("remove-return");
+            cb(err);
+            removeReturned.resolve();
+          };
+          // Controlled adapter failure before unlink; not a host permission test.
+          if (removeFailure) finish(injectedError);
+          else disk._removeFile(req, file, finish);
+        });
       },
     };
     const parser = createUploadParser(storage, 1024);
@@ -84,6 +97,7 @@ for (const mode of ["destination", "filename", "visible-path", "info-only"] as c
       parser(req, res, (err) => {
         parserCalls++;
         parserError = err;
+        storageErrorsAtParser = err?.storageErrors?.slice();
         events.push("parser-return");
         parserReturned.resolve();
         if (!res.destroyed) res.status(err ? 400 : 200).end();
@@ -142,6 +156,7 @@ for (const mode of ["destination", "filename", "visible-path", "info-only"] as c
       assert.equal(handleCalls, 0);
       assert.equal(removeCalls, 0);
       assert.deepEqual(await readdir(root), ["owned.txt"], "parser returned before late cleanup");
+      assert.deepEqual(storageErrorsAtParser, [], "late removal has not run at parser return");
       releaseStorage.resolve();
       await storageReturned.promise;
       await removeEntered.promise;
@@ -154,9 +169,33 @@ for (const mode of ["destination", "filename", "visible-path", "info-only"] as c
     assert.ok(parserError, "aborted request is rejected");
     assert.equal(parserCalls, 1);
     assert.equal(handleCalls, 1);
-    assert.deepEqual(await readdir(root), [], "no extra fixture files after callback settlement");
+    if (removeFailure) {
+      assert.equal(removeCalls, 1, "failed removal is not retried on late completion");
+      assert.equal(handleError, null, "storage completed successfully before injected cleanup failure");
+      assert.deepEqual(await readdir(root), ["owned.txt"]);
+      assert.equal(await readFile(path.join(root, "owned.txt"), "utf8"), "fixture-bytes");
+      if (mode === "visible-path") {
+        assert.deepEqual(storageErrorsAtParser, [injectedError]);
+        assert.equal(parserError.storageErrors?.[0], injectedError);
+        assert.equal(injectedError.field, "file");
+        assert.equal(injectedError.file?.path, path.join(root, "owned.txt"));
+        assert.ok(events.indexOf("remove-return") < events.indexOf("parser-return"));
+      } else {
+        assert.deepEqual(storageErrorsAtParser, []);
+        assert.deepEqual(parserError.storageErrors, [], "late failure is not added to the returned error");
+        assert.equal(injectedError.file, undefined, "late branch bypasses initial error annotation");
+        assert.ok(events.indexOf("parser-return") < events.indexOf("remove-enter"));
+      }
+    } else {
+      assert.deepEqual(await readdir(root), [], "no extra fixture files after callback settlement");
+      assert.deepEqual(storageErrorsAtParser, []);
+      assert.deepEqual(parserError.storageErrors, []);
+    }
     assert.ok(events.indexOf("parser-return") < events.indexOf("handle-callback"));
-    t.diagnostic(JSON.stringify({ mode, events, parserCalls, handleCalls, removeCalls,
-      parserError: parserError.message, handleError: handleError?.code ?? null, remainingFiles: 0 }));
+    t.diagnostic(JSON.stringify({ mode, removeFailure, events, parserCalls, handleCalls, removeCalls,
+      parserError: parserError.message, handleError: handleError?.code ?? null,
+      storageErrorsAtParser: storageErrorsAtParser?.map((e) => e.code),
+      storageErrorsAfterSettlement: parserError.storageErrors?.map((e) => e.code),
+      remainingFiles: removeFailure ? 1 : 0 }));
   });
 }
