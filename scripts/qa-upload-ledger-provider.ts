@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
 import { createUploadLedgerProvider } from "../src/lib/upload-ledger-provider";
 import { runUploadLedgerTransaction } from "../src/lib/upload-ledger-transaction";
@@ -162,6 +163,73 @@ async function main() {
     s = await state();
     check(s.domain.outstanding_bytes === "20" && s.domain.outstanding_objects === "4");
     check(s.attempts.length === 2 && s.attempts.some(row => row.attempt_id === unknown.result.attemptId));
+    // Kill only a verified backend in OUR random database, never a supplied PID.
+    // No error-event interception: an unhandled pg error fails this child process.
+    const baseline = await state();
+    const failures: Record<string, unknown>[] = [];
+    async function terminateOwned(pid: number) {
+      const target = await db!.query("SELECT datname,usename FROM pg_stat_activity WHERE pid=$1 AND pid<>pg_backend_pid()", [pid]);
+      check(target.rowCount === 1 && target.rows[0].datname === database && target.rows[0].usename === role);
+      check((await db!.query("SELECT pg_terminate_backend($1) AS terminated", [pid])).rows[0].terminated === true);
+    }
+    async function waitPoisoned(p: typeof provider) {
+      const deadline = Date.now() + 5000;
+      while (p.pin(policy) !== null && Date.now() < deadline) await delay(10);
+      check(p.pin(policy) === null);
+    }
+    const active = make({ user: role }), activePin = active.pin(policy)!;
+    let activePid = 0, activeFinalizations = 0;
+    const activeCalls: string[] = [];
+    const observedActive = { ...active, checkout: async (ownedPin: typeof pin) => {
+      const r = await active.checkout(ownedPin);
+      if (r.status !== "acquired") return r;
+      const query = r.lease.query.bind(r.lease), finalize = r.lease.finalize.bind(r.lease);
+      r.lease.query = (sql, values) => { activeCalls.push(sql); return query(sql, values); };
+      r.lease.finalize = broken => { activeFinalizations++; check(broken); return finalize(broken); };
+      return r;
+    } };
+    const activeWork = createUploadResourceSqlWork(activePin, policy,
+      { auditId: "cut1", operationId: randomUUID(), writerId: "terminated-fixture" })!;
+    cursor = log().length;
+    const terminated = await runUploadLedgerTransaction(observedActive, activePin, async context => {
+      activePid = (await context.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      check(await activeWork(context) === "prepared"); // real uncommitted charge + attempt
+      await terminateOwned(activePid);
+      await waitPoisoned(active);
+      throw Error("fixture backend terminated before COMMIT");
+    });
+    check(terminated.status === "unknown" && !terminated.commitDispatched);
+    check(activeFinalizations === 1 && activeCalls.filter(sql => sql === "ROLLBACK").length === 1);
+    check(!activeCalls.includes("COMMIT"));
+    const activeLog = log().slice(cursor).split("\n").filter(line => line.includes("[" + activePid + "]")).join("\n");
+    check(activeLog.includes("BEGIN ISOLATION LEVEL READ COMMITTED") && activeLog.includes("INSERT INTO"));
+    check(activeLog.includes("terminating connection due to administrator command") && !activeLog.includes("statement: COMMIT"));
+    check(JSON.stringify(await state()) === JSON.stringify(baseline));
+    check(!baseline.attempts.some(row => row.attempt_id === terminated.attemptId));
+    cursor = log().length;
+    check((await active.checkout(activePin)).status === "failed");
+    const blocked = await runUploadLedgerTransaction(active, activePin, async () => { throw Error("must not execute"); });
+    check(blocked.status === "not-committed" && !blocked.commitDispatched);
+    check(log().slice(cursor).length === 0); // no reconnect, probe, mutation or replay
+    await active.close();
+    failures.push({ mode: "checked-out-in-transaction", pid: activePid, outcome: terminated,
+      finalizations: activeFinalizations, rollbackAttempted: true, serverCommit: false, futureCheckout: "failed" });
+
+    const idle = make({ user: role }), idlePin = idle.pin(policy)!;
+    const idleLease = await idle.checkout(idlePin);
+    check(idleLease.status === "acquired");
+    if (idleLease.status !== "acquired") throw Error("Idle fixture checkout denied");
+    const idlePid = (await idleLease.lease.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    check(idleLease.lease.finalize(false) === "released");
+    await terminateOwned(idlePid);
+    await waitPoisoned(idle);
+    cursor = log().length;
+    check((await idle.checkout(idlePin)).status === "failed");
+    check(log().slice(cursor).length === 0);
+    check(idleLease.lease.finalize(true) === "already-finalized");
+    await idle.close();
+    check(JSON.stringify(await state()) === JSON.stringify(baseline));
+    failures.push({ mode: "idle-in-pool", pid: idlePid, futureCheckout: "failed", pin: null });
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     console.log(JSON.stringify({ status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
@@ -169,6 +237,7 @@ async function main() {
       fixtureOnlyExplicitGrants: true, sameLeaseProbeBeforeBegin: true,
       committed: valid.result, lostAcknowledgement: unknown.result,
       finalLiability: { bytes: 20, objects: 4 },
+      backendTermination: failures, terminationPreservedLedger: true,
       actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "transaction", "SQL callback", "lease"],
       excluded: ["managed-provider privileges", "clone uniqueness", "physical fencing", "network fault injection", "live migration", "storage authority"] }));
   } finally {

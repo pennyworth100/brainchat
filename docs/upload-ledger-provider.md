@@ -187,3 +187,34 @@ Managed-provider support, trusted
 endpoint/clone provenance, pool/network failure recovery and physical fencing
 remain independent gates. No public consumer, IO authority, live migration,
 seed, merge, deployment or listener action follows from this local PASS.
+
+### Real backend termination (owned TLS fixture)
+
+The same matrix fixture now exercises two separate provider instances with the
+limited role. Before each `pg_terminate_backend`, the bootstrap connection checks
+the target PID belongs to this run's random database and limited role, and is not
+itself. No supplied PID or shared/live database is targeted.
+
+- **Checked-out transaction:** execute the real SQL callback, including its
+  uncommitted charge and attempt INSERT, then terminate that backend before
+  COMMIT. The provider's lifetime error listener poisons it. A deliberate callback
+  failure attempts ROLLBACK once; the dead connection cannot acknowledge it, so
+  the transaction conservatively returns UNKNOWN with the original attempt UUID
+  and `commitDispatched:false`, destroying the lease exactly once. An independent
+  connection confirms the ledger is unchanged and that UUID is absent. Server
+  logs confirm the transaction/INSERT, administrative termination and no COMMIT.
+- **Idle pool connection:** release a separate lease, terminate its verified
+  backend, then observe provider poisoning without intercepting error events.
+  An unhandled EventEmitter error would fail the child process. The finalized
+  lease cannot be finalized again.
+- Both poisoned providers reject new pins and old-pin checkouts, with no new
+  connection probe, mutation or replay in the statement log. `close()` completes;
+  the fixture drops its database/role and stops its owned cluster.
+
+Local PostgreSQL 18.1: **65 assertions PASS**, TLSv1.3, unchanged final liability
+20 bytes / 4 objects, `clusterStopped:true`. CI must independently validate PG16
+and PG18. This proves fail-closed behavior after administrative backend death,
+not transparent reconnection, TCP blackhole/packet loss, a lost COMMIT response,
+SIGKILL cleanup, managed-platform privileges or physical writer fencing. Creating
+a replacement provider safely after an outage remains a separate operational
+recovery/provenance gate; this test grants no permission to replay UNKNOWN work.
