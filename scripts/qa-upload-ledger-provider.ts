@@ -1,7 +1,7 @@
 /** Owned loopback TLS fixture ONLY. No live credentials, grants or storage IO.
  * Requires a dedicated PG instance logging statements and a one-day fixture CA.
- * Positive SQL composition uses its EXISTING bootstrap role, not an app-role claim.
- * A function EXECUTE revoke is confined to the disposable database (no grants).
+ * Positive SQL uses an explicitly limited nonsuperuser role in the random DB.
+ * All privilege changes are fixture-only; not a managed-platform readiness claim.
  */
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -13,10 +13,13 @@ import { createUploadResourceSqlWork } from "../src/lib/upload-resource-sql";
 
 async function main() {
   const fixture = process.env.LEDGER_TLS_FIXTURE || "";
-  assert.match(fixture, /^\/private\/tmp\/dimle-provider-tls-20261010-[a-z0-9]+$/);
+  assert.match(fixture, /^\/(?:private\/)?tmp\/dimle-provider-tls-[a-zA-Z0-9_-]+$/);
+  const manifest = JSON.parse(readFileSync(fixture + "/fixture.json", "utf8"));
+  assert.equal(manifest.kind, "owned-disposable-tls-v1");
+  assert.ok(Number.isInteger(manifest.port) && manifest.port > 1024 && manifest.port < 65536);
   const ca = readFileSync(fixture + "/server.crt", "utf8");
   const log = () => readFileSync(fixture + "/server.log", "utf8");
-  const connection = { host: "127.0.0.1", port: 55440, user: "dimle", password: "",
+  const connection = { host: "127.0.0.1", port: manifest.port, user: "dimle", password: "",
     ssl: { rejectUnauthorized: true, ca } };
   const admin = new Pool({ ...connection, database: "postgres", max: 1 });
   const suffix = randomBytes(8).toString("hex");
@@ -26,6 +29,7 @@ async function main() {
   const check = (value: unknown) => { assert.ok(value); checks++; };
   try {
     const systemIdentifier = (await admin.query("SELECT system_identifier::text FROM pg_control_system()")).rows[0].system_identifier;
+    // The unique per-run TLS trust anchor verifies our cluster before mutation.
     await admin.query('CREATE DATABASE "' + database + '"'); created = true;
     await admin.query('CREATE ROLE "' + role + '" LOGIN'); roleCreated = true;
     db = new Pool({ ...connection, database, max: 1 });
@@ -35,14 +39,14 @@ async function main() {
     const make = (overrides: Partial<typeof config> = {}) => {
       const p = createUploadLedgerProvider({ ...config, ...overrides }); providers.push(p); return p;
     };
-    const provider = make();
+    let provider = make();
     const policy = { identity: { database: provider.binding.database, schema: "public", quotaDomain: "volume",
       namespace: "a", policyVersion: "v1", writerGeneration: "g1" }, adapter: "multer-crossing-byte-v1",
       layout: "provisioned-root-one-directory-one-file-v1", allocationModel: "audited-rounded-copies-v1",
       stableExclusiveNamespace: true, allAllocationCostsBounded: true, maxFileBytes: 6,
       allocationUnitBytes: 1, allocationCopies: 1, directoryAndParentBytes: 3,
       metadataBytes: 0, temporaryBytes: 0, additionalObjects: 0 };
-    const pin = provider.pin(policy)!; check(pin !== null);
+    let pin = provider.pin(policy)!; check(pin !== null);
     check(provider.pin({ ...policy, identity: { ...policy.identity, database: "wrong" } }) === null);
     for (const table of ["domains", "policies", "attempts"])
       check((await db.query("SELECT count(*)::int AS n FROM public.upload_resource_" + table)).rows[0].n === 0);
@@ -80,6 +84,31 @@ async function main() {
     const deniedProbe = log().slice(cursor);
     check(deniedProbe.includes("permission denied for function pg_control_system"));
     check(!/statement: (BEGIN|INSERT|UPDATE|DELETE)/.test(deniedProbe));
+    // Explicit fixture-only privileges; no ownership, memberships or broad write grant.
+    await db.query('GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO "' + role + '"');
+    await db.query('GRANT USAGE ON SCHEMA public TO "' + role + '"');
+    await db.query('GRANT SELECT ON public.upload_resource_domains, public.upload_resource_policies TO "' + role + '"');
+    await db.query('GRANT UPDATE (outstanding_bytes, outstanding_objects) ON public.upload_resource_domains TO "' + role + '"');
+    // PostgreSQL row locks require UPDATE privilege on at least one column.
+    await db.query('GRANT UPDATE (policy_snapshot) ON public.upload_resource_policies TO "' + role + '"');
+    await db.query('GRANT INSERT, SELECT (attempt_id) ON public.upload_resource_attempts TO "' + role + '"');
+    const limited = new Pool({ ...connection, database, user: role, max: 1 });
+    try {
+      const attrs = (await limited.query("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname=current_user")).rows[0];
+      check(Object.values(attrs).every(value => value === false));
+      for (const sql of [
+        "UPDATE public.upload_resource_domains SET writer_generation='forbidden' WHERE false",
+        "DELETE FROM public.upload_resource_domains WHERE false",
+        "UPDATE public.upload_resource_policies SET writer_generation='forbidden' WHERE false",
+        "DELETE FROM public.upload_resource_policies WHERE false",
+        "UPDATE public.upload_resource_attempts SET writer_id='forbidden' WHERE false",
+        "DELETE FROM public.upload_resource_attempts WHERE false",
+      ]) {
+        await assert.rejects(limited.query(sql), (e: { code?: string }) => e.code === "42501"); checks++;
+      }
+    } finally { await limited.end(); }
+    provider = make({ user: role });
+    pin = provider.pin(policy)!; check(pin !== null);
     const acquired = await provider.checkout(pin);
     check(acquired.status === "acquired");
     if (acquired.status !== "acquired") throw Error("Fixture checkout denied");
@@ -136,7 +165,8 @@ async function main() {
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     console.log(JSON.stringify({ status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
-      bootstrapRolePositiveOnly: true, sameLeaseProbeBeforeBegin: true,
+      bootstrapRolePositiveOnly: false, fixtureLimitedRolePositive: true,
+      fixtureOnlyExplicitGrants: true, sameLeaseProbeBeforeBegin: true,
       committed: valid.result, lostAcknowledgement: unknown.result,
       finalLiability: { bytes: 20, objects: 4 },
       actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "transaction", "SQL callback", "lease"],

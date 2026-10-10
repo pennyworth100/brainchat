@@ -120,9 +120,50 @@ It is manually opted in, **not** a live deployment or a CI coverage claim.
   durable UUID. Total liabilities remain 20 bytes / 4 objects. This is a controlled
   exception seam, **not** packet loss, SIGKILL or network-fault evidence.
 
-Next: make this fixture reproducible in isolated CI (including supported PG
-versions) and verify a least-privilege positive composition without treating
-fixture grants as platform authorization. Managed-provider support, trusted
+### Reproducible fixture and limited-role composition
+
+The follow-up replaces manual cluster setup with:
+
+```sh
+PG_BIN=/path/to/postgresql/bin python3 scripts/qa-upload-ledger-tls-fixture.py
+```
+
+Run from a checkout with `npm ci` installed, Python 3, OpenSSL and Node 24 on
+PATH, as a non-root user. `PG_BIN` needs `initdb` and `pg_ctl`. The runner creates
+a fresh `/tmp/dimle-provider-tls-<random>` directory (resolved to `/private/tmp`
+on macOS), private per-run one-day certificate and key, and a new data directory.
+It selects an ephemeral loopback port, disables Unix sockets, and allows only
+verified TLS over loopback. No existing cluster, credential or configuration is
+used. The unique fixture trust anchor verifies the target before database/role
+creation. An ephemeral-port race causes startup/verification failure, not fallback.
+`fixture.json` supplies the port to the TypeScript test; the old manual invocation
+above is historical evidence, not the current setup contract.
+
+The runner stops only its own cluster on normal completion, child failure,
+timeout, SIGTERM or Python exception; SIGKILL/host loss cannot guarantee cleanup.
+`report.json` and `server.log` remain under the generated directory for inspection.
+The test drops its random database and role before cluster shutdown. CI retains
+only reports and server logs, never private keys or database files. The separate
+`ledger-tls` CI job installs PostgreSQL 16 and runs this owned fixture with Node 24;
+CI success must be observed, not inferred from local PostgreSQL 18.1 success.
+
+Positive transactions now use the generated nonsuperuser role with no CREATEDB,
+CREATEROLE, REPLICATION, BYPASSRLS or superuser attribute. After verifying the
+fixture-only permission denial, the fixture owner explicitly grants function
+EXECUTE, schema USAGE, SELECT on domains/policies, UPDATE of only the two domain
+liability columns, UPDATE of policy_snapshot (required by PostgreSQL FOR SHARE),
+and INSERT plus SELECT(attempt_id) on attempts. Six real SQLSTATE 42501 checks
+reject changes to generation, deletes, and attempt updates. The role performs
+both the acknowledged and UNKNOWN accounting transactions over verified TLS;
+the bootstrap role only provisions/inspects the fixture. Local PostgreSQL 18.1:
+41 assertions PASS. This is a limited-role composition test, **not** a hostile-SQL
+authorization boundary: policy_snapshot remains writable and column grants alone
+do not enforce monotonic accounting. It is not proof the managed platform can or
+should grant these permissions.
+
+Next: consume the new PostgreSQL 16 CI result, then extend the isolated matrix
+to other supported PostgreSQL versions without waiving permission review.
+Managed-provider support, trusted
 endpoint/clone provenance, pool/network failure recovery and physical fencing
 remain independent gates. No public consumer, IO authority, live migration,
 seed, merge, deployment or listener action follows from this local PASS.
