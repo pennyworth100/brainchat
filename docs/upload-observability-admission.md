@@ -111,7 +111,10 @@ policy/identity/overhead denies. A quote is not a physical reservation.
 The [transaction/schema mapping](upload-resource-reservation-mapping.md) records
 the exact incompatibilities with the old singleton, disjoint liability buckets,
 shared physical-domain lock, proposed additive records and required race cases.
-Next is an isolated private DB vector-reservation slice, not public wiring.
+The isolated vector transaction experiment now verifies shared-domain byte/object
+charges, rollback, unknown commit and observed generation lock contention.
+It remains fixture-only: next is a disabled private API with a trusted connection
+and policy contract, production schema constraints and failure/crash semantics.
 Keep public responses generic and preserve callback counts/byte retention.
 This narrows actual uncertainty; it does not authorize retry, cleanup, runtime
 wiring, a volume scan, merge, staging activation or production.

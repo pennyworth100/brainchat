@@ -158,9 +158,44 @@ the corrected require-based probe passed. Full probe source/results and checks:
 No full build, dependency audit or real PostgreSQL rerun is claimed for this
 documentation-only change; the previous baseline results above remain historical.
 
-Next: implement only the disabled, private additive DB vector-reservation slice
-in an owned isolated PostgreSQL fixture: domain/policy/attempt records, exact
-identity binding and all-or-nothing two-dimensional charge. Exercise shared-domain
-cross-namespace concurrency, one-dimension exhaustion, policy mismatch and
-rollback/unknown commit. No live migration/seed, storage consumer switch, public
-middleware, physical fence claim, refund or activation in that slice.
+### Isolated executable transaction experiment (2026-10-10 UTC)
+
+[`qa-upload-resource-vector.ts`](../scripts/qa-upload-resource-vector.ts) now
+creates and drops its own random PostgreSQL schema with synthetic domain,
+policy and attempt records. It is a **fixture-only implementation experiment**,
+not the application reservation API, production DDL or migration. CI runs it
+against the existing isolated PostgreSQL service. Missing/disabled domains deny.
+Two namespaces share one locked capacity envelope: 32 concurrent calls admit
+10 and deny 22, conserving both byte and object counters plus provenance.
+Independent exhaustion in either dimension denies without mutation. A real
+INSERT constraint failure rolls back both increments; a lost COMMIT ACK returns
+unknown while the committed charge and attempt remain present.
+
+The generation race observes the waiting backend's PostgreSQL `Lock` event
+before the holder changes generation/policy and commits. The waiting old
+generation is denied; a new-generation admission retains all earlier charges.
+Wrong policy/database/schema/adapter/audit and unsafe bigint decoding do not
+admit. Costs, identities, capacity and audit strings are **synthetic assertions**,
+not measured volume geometry, canonical connection authority or fencing evidence.
+SQL identifier interpolation is limited to generated schema names and fixed
+test-case field names, never request input.
+
+Local evidence for this follow-up: **47 PostgreSQL assertions**, 513 existing
+tests (508 application + 5 plugin), typecheck and production build PASS;
+production-only dependency audit reports zero vulnerabilities. The final
+lock-observation change was rechecked with the fixture and typecheck; no runtime
+source changed. Full logs are in private supervisor artifacts
+`resource-vector-20261010-checks.json` and `resource-vector-20261010-final.json`.
+These assertions are additional integration checks, not 47 new unit tests.
+
+This experiment does not implement trusted quote recomputation, an opaque live
+grant, connection authority, safe provisioning, production schema constraints,
+pool release-failure handling, worker crash recovery or physical enforcement.
+No storage call exists; a `reserved` fixture result is not IO authority. Prior
+0008 SIGKILL evidence is not inherited by this vector experiment.
+
+Next: extract a private disabled application primitive with an explicit trusted
+connection/policy contract and additive schema constraints, then verify its
+quote recomputation, exact input snapshot, checkout/release failure and crash
+semantics. Keep migration 0008 immutable. No live migration/seed, consumer switch,
+public middleware, physical fence claim, refund or activation.
