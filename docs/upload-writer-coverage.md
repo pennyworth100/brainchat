@@ -97,11 +97,13 @@ error. Check DB file reference and owned temporary blob independently. Also
 retain explicit cases for delayed touchRoom, late Multer cleanup and delayed
 unlink: request completion alone cannot mean writer settlement.
 
-The immediate next bounded slice is the committed-but-unacknowledged public
-upload regression (W08), using only a harness-owned database/schema/root and the
-actual current handler path. Do not point it at production/staging or interpret
-injected behavior as a live incident. Report the counterexample before choosing
-the smallest correction; no blind replay or deletion is an acceptable recovery.
+The committed-but-unacknowledged public upload regression (W08) is now
+[reproduced in isolation](public-upload-outcome.md): a real committed row remains
+after catch cleanup removes its blob. Throwing during emit after successful save
+produces the same dangling reference. These are injected counterexamples, not
+live incidents. The next slice is the smallest correction preserving bytes on
+uncertain outcomes and separating post-save publication errors; no blind replay
+or deletion is acceptable recovery. Deferred-writer drain remains unproven.
 
 Later barrier work must close admission across public HTTP/socket writers,
 private reservation/storage/receipt writers, maintenance/SQL/replicas and startup;
