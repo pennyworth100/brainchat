@@ -44,8 +44,12 @@ arbitrary caller pool. Its contract must supply:
 | Policy reader | Reads a complete, immutable-version policy on that client **after** acquiring the canonical domain lock. Uses trusted exact identity, never caller-provided charge. |
 
 Merely accepting an object with these fields would **not verify this contract**.
-The provider, its provenance, lifecycle tests and additive constraints are still
-missing. This helper neither opens a connection nor claims any was authenticated.
+The provider, its provenance, composed transaction lifecycle tests and additive
+constraints are still missing. A separate private
+[checkout lifecycle mechanism](upload-ledger-lease.md) now tests bounded checkout,
+late disposal and exactly-once finalization with a fake driver; it does not
+authenticate the connection or implement this provider. The policy-pin helper
+neither opens a connection nor claims any was authenticated.
 The pin must not be advertised as that missing provider or an opaque storage grant.
 
 ## Required transaction placement
@@ -90,9 +94,10 @@ The latter SHA-256 is
 `a7f591929935dff453f551050107f00f8007c470adb26f2053659da720abb03f`.
 Explicit source search finds no public/runtime consumer; `server.ts` is unchanged.
 
-Next bounded slice: implement and test the closed pinned-client lifecycle
-contract (checkout rejection, late checkout, release failure, COMMIT uncertainty)
-before extracting application vector SQL. Keep migration 0008 immutable, new
+Next bounded slice: compose the separately tested checkout/finalization mechanism
+with a closed, authority-owned provider and test the transaction outcome contract
+(especially COMMIT uncertainty and finalization failure) before extracting
+application vector SQL. Keep migration 0008 immutable, new
 constraints additive and unseeded, and the draft disabled. The complete mapping
 and physical-release gates remain in
 [upload-resource-reservation-mapping.md](upload-resource-reservation-mapping.md).
