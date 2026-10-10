@@ -106,8 +106,12 @@ event envelope are recorded in [the follow-up](upload-disk-removal-metadata.md).
 The [source-backed resource cost contract](upload-resource-cost.md) now proves
 the L+1 logical byte clamp with three real disk/HTTP cases, including a 1 MiB
 rejected input, and the empty destination directory retained after unlink.
-Next implement a private side-effect-free resource quote validator; unknown
-policy/identity/overhead must deny. A quote is not a physical reservation.
+The private side-effect-free quote validator is now implemented; unknown
+policy/identity/overhead denies. A quote is not a physical reservation.
+The [transaction/schema mapping](upload-resource-reservation-mapping.md) records
+the exact incompatibilities with the old singleton, disjoint liability buckets,
+shared physical-domain lock, proposed additive records and required race cases.
+Next is an isolated private DB vector-reservation slice, not public wiring.
 Keep public responses generic and preserve callback counts/byte retention.
 This narrows actual uncertainty; it does not authorize retry, cleanup, runtime
 wiring, a volume scan, merge, staging activation or production.
