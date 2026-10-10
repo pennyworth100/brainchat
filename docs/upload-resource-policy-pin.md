@@ -28,7 +28,7 @@ Own data descriptors avoid executing getters; hostile Proxies are outside this
 trusted-data contract. Invalid inputs return null; unexpected JS exceptions must
 be caught by the future reservation transaction and never converted to admission.
 
-## Exact trusted connection interface (required, NOT implemented)
+## Exact trusted connection interface (required; private provider slice implemented)
 
 The future reservation service must be constructed only in the server's trusted
 composition root with a **closed, authority-owned connection provider**, not an
@@ -44,8 +44,10 @@ arbitrary caller pool. Its contract must supply:
 | Policy reader | Reads a complete, immutable-version policy on that client **after** acquiring the canonical domain lock. Uses trusted exact identity, never caller-provided charge. |
 
 Merely accepting an object with these fields would **not verify this contract**.
-The provider, its provenance, composed transaction lifecycle tests and additive
-constraints are still missing. A separate private
+The private [owned-pool provider](upload-ledger-provider.md) now supplies fixed
+connection/policy binding and same-lease cluster/database probing. Actual trusted
+infrastructure provisioning evidence, composed transaction lifecycle tests and
+additive constraints remain missing. A separate private
 [checkout lifecycle mechanism](upload-ledger-lease.md) now tests bounded checkout,
 late disposal and exactly-once finalization with a fake driver; it does not
 authenticate the connection or implement this provider. The policy-pin helper
@@ -94,8 +96,8 @@ The latter SHA-256 is
 `a7f591929935dff453f551050107f00f8007c470adb26f2053659da720abb03f`.
 Explicit source search finds no public/runtime consumer; `server.ts` is unchanged.
 
-Next bounded slice: compose the separately tested checkout/finalization mechanism
-with a closed, authority-owned provider and test the transaction outcome contract
+Next bounded slice: compose the private owned-pool provider with a transaction
+state machine and test the outcome contract
 (especially COMMIT uncertainty and finalization failure) before extracting
 application vector SQL. Keep migration 0008 immutable, new
 constraints additive and unseeded, and the draft disabled. The complete mapping

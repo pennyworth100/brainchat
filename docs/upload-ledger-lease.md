@@ -1,8 +1,8 @@
 # Private upload ledger checkout lifecycle (draft 3.0.11)
 
 [`upload-ledger-lease.ts`](../src/lib/upload-ledger-lease.ts) implements a bounded
-**checkout-only lifecycle mechanism**, not the closed trusted provider required
-by [the policy-pin contract](upload-resource-policy-pin.md). No runtime/public
+**checkout-only lifecycle mechanism**, now composed by the private
+[owned-pool provider](upload-ledger-provider.md). No runtime/public
 consumer imports it. It does not change the old singleton reservation, vector
 fixture SQL, migrations, budget seed, storage writer, deployment or listener.
 
@@ -54,10 +54,9 @@ unknown. Existing singleton tests do not satisfy the new vector service's proof.
 
 ## Next bounded slice / activation still blocked
 
-Build the server-owned closed provider: immutable canonical cluster+database
-identity, schema and fixed qualified tables, exclusive pool provenance, and
-policy binding. Do not accept a request-selected pool/schema/search_path. Compose
-this lifecycle helper with that provider, then test transaction dispatch,
+The [private provider](upload-ledger-provider.md) now owns the pool, canonical
+identity binding, fixed tables and policy-pin provenance. Its fake-driver tests
+are not real connection/provisioning evidence. Next test transaction dispatch,
 COMMIT uncertainty/finalization failure and no-replay with durable attempt
 identity. Only then extract application vector SQL and additive unseeded
 constraints. Keep migration 0008 immutable and public wiring disabled.
