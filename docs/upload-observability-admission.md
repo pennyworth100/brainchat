@@ -103,8 +103,11 @@ This is a release contract to implement and prove, **not a completed barrier API
 
 The isolated **real disk removal** metadata slice and proposed bounded internal
 event envelope are recorded in [the follow-up](upload-disk-removal-metadata.md).
-Next review conservative public-parser resource cost, including the observed
-fileSize+1 crossing byte, directory/file inodes and retained failure bytes.
+The [source-backed resource cost contract](upload-resource-cost.md) now proves
+the L+1 logical byte clamp with three real disk/HTTP cases, including a 1 MiB
+rejected input, and the empty destination directory retained after unlink.
+Next implement a private side-effect-free resource quote validator; unknown
+policy/identity/overhead must deny. A quote is not a physical reservation.
 Keep public responses generic and preserve callback counts/byte retention.
 This narrows actual uncertainty; it does not authorize retry, cleanup, runtime
 wiring, a volume scan, merge, staging activation or production.
