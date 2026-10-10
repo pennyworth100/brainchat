@@ -243,3 +243,28 @@ requires its own matrix results; prior CI is not evidence for this change.
 This is actual in-flight SQL termination, not a TCP blackhole, COMMIT-response
 loss, transparent reconnection or automatic recovery. UNKNOWN replay and all
 physical/managed-provider activation gates remain blocked.
+
+### Explicit replacement without UNKNOWN replay
+
+The owned TLS fixture now constructs a fresh limited-role provider from the same
+explicit trusted fixture configuration after backend failure. The poisoned
+provider remains open during this check, so its continued rejection is not just
+an effect of shutdown. Construction/pinning are inert, and the new provider
+rejects the old provider's pin without connecting. Only a fresh owned pin admits
+one **new unrelated** transaction: the same backend probes identity before BEGIN,
+inserts its distinct attempt UUID and acknowledges exactly one COMMIT.
+
+Liabilities increase once from 20 bytes / 4 objects to 30 bytes / 6 objects.
+Independent SQL snapshots preserve both original durable rows byte-for-byte;
+the aborted UNKNOWN attempt remains absent. Both original UNKNOWN outcomes and
+UUIDs remain UNKNOWN, with no replay or reconciliation inferred from those
+snapshots. The replacement PID's log contains neither UNKNOWN UUID. New pins and
+old-pin checkouts on the still-open poisoned provider remain denied without SQL.
+
+Local PostgreSQL 18.1: **97 assertions PASS**, TLSv1.3, typecheck PASS, owned
+database/role dropped and cluster stopped. PG16/18 CI results must be verified
+separately. This proves explicit replacement composition in a trusted disposable
+fixture, **not automatic recovery**, endpoint/failover provenance, network-fault
+recovery, UNKNOWN replay safety or physical fencing. There is no runtime wiring,
+live migration, seed, deployment, storage IO or permission change outside the
+fixture. All activation gates above remain required.

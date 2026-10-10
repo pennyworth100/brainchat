@@ -125,12 +125,12 @@ async function main() {
       domain: (await db!.query("SELECT outstanding_bytes,outstanding_objects FROM public.upload_resource_domains")).rows[0],
       attempts: (await db!.query("SELECT * FROM public.upload_resource_attempts ORDER BY attempt_id")).rows,
     });
-    async function reserve(loseAcknowledgement = false) {
-      const work = createUploadResourceSqlWork(pin, policy, { auditId: "cut1", operationId: randomUUID(), writerId: "fixture" })!;
+    async function reserve(loseAcknowledgement = false, selectedProvider = provider, selectedPin = pin) {
+      const work = createUploadResourceSqlWork(selectedPin, policy, { auditId: "cut1", operationId: randomUUID(), writerId: "fixture" })!;
       let pid = 0, finalizations = 0, destroyed = false;
       const calls: string[] = [];
-      const observed = { ...provider, checkout: async (ownedPin: typeof pin) => {
-        const r = await provider.checkout(ownedPin);
+      const observed = { ...selectedProvider, checkout: async (ownedPin: typeof pin) => {
+        const r = await selectedProvider.checkout(ownedPin);
         if (r.status !== "acquired") return r;
         pid = (await r.lease.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
         const query = r.lease.query.bind(r.lease), finalize = r.lease.finalize.bind(r.lease);
@@ -144,7 +144,7 @@ async function main() {
         r.lease.finalize = broken => { finalizations++; destroyed = broken; return finalize(broken); };
         return r;
       } };
-      const result = await runUploadLedgerTransaction(observed, pin, work);
+      const result = await runUploadLedgerTransaction(observed, selectedPin, work);
       check(finalizations === 1);
       return { result, pid, calls, destroyed };
     }
@@ -278,19 +278,52 @@ async function main() {
     cursor = log().length;
     check((await busy.checkout(busyPin)).status === "failed");
     check(log().slice(cursor).length === 0); // no reconnect/probe/mutation/replay
-    await busy.close();
     check(JSON.stringify(await state()) === JSON.stringify(baseline));
     failures.push({ mode: "pending-query", pid: busyPid, observed,
       outcome: await pending, pendingFinalize: "query-pending", settledBeforeDestroy: settled,
       destroyedOnce: destroyed, futureCheckout: "failed", pin: null });
+    // Explicit trusted replacement, never automatic recovery or UNKNOWN replay.
+    // Keep busy OPEN here: denial must be poisoning, not merely close().
+    const retainedUnknown = JSON.stringify([unknown.result, terminated]);
+    cursor = log().length;
+    const replacement = make({ user: role });
+    const replacementPin = replacement.pin(policy)!;
+    check(replacementPin !== null && replacementPin !== busyPin);
+    check((await replacement.checkout(busyPin)).status === "failed");
+    check(log().slice(cursor).length === 0); // construction/pinning/foreign pin are inert
+    const fresh = await reserve(false, replacement, replacementPin);
+    check(fresh.result.status === "committed" && fresh.result.commitDispatched && !fresh.destroyed);
+    check(![valid.result.attemptId, unknown.result.attemptId, terminated.attemptId].includes(fresh.result.attemptId));
+    check(fresh.calls.filter(sql => sql === "COMMIT").length === 1 && !fresh.calls.includes("ROLLBACK"));
+    const replacementLog = log().slice(cursor).split("\n").filter(line => line.includes("[" + fresh.pid + "]")).join("\n");
+    const replacementProbe = replacementLog.indexOf("SELECT pg_catalog.current_database()");
+    const replacementBegin = replacementLog.indexOf("BEGIN ISOLATION LEVEL READ COMMITTED");
+    check(replacementProbe >= 0 && replacementBegin > replacementProbe);
+    check((replacementLog.match(/statement: COMMIT/g) || []).length === 1);
+    check((replacementLog.match(/INSERT INTO/g) || []).length === 1 && replacementLog.includes(fresh.result.attemptId));
+    check(!replacementLog.includes(unknown.result.attemptId) && !replacementLog.includes(terminated.attemptId));
+    const replacedState = await state();
+    check(replacedState.domain.outstanding_bytes === "30" && replacedState.domain.outstanding_objects === "6");
+    check(replacedState.attempts.length === 3 && replacedState.attempts.filter(row => row.attempt_id === fresh.result.attemptId).length === 1);
+    check(JSON.stringify(replacedState.attempts.filter(row => row.attempt_id !== fresh.result.attemptId)) === JSON.stringify(baseline.attempts));
+    check(!replacedState.attempts.some(row => row.attempt_id === terminated.attemptId));
+    check(JSON.stringify([unknown.result, terminated]) === retainedUnknown);
+    cursor = log().length;
+    check(busy.pin(policy) === null && (await busy.checkout(busyPin)).status === "failed");
+    check(log().slice(cursor).length === 0); // replacement never revives poisoned provider
+    await busy.close();
+    await replacement.close();
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     console.log(JSON.stringify({ status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
       bootstrapRolePositiveOnly: false, fixtureLimitedRolePositive: true,
       fixtureOnlyExplicitGrants: true, sameLeaseProbeBeforeBegin: true,
       committed: valid.result, lostAcknowledgement: unknown.result,
-      finalLiability: { bytes: 20, objects: 4 },
+      finalLiability: { bytes: 30, objects: 6 },
       backendTermination: failures, terminationPreservedLedger: true,
+      explicitReplacement: { pid: fresh.pid, outcome: fresh.result, sameLeaseProbeBeforeBegin: true,
+        commitCount: 1, insertCount: 1, originalRowsUnchanged: true, retainedUnknown: [unknown.result, terminated],
+        unknownReplay: false, poisonedProviderRevived: false, automaticRecovery: false },
       actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "transaction", "SQL callback", "lease"],
       excluded: ["managed-provider privileges", "clone uniqueness", "physical fencing", "network fault injection", "live migration", "storage authority"] }));
   } finally {
