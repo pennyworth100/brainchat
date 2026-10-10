@@ -30,8 +30,12 @@ export class ResumeUploadReservations {
     }
     let client: PoolClient | undefined, commitDispatched = false;
     let broken = false;
+    // pg-pool removes its idle error listener while a client is checked out.
+    // A lost socket rejects queries AND emits error; catch alone cannot own it.
+    const onClientError = () => { broken = true; };
     try {
       client = await this.pool.connect();
+      client.on("error", onClientError);
       await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
       // Concurrent UPDATE rechecks the predicate after the row-lock wait.
       // Counter and provenance commit atomically. Missing budget fails closed.
@@ -46,8 +50,10 @@ export class ResumeUploadReservations {
         (storage_key, session_id, room_id, client_message_id, reserved_bytes)
         VALUES ($1, $2, $3, $4, $5)`, [attempt.storageKey, attempt.sessionId,
         attempt.roomId, attempt.clientMessageId, attempt.reservedBytes]);
+      if (broken) throw Error("Upload reservation connection failed");
       commitDispatched = true;
       await client.query("COMMIT");
+      if (broken) throw Error("Upload reservation connection failed");
       return { status: "reserved", attempt };
     } catch {
       broken = true;
@@ -57,6 +63,9 @@ export class ResumeUploadReservations {
     } finally {
       try { client?.release(broken); } catch {
         return { status: "failed", commit: commitDispatched ? "unknown" : "not-dispatched", attempt };
+      } finally {
+        // release restores pg-pool's idle owner or destroys the broken client.
+        client?.removeListener("error", onClientError);
       }
     }
   }

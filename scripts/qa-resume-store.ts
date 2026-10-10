@@ -997,7 +997,7 @@ try {
               "reservation-successor-" + f.binding.sessionId, async () => {}, () => true);
           }
           return result;
-        }, release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+        }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
       } });
       let reads = 0;
       async function* untouched() { reads++; yield Buffer.from("unused"); }

@@ -43,7 +43,7 @@ async function main() {
         const result = await real.query(sql, values);
         if (sql === "COMMIT") throw Error("controlled lost COMMIT acknowledgement");
         return result;
-      }, release: real.release.bind(real) } as unknown as PoolClient;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as PoolClient;
     } });
     const uncertain = await lost.reserve(input);
     check(uncertain.status === "failed" && uncertain.commit === "unknown");
