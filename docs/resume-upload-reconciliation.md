@@ -4,6 +4,10 @@ Status: private contract, bounded database collector, separate root-entry observ
 proof, NOT a complete reconciliation collector. No scheduler, public route, cleanup, refund, retry or deployment is
 enabled. The ledger remains monotonic. This contract does not grant repair authority.
 
+The [all-writer source coverage audit](upload-writer-coverage.md) enumerates public,
+private, dependency-owned and external mutation paths. It identifies uncovered
+legacy upload lifetimes; it does not establish or activate a cross-store barrier.
+
 ## Evidence sources and completeness
 
 ### Private evidence envelope
