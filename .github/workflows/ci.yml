@@ -20,6 +20,10 @@ jobs:
   ledger-tls:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 18]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -28,16 +32,16 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Install isolated fixture tools
-        run: sudo apt-get update && sudo apt-get install -y postgresql-16 openssl
-      - name: Verified TLS provider composition (owned PostgreSQL 16 cluster)
+        run: sudo apt-get update && sudo apt-get install -y postgresql-${{ matrix.postgres }} openssl
+      - name: Verified TLS provider composition (owned PostgreSQL ${{ matrix.postgres }} cluster)
         env:
-          PG_BIN: /usr/lib/postgresql/16/bin
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py
       - name: Retain fixture evidence (no keys or database files)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ledger-tls-pg16
+          name: ledger-tls-pg${{ matrix.postgres }}
           path: |
             /tmp/dimle-provider-tls-*/report.json
             /tmp/dimle-provider-tls-*/server.log

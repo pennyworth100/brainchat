@@ -144,8 +144,12 @@ timeout, SIGTERM or Python exception; SIGKILL/host loss cannot guarantee cleanup
 `report.json` and `server.log` remain under the generated directory for inspection.
 The test drops its random database and role before cluster shutdown. CI retains
 only reports and server logs, never private keys or database files. The separate
-`ledger-tls` CI job installs PostgreSQL 16 and runs this owned fixture with Node 24;
-CI success must be observed, not inferred from local PostgreSQL 18.1 success.
+`ledger-tls` CI matrix installs PostgreSQL 16 and 18 on separate Ubuntu 24.04
+runners and runs this owned fixture with Node 24. Each leg uses its explicit
+versioned binary directory and retains a distinct `ledger-tls-pg<major>` artifact.
+Fail-fast is disabled so both versions produce independent evidence. Package
+minor versions follow the runner's apt repositories; the report records the actual
+server version. CI success must be observed, not inferred from local success.
 
 Positive transactions now use the generated nonsuperuser role with no CREATEDB,
 CREATEROLE, REPLICATION, BYPASSRLS or superuser attribute. After verifying the
@@ -161,8 +165,10 @@ authorization boundary: policy_snapshot remains writable and column grants alone
 do not enforce monotonic accounting. It is not proof the managed platform can or
 should grant these permissions.
 
-Next: consume the new PostgreSQL 16 CI result, then extend the isolated matrix
-to other supported PostgreSQL versions without waiving permission review.
+The initial PostgreSQL 16.15 CI fixture passed all 41 assertions with TLSv1.3
+and confirmed cluster cleanup (both workflows for commit `02b87c4` succeeded).
+Next: consume both PostgreSQL 16/18 matrix reports and verify their server versions,
+41 assertions and cleanup independently, without waiving permission review.
 Managed-provider support, trusted
 endpoint/clone provenance, pool/network failure recovery and physical fencing
 remain independent gates. No public consumer, IO authority, live migration,
