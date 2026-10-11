@@ -23,6 +23,7 @@ export interface ChatMessage {
 export interface RoomSnapshot {
   history: ChatMessage[];
   users: string[];
+  capabilities?: { textOperationKeys?: boolean };
 }
 
 // IDs are assigned by the database, not by client clocks or usernames.
@@ -50,6 +51,7 @@ export function createRoomSession(
   let joinTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let retries = 0;
+  let textOperationKeys = false;
   let probe: Promise<string> | null = null;
   let healthProbe: Promise<string> | null = null;
   const waiters = new Set<{ resolve: (id: string) => void; reject: (err: Error) => void }>();
@@ -85,6 +87,7 @@ export function createRoomSession(
     clearRetryTimer();
     retries = 0;
     callbacks.onSnapshot(snapshot);
+    if (snapshot.capabilities?.textOperationKeys === true) textOperationKeys = true;
     delete credentials.creationToken;
     callbacks.onJoined();
     setState("ready");
@@ -94,6 +97,7 @@ export function createRoomSession(
     }
   };
   const onDisconnect = () => {
+    textOperationKeys = false;
     ++epoch;
     clearJoinTimer();
     if (credentials && !disposed && state !== "error") setState("reconnecting");
@@ -209,6 +213,7 @@ export function createRoomSession(
       retries = 0;
       socket.disconnect();
       credentials = { ...next };
+      textOperationKeys = false;
       setState("reconnecting");
       socket.connect();
     },
@@ -224,6 +229,7 @@ export function createRoomSession(
       return whenReady();
     },
     isReady: () => state === "ready" && socket.connected,
+    canRetryText: () => state === "ready" && socket.connected && textOperationKeys,
     dispose() {
       disposed = true;
       ++epoch;
