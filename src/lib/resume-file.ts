@@ -30,6 +30,12 @@ export function canonicalResumeFile(file: ResumeStoredFile): ResumeStoredFile {
 
 type FileRow = { id: number; room_id: string; username: string; type: string; content: string; ts: Date };
 
+export function resumeFileContent(file: ResumeStoredFile): string {
+  const f = canonicalResumeFile(file);
+  return JSON.stringify({ url: `/uploads/${f.storageKey}/blob`, name: f.name,
+    size: f.size, mime: f.mime, sha256: f.sha256 });
+}
+
 // Database-only primitive used by the server-owned strict upload composition.
 // No filesystem effects, cleanup, retry, release, ACK or broadcast here.
 export class ResumeFileWriter {
@@ -49,9 +55,7 @@ export class ResumeFileWriter {
         binding.roomId, binding.username, "file", f.name, f.size, f.mime, f.sha256,
       ]);
       const hash = createHash("sha256").update(identity(candidate)).digest("hex");
-      const content = (f: ResumeStoredFile) => JSON.stringify({
-        url: `/uploads/${f.storageKey}/blob`, name: f.name, size: f.size, mime: f.mime, sha256: f.sha256,
-      });
+      const content = resumeFileContent;
       const receipt = (row: FileRow | undefined): ResumeFileMessage => {
         if (!row || !Number.isSafeInteger(row.id) || row.id < 1 ||
             row.room_id !== binding.roomId || row.username !== binding.username || row.type !== "file" ||
