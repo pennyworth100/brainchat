@@ -4,6 +4,13 @@
 Private quote arithmetic/tests/documentation only. This defines inputs required before admission wiring;
 it neither supplies measured capacity nor enables a budget, cleanup or rollout.
 
+2026-10-11 addendum: the original Multer L+1 contract below is unchanged.
+The separate private `resume-strict-writer-v1` quote/pin adapter now supports
+`ResumeFileStorage`'s reject-before-write ceiling L; see
+[strict adapter evidence and limits](upload-resource-policy-pin.md#2026-10-11-strict-writer-adapter).
+It shares the complete physical-policy prerequisites below, not a presumed
+filesystem bound. No production or recovery policy is enabled by this helper.
+
 ## Source-derived bound and executed proof
 
 [createUploadParser](../src/lib/upload-parser.ts) permits one file, zero text

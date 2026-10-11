@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { ResumeBindings } from "./resume-bindings";
 import { ResumeUploadAdmissions } from "./resume-upload-admission";
 import { ResumeFileStorage, writeResumeChunk } from "./resume-file-storage";
+import { quoteStrictUploadResources } from "./upload-resource-quote";
 
 const metadata = { name: "report.txt", mime: "text/plain", clientMessageId: "key" };
 const reservations: Pick<import("./resume-upload-reservation").ResumeUploadReservations, "reserve"> = {
@@ -29,6 +30,32 @@ async function fixture(t: TestContext, maxBytes = 10) {
   return { root, bindings, binding, admissions, grant, storage, time: (v: number) => { now = v; } };
 }
 async function* bytes(...chunks: string[]) { for (const c of chunks) yield Buffer.from(c); }
+
+test("strict quote logical ceiling matches actual writer at and across L for different chunks", async t => {
+  for (const [chunks, expected, accepted] of [
+    [["abcd"], "abcd", true], [["abcd", "e"], "abcd", false],
+    [["abc", "de"], "abc", false], [["abcde"], "", false],
+  ] as const) {
+    const f = await fixture(t, 4);
+    t.after(() => { f.admissions.release(f.grant); });
+    const identity = { database: "fixture", schema: "fixture", namespace: f.root,
+      quotaDomain: "fixture", policyVersion: "v1", writerGeneration: "g1" };
+    // Synthetic physical numbers: this verifies the logical adapter ONLY.
+    const quote = quoteStrictUploadResources({ identity, adapter: "resume-strict-writer-v1",
+      layout: "provisioned-root-one-directory-one-file-v1", allocationModel: "audited-rounded-copies-v1",
+      stableExclusiveNamespace: true, allAllocationCostsBounded: true,
+      maxFileBytes: f.admissions.byteLimit(f.grant), allocationUnitBytes: 1, allocationCopies: 1,
+      directoryAndParentBytes: 0, metadataBytes: 0, temporaryBytes: 0, additionalObjects: 0 }, identity)!;
+    const pending = f.storage.stage(f.grant, metadata, bytes(...chunks));
+    if (accepted) assert.equal((await pending).file.size, quote.logicalFileBytes);
+    else await assert.rejects(pending, /denied/);
+    const dirs = await readdir(f.root); assert.equal(dirs.length, 1);
+    const data = await readFile(join(f.root, dirs[0], "blob"));
+    assert.equal(data.toString(), expected);
+    assert.ok(data.length <= quote.logicalFileBytes);
+    assert.equal(quote.logicalFileBytes, 4);
+  }
+});
 
 test("exclusive storage derives bytes/digest, restrictive modes and exact grant capability", async t => {
   const f = await fixture(t);

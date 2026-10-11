@@ -60,6 +60,19 @@ function integer(value: unknown, minimum = 0): bigint | null {
  * No defaults: explicit zero overhead is an audited assertion, not an estimate.
  */
 export function quoteUploadResources(policy: unknown, expectedIdentity: unknown): UploadResourceQuote | null {
+  return quote(policy, expectedIdentity, 1n);
+}
+
+/** ResumeFileStorage rejects an entire crossing chunk before writing it. This
+ * distinct adapter quotes L, never Multer's L+1. Still arithmetic, not authority.
+ */
+export function quoteStrictUploadResources(policy: unknown, expectedIdentity: unknown): UploadResourceQuote | null {
+  const input = record(policy);
+  if (!input || field(input, "adapter") !== "resume-strict-writer-v1") return null;
+  return quote(input, expectedIdentity, 0n);
+}
+
+function quote(policy: unknown, expectedIdentity: unknown, crossingBytes: bigint): UploadResourceQuote | null {
   const input = record(policy), expected = identity(expectedIdentity);
   if (!input || !expected) return null;
   const boundIdentity = identity(field(input, "identity"));
@@ -80,7 +93,7 @@ export function quoteUploadResources(policy: unknown, expectedIdentity: unknown)
       metadata === null || temporary === null || extraObjects === null) return null;
 
   // BigInt avoids rounding intermediate sums/products near MAX_SAFE_INTEGER.
-  const logical = limit + 1n;
+  const logical = limit + crossingBytes;
   const file = ((logical + unit - 1n) / unit) * unit * copies;
   const allocated = file + directory + metadata + temporary;
   const objects = 2n + extraObjects;

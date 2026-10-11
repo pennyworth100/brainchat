@@ -8,9 +8,14 @@ storage-consumer switch, deployment, refund or activation.
 [`upload-resource-policy-pin.ts`](../src/lib/upload-resource-policy-pin.ts)
 captures the exact six-field identity, adapter and every arithmetic policy input
 synchronously before checkout/await. It recomputes its quote rather than trusting
-a supplied `quote`, `allocatedBytes` or `objects` property. Only the explicitly
-named `multer-crossing-byte-v1` adapter is supported; the current private raw
-writer has different chunk semantics and is deliberately rejected.
+a supplied `quote`, `allocatedBytes` or `objects` property. The existing
+`pinUploadResourcePolicy`/`recheckUploadResourcePolicy` pair accepts only
+`multer-crossing-byte-v1` (L+1). The separate
+`pinStrictUploadResourcePolicy`/`recheckStrictUploadResourcePolicy` pair accepts
+only `resume-strict-writer-v1` (L). Their registries and pin types are distinct:
+neither can recheck the other's pin, even when rounded charges coincide.
+The strict adapter is private arithmetic/snapshot support, not transaction or
+storage wiring; the current transaction continues to accept only Multer pins.
 
 The returned frozen pin is registered in a module-local WeakMap. Copies,
 serialization and fabricated objects cannot recheck it. This is **not an
@@ -78,6 +83,35 @@ The existing fixture-only vector SQL experiment remains separate and synthetic.
 No guarantee is inherited from the old singleton reservation's crash tests.
 
 ## Evidence and next slice
+
+### 2026-10-11 strict writer adapter
+
+`quoteStrictUploadResources` requires the exact strict adapter tag and uses the
+same validated arithmetic with logical ceiling L. Existing
+`quoteUploadResources` remains the legacy L+1 arithmetic API, with its original
+shape and behavior; it does not select an adapter from the policy tag.
+Only the adapter-specific pin/recheck APIs bind that choice. No adapter may be
+selected from a request, and quotes/pins alone never authorize IO.
+
+`ResumeFileStorage.stage` rejects the entire crossing chunk before copying or
+writing it. Actual temporary-file regressions at L=4 observe: `[abcd]` accepts
+four bytes; `[abcd,e]` rejects with four retained bytes; `[abc,de]` rejects with
+three; `[abcde]` rejects with zero. Existing short-write and durability-error
+tests remain in force. Rejected attempts retain their directory/file and charge.
+
+Nine additional arithmetic/pin tests cover exact allocation boundaries, all
+overheads, registry/adapter mismatch, safe-integer overflow, incomplete policy,
+identity mismatch, snapshot mutation, equal-cost input changes and forged pins.
+Zero logical limit and MAX_SAFE_INTEGER are arithmetic edge cases, **not**
+supported admission limits (the current grant registry permits 1..100 MiB).
+All physical policy numbers in these tests are synthetic; no Railway allocation
+bound, seed, physical grant, refund, parser change or public activation follows.
+
+This is a continuation of the unreleased 3.0.11 draft patch over main 3.0.10;
+it is not a separate released version. Before composition, trusted provisioners
+must still establish complete physical policy, root/volume identity, canonical
+domain locking and exact writer/grant limit binding. Unknown physical policy
+remains disabled. The strict transaction/provider wiring is the next code slice.
 
 Nine new regression tests cover recomputation despite forged charge properties,
 mutation across await, all six identity dimensions, same-charge policy changes,
