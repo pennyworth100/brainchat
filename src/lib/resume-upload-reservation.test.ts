@@ -4,6 +4,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { ResumeUploadReservations } from "./resume-upload-reservation";
+import fs from "node:fs/promises";
+import { ResumeBindings } from "./resume-bindings";
+import { ResumeUploadAdmissions } from "./resume-upload-admission";
+import { ResumeFileStorage } from "./resume-file-storage";
 
 const input = () => ({ sessionId: randomUUID(), roomId: "candy986", clientMessageId: "key", reservedBytes: 10 });
 for (const mode of ["checkout", "begin", "insert", "commit", "release"] as const) {
@@ -14,7 +18,7 @@ for (const mode of ["checkout", "begin", "insert", "commit", "release"] as const
       if ((mode === "begin" && sql.startsWith("BEGIN")) ||
           (mode === "insert" && sql.startsWith("INSERT")) ||
           (mode === "commit" && sql === "COMMIT")) throw Error("controlled failure");
-      return { rowCount: 1 };
+      return { rowCount: 1, command: sql.split(" ")[0] };
     }, release: () => { if (mode === "release") throw Error("controlled release failure"); } }) as unknown as PoolClient;
     const ledger = new ResumeUploadReservations({ connect: async () => {
       if (mode === "checkout") throw Error("controlled checkout failure");
@@ -43,7 +47,7 @@ test("pending commit never grants or refunds; caller mutation cannot change prov
   const ledger = new ResumeUploadReservations({ connect: async () => Object.assign(new EventEmitter(), {
     query: async (sql: string) => {
       if (sql === "COMMIT") { entered(); await pending; }
-      return { rowCount: 1 };
+      return { rowCount: 1, command: sql.split(" ")[0] };
     }, release: () => {},
   }) as unknown as PoolClient });
   let settled = false;
@@ -69,7 +73,7 @@ for (const phase of ["BEGIN", "INSERT", "COMMIT"] as const) {
           client.emit("error", Error("Connection terminated unexpectedly"));
           throw Error("Connection terminated unexpectedly");
         }
-        return { rowCount: 1 };
+        return { rowCount: 1, command: sql.split(" ")[0] };
       },
       release: (broken: boolean) => { assert.equal(broken, true); },
     });
@@ -92,7 +96,7 @@ test("reservation owns error event even without a pool idle listener", async () 
         client.emit("error", Error("lost socket"));
         throw Error("lost socket");
       }
-      return { rowCount: 1 };
+      return { rowCount: 1, command: sql.split(" ")[0] };
     },
     release: (broken: boolean) => { releases++; assert.equal(broken, true); },
   });
@@ -102,4 +106,75 @@ test("reservation owns error event even without a pool idle listener", async () 
   assert.ok(result.status === "failed" && result.commit === "unknown");
   assert.equal(releases, 1);
   assert.equal(client.listenerCount("error"), 0);
+});
+
+
+for (const acknowledgement of ["ROLLBACK", "UPDATE", undefined] as const) {
+  test("non-COMMIT acknowledgement " + acknowledgement + " never reserves or rolls back again", async () => {
+    const calls: string[] = [];
+    let destroyed: boolean | undefined;
+    const client = Object.assign(new EventEmitter(), {
+      query: async (sql: string) => {
+        calls.push(sql.split(" ")[0]);
+        return { rowCount: 1, command: sql === "COMMIT" ? acknowledgement : sql.split(" ")[0] };
+      },
+      release: (broken: boolean) => { destroyed = broken; },
+    });
+    const result = await new ResumeUploadReservations({
+      connect: async () => client as unknown as PoolClient,
+    }).reserve(input());
+    assert.ok(result.status === "failed" && result.commit === "unknown");
+    assert.deepEqual(calls, ["BEGIN", "UPDATE", "INSERT", "COMMIT"]);
+    assert.equal(destroyed, true);
+    assert.equal(client.listenerCount("error"), 0);
+  });
+}
+
+test("lost COMMIT ACK preserves original attempt and performs no second transaction command", async () => {
+  let insertedKey: unknown;
+  const calls: string[] = [];
+  const client = Object.assign(new EventEmitter(), {
+    query: async (sql: string, values?: unknown[]) => {
+      calls.push(sql.split(" ")[0]);
+      if (sql.startsWith("INSERT")) insertedKey = values?.[0];
+      if (sql === "COMMIT") throw Error("lost ACK");
+      return { rowCount: 1, command: sql.split(" ")[0] };
+    },
+    release: (broken: boolean) => assert.equal(broken, true),
+  });
+  const result = await new ResumeUploadReservations({
+    connect: async () => client as unknown as PoolClient,
+  }).reserve(input());
+  assert.ok(result.status === "failed" && result.commit === "unknown");
+  assert.equal(result.attempt.storageKey, insertedKey);
+  assert.deepEqual(calls, ["BEGIN", "UPDATE", "INSERT", "COMMIT"]);
+});
+
+test("aborted COMMIT through reservation/storage composition consumes no body, opens no root and retains admission", async t => {
+  const request = input(), bindings = new ResumeBindings();
+  const binding = (await bindings.activate({ sessionId: request.sessionId, roomId: request.roomId,
+    username: "Alice", authVersion: 1, generation: 1,
+    issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) },
+  "reservation-storage-test", async () => {}, () => true))!;
+  const admissions = new ResumeUploadAdmissions(bindings, undefined, 10);
+  const grant = admissions.admit(binding)!;
+  t.after(() => { admissions.release(grant); });
+  const client = Object.assign(new EventEmitter(), {
+    query: async (sql: string) => ({ rowCount: 1,
+      command: sql === "COMMIT" ? "ROLLBACK" : sql.split(" ")[0] }),
+    release: (broken: boolean) => assert.equal(broken, true),
+  });
+  const ledger = new ResumeUploadReservations({ connect: async () => client as unknown as PoolClient });
+  let io = 0, consumed = 0;
+  for (const method of ["open", "mkdir"] as const) t.mock.method(fs, method, async () => {
+    io++; throw Error("unexpected filesystem IO");
+  });
+  async function* source() { consumed++; yield Buffer.from("x"); }
+  const storage = new ResumeFileStorage("/must-not-be-opened", admissions, ledger);
+  await assert.rejects(storage.stage(grant, { name: "a.txt", mime: "text/plain", clientMessageId: "key" }, source()),
+    /reservation denied or uncertain/);
+  assert.equal(consumed, 0); assert.equal(io, 0);
+  assert.equal(admissions.admit(binding), null);
+  await assert.rejects(storage.stage(grant, { name: "a.txt", mime: "text/plain", clientMessageId: "key" }, source()), /denied/);
+  assert.equal(consumed, 0); assert.equal(io, 0);
 });

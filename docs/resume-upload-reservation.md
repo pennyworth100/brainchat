@@ -14,7 +14,13 @@ Each call creates a new attempt, including the same logical message key. No
 operation retries automatically. No timer, refund, age deletion or cascade exists.
 Provenance survives deletion of sessions/rooms/receipts by design.
 
-Only `reserved` means COMMIT acknowledged. `failed/unknown` includes COMMIT dispatch
+Only `reserved` means COMMIT acknowledged with PostgreSQL's exact `COMMIT`
+command tag and successful connection finalization. A fulfilled query bearing
+`ROLLBACK` (aborted transaction), another tag or no tag never reserves. After
+COMMIT dispatch, no additional ROLLBACK or retry is sent; uncertainty destroys
+the connection and retains the original attempt identity. This also applies to
+a lost ACK. A later ROLLBACK cannot establish whether the earlier COMMIT took
+effect. `failed/unknown` includes COMMIT dispatch
 or release failure and retains the generated identity for investigation. Never
 consume bytes or create files on failed, denied or pending outcomes. A hung call
 retains its transaction/checkout: callers must not equate a deadline with rollback.
@@ -40,7 +46,9 @@ strict parser acceptance. A future cleanup design must retain provenance until
 all receipt/attempt references are proven safe, never simply on session expiry.
 
 The isolated PostgreSQL harness uses the generated migration, 32 competing calls,
-real INSERT rollback, a real committed-but-lost ACK, then SIGKILL of a Node worker
+real INSERT rollback, an actually aborted transaction whose COMMIT resolves with
+the ROLLBACK tag (unchanged counter and absent attempt), a real committed-but-lost
+ACK, then SIGKILL of a Node worker
 after its acknowledged reservation and verification using a fresh DB pool. It is
 an application-process crash test, NOT a PostgreSQL server/power-loss test.
 

@@ -37,6 +37,30 @@ async function main() {
     // Retrying the same logical message is a distinct charged attempt, never a
     // replay of storage authority. Existing provenance must remain unchanged.
     await pool.query("UPDATE resume_upload_budget SET capacity_bytes = 150");
+    // Real PostgreSQL aborted transaction: a swallowed SQL error before COMMIT
+    // makes that command resolve normally with command=ROLLBACK, not COMMIT.
+    // No forged pg result; verify accounting/provenance both remain unchanged.
+    let abortedTag: string | undefined;
+    const aborted = new ResumeUploadReservations({ connect: async () => {
+      const real = await pool.connect();
+      return { query: async (sql: string, values?: unknown[]) => {
+        if (sql === "COMMIT") {
+          await real.query("SELECT 1 / 0").catch(() => {});
+          const result = await real.query(sql);
+          abortedTag = result.command;
+          return result;
+        }
+        return real.query(sql, values);
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real),
+      release: real.release.bind(real) } as unknown as PoolClient;
+    } });
+    const notCommitted = await aborted.reserve(input);
+    check(abortedTag === "ROLLBACK");
+    check(notCommitted.status === "failed" && notCommitted.commit === "unknown");
+    assert.ok(notCommitted.status === "failed");
+    check((await pool.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes === "100");
+    check((await pool.query("SELECT count(*) FROM resume_upload_attempts WHERE storage_key=$1",
+      [notCommitted.attempt.storageKey])).rows[0].count === "0");
     const lost = new ResumeUploadReservations({ connect: async () => {
       const real = await pool.connect();
       return { query: async (sql: string, values?: unknown[]) => {
@@ -75,7 +99,8 @@ async function main() {
     } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
     // There is deliberately no FK to a session/room or any expiry/refund path.
     check((await pool.query("SELECT count(*) FROM pg_constraint WHERE conrelid='resume_upload_attempts'::regclass AND contype='f'")).rows[0].count === "0");
-    console.log(JSON.stringify({ passed: checks, concurrentAttempts: 32, accepted: 10, rejected: 22, lostCommitAck: true, workerSIGKILL: true }));
+    console.log(JSON.stringify({ passed: checks, concurrentAttempts: 32, accepted: 10, rejected: 22,
+      abortedCommitTag: abortedTag, lostCommitAck: true, workerSIGKILL: true }));
   } finally {
     await pool.end();
     await admin.query('DROP SCHEMA "' + schema + '" CASCADE');

@@ -52,13 +52,18 @@ export class ResumeUploadReservations {
         attempt.roomId, attempt.clientMessageId, attempt.reservedBytes]);
       if (broken) throw Error("Upload reservation connection failed");
       commitDispatched = true;
-      await client.query("COMMIT");
+      const committed = await client.query("COMMIT");
+      // PostgreSQL can acknowledge COMMIT with command=ROLLBACK when the
+      // transaction is aborted. A resolved query alone is never a grant.
+      if (committed.command !== "COMMIT") throw Error("Upload reservation commit unconfirmed");
       if (broken) throw Error("Upload reservation connection failed");
       return { status: "reserved", attempt };
     } catch {
       broken = true;
       // Even successful ROLLBACK cannot disprove an acknowledged-lost COMMIT.
-      if (client) { try { await client.query("ROLLBACK"); } catch { /* destroy below */ } }
+      // Once COMMIT is dispatched, preserve uncertainty and destroy the client.
+      // A later ROLLBACK neither disproves that commit nor permits a retry.
+      if (client && !commitDispatched) { try { await client.query("ROLLBACK"); } catch { /* destroy below */ } }
       return { status: "failed", commit: commitDispatched ? "unknown" : "not-dispatched", attempt };
     } finally {
       try { client?.release(broken); } catch {
