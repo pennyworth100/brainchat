@@ -92,14 +92,16 @@ async function main() {
     await db.query('GRANT USAGE ON SCHEMA public TO "' + role + '"');
     await db.query('GRANT SELECT ON public.upload_resource_domains, public.upload_resource_policies TO "' + role + '"');
     await db.query('GRANT UPDATE (outstanding_bytes, outstanding_objects) ON public.upload_resource_domains TO "' + role + '"');
-    // PostgreSQL row locks require UPDATE privilege on at least one column.
-    await db.query('GRANT UPDATE (policy_snapshot) ON public.upload_resource_policies TO "' + role + '"');
+    // Policy is read-only to this role; its canonical domain lock serializes
+    // reads with trusted provisioners. Never grant UPDATE just for FOR SHARE.
     await db.query('GRANT INSERT, SELECT (attempt_id) ON public.upload_resource_attempts TO "' + role + '"');
     const limited = new Pool({ ...connection, database, user: role, max: 1 });
     try {
       const attrs = (await limited.query("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname=current_user")).rows[0];
       check(Object.values(attrs).every(value => value === false));
       for (const sql of [
+        "SELECT * FROM public.upload_resource_policies FOR SHARE",
+        "UPDATE public.upload_resource_policies SET policy_snapshot=policy_snapshot WHERE false",
         "UPDATE public.upload_resource_domains SET writer_generation='forbidden' WHERE false",
         "DELETE FROM public.upload_resource_domains WHERE false",
         "UPDATE public.upload_resource_policies SET writer_generation='forbidden' WHERE false",

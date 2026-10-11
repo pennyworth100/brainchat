@@ -156,7 +156,7 @@ default apt repositories do not contain `postgresql-18`; it was not a TLS failur
 Package minor versions follow those apt repositories; the report records the
 actual server version. CI success must be observed, not inferred from local success.
 
-Positive transactions now use the generated nonsuperuser role with no CREATEDB,
+At the original 41-assertion checkpoint, positive transactions used the generated nonsuperuser role with no CREATEDB,
 CREATEROLE, REPLICATION, BYPASSRLS or superuser attribute. After verifying the
 fixture-only permission denial, the fixture owner explicitly grants function
 EXECUTE, schema USAGE, SELECT on domains/policies, UPDATE of only the two domain
@@ -169,6 +169,33 @@ the bootstrap role only provisions/inspects the fixture. Local PostgreSQL 18.1:
 authorization boundary: policy_snapshot remains writable and column grants alone
 do not enforce monotonic accounting. It is not proof the managed platform can or
 should grant these permissions.
+
+### Recovery-scoped read-only policy role (2026-10-11)
+
+The current callback reads policy under the canonical domain lock without
+`FOR SHARE`. Current fixture grants omit UPDATE(policy_snapshot), and regressions
+require both policy UPDATE and policy FOR SHARE to fail with SQLSTATE 42501 while
+acknowledged and uncertain accounting transactions still run. Every trusted
+policy provisioner must acquire the same domain lock before changing policy;
+owners/superusers that bypass this protocol remain outside the guarantee.
+
+In the existing isolated Railway recovery database
+`production_recovery_20261010`, role `dimle_recovery_ledger_20261011` is provisioned
+as NOLOGIN, NOINHERIT, NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOREPLICATION,
+NOBYPASSRLS, with no role memberships. It has schema USAGE, identity-function
+EXECUTE, domain/policy SELECT, UPDATE of the two outstanding domain counters,
+and attempt INSERT plus SELECT(attempt_id). Policy writes are not granted.
+Verified TLS1.3 and exact recovery cluster identity precede the transaction.
+Eight managed permission denials include policy locks/writes, generation writes,
+deletes, attempt updates, message reads and legacy-budget reads. The three
+resource tables remain empty; no policy/capacity was seeded.
+
+This is a capability role, NOT a usable login or installed runtime provider.
+No password, login membership or public access was created. Inherited PUBLIC
+CONNECT/TEMP was not changed. Direct counter UPDATE is not a monotonicity or
+hostile-SQL boundary. Credential provisioning, physical all-writer fencing,
+whole-domain liability/cost audit and actual parser/storage/receipt composition
+remain gates. The public credential upload branch still fails closed with 503.
 
 The initial PostgreSQL 16.15 CI fixture passed all 41 assertions with TLSv1.3
 and confirmed cluster cleanup (both workflows for commit `02b87c4` succeeded).

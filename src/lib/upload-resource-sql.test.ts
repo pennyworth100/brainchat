@@ -40,7 +40,7 @@ function fixture() {
   return { policy, pin, domain, provenance, replies, calls, context, work, fail: (index: number) => { failAt = index; } };
 }
 
-test("fixed-table callback locks canonical domain then policy, charges both and inserts exact UUID/snapshot", async () => {
+test("fixed-table callback locks canonical domain then reads policy, charges both and inserts exact UUID/snapshot", async () => {
   const f = fixture();
   assert.equal(await f.work(f.context), "prepared");
   assert.equal(f.calls.length, 4);
@@ -48,7 +48,7 @@ test("fixed-table callback locks canonical domain then policy, charges both and 
   assert.deepEqual(f.calls[0].values, [f.policy.identity.database, "public", "volume"]);
   for (const dim of ["bytes", "objects"]) for (const prefix of ["capacity", "headroom", "baseline", "outstanding"])
     assert.ok(f.calls[0].sql.includes(prefix + "_" + dim + "::text"));
-  assert.match(f.calls[1].sql, /FOR SHARE$/);
+  assert.doesNotMatch(f.calls[1].sql, /FOR (?:UPDATE|SHARE|KEY SHARE|NO KEY UPDATE)/);
   assert.deepEqual(f.calls[2].values?.slice(3), ["81", "15"]);
   assert.deepEqual(f.calls[3].values?.slice(0, 12), [f.context.attemptId, f.policy.identity.database, "public", "volume",
     "a", "v1", "g1", "cut1", "operation1", "writer1", "41", "5"]);

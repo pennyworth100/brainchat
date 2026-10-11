@@ -18,6 +18,13 @@ No retry, refund, upsert, replay, DDL, filesystem effect or transaction control 
 Errors or unexpected affected rows deny and the transaction wrapper rolls back;
 dispatched COMMIT uncertainty retains its UUID and both possible liabilities.
 
+Policy reads deliberately do not use `FOR SHARE`: PostgreSQL requires an UPDATE
+grant for that row lock, unnecessarily allowing the ledger role to rewrite its
+own policy. The canonical domain `FOR UPDATE` lock already serializes policy
+provisioners; every provisioner MUST take it before policy changes. This is an
+explicit trusted-provisioner contract, not protection against a bypassing owner
+or superuser. The accounting role receives SELECT only on policy rows.
+
 ## Schema and verification gates
 
 Tables are intentionally not installed live. Additive migration 0009 creates

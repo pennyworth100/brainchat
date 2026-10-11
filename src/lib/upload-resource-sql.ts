@@ -37,11 +37,13 @@ export function createUploadResourceSqlWork(
       FROM public.upload_resource_domains
       WHERE database_identity=$1 AND schema_identity=$2 AND quota_domain=$3 FOR UPDATE`, key);
     if (domains.rowCount !== 1 || domains.rows.length !== 1) return "denied";
-    // Every provisioner MUST acquire the same domain lock before editing policy.
-    // SHARE additionally prevents changes to this existing policy until COMMIT.
+    // Every provisioner MUST acquire this same domain lock before editing policy.
+    // Do not lock the policy row: PostgreSQL FOR SHARE requires UPDATE privilege,
+    // which would let the accounting role rewrite its own admission policy.
+    // The canonical domain lock is the serialization authority for BOTH rows.
     const policies = await context.query(`SELECT policy_snapshot FROM public.upload_resource_policies
       WHERE database_identity=$1 AND schema_identity=$2 AND quota_domain=$3
-      AND namespace=$4 AND policy_version=$5 AND writer_generation=$6 FOR SHARE`,
+      AND namespace=$4 AND policy_version=$5 AND writer_generation=$6`,
     [...key, identity.namespace, identity.policyVersion, identity.writerGeneration]);
     if (policies.rowCount !== 1 || policies.rows.length !== 1) return "denied";
     const evaluated = evaluateUploadResourceDomain(pin, policies.rows[0].policy_snapshot, domains.rows[0], auditId);
