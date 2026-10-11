@@ -17,6 +17,10 @@ import http, { type IncomingMessage } from "node:http";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { createStrictUploadService } from "../src/lib/strict-upload-service";
+import { createUploadDownloadRouter } from "../src/lib/upload-download";
+import { ServerLifecycle } from "../src/lib/server-lifecycle";
+import express from "express";
 
 async function main() {
   const fixture = process.env.LEDGER_TLS_FIXTURE || "";
@@ -61,7 +65,7 @@ async function main() {
     await db.query("INSERT INTO public.upload_resource_policies VALUES ($1,'public','fixture',$2,'v1','g1',$3::jsonb)",
       [provider.binding.database, rootPath, JSON.stringify(policy)]);
     await db.query("INSERT INTO rooms(id) VALUES ('files123')");
-    for (const protocol of ["raw", "multipart", "http-runtime"] as const) for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message"] as const) {
+    for (const protocol of ["raw", "multipart", "http-runtime"] as const) for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message", "before-commit", "rollback"] as const) {
       const sessionId = protocol + "-" + mode;
       const beforeFiles = await fs.readdir(rootPath);
       const beforeRows = Number((await db.query("SELECT count(*) FROM upload_resource_attempts")).rows[0].count);
@@ -102,6 +106,10 @@ async function main() {
         const real = await db.connect();
         return { on: real.on.bind(real), removeListener: real.removeListener.bind(real),
           release: real.release.bind(real), query: async (sql: string, values?: unknown[]) => {
+            if (mode === "rollback" && sql.includes("INSERT INTO resume_message_receipts")) {
+              throw Error("controlled rollback before receipt insert");
+            }
+            if (sql === "COMMIT" && mode === "before-commit") { enter(); await pause; }
             const result = await real.query(sql, values);
             if (sql === "COMMIT" && mode === "lost-message") throw Error("controlled lost message ACK");
             if (sql === "COMMIT" && mode === "pending-message") { enter(); await pause; }
@@ -114,8 +122,23 @@ async function main() {
       const multipartUpload = new StrictMultipartUpload(storage, new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
       const wire = Buffer.from('--bound\r\nContent-Disposition: form-data; name="file"; filename="file.txt"\r\nContent-Type: text/plain\r\n\r\nabc\r\n--bound--\r\n');
       async function* multipartSource() { bodyReads++; yield wire; }
-      const runtime = new StrictUploadRuntime(admissions, mode === "missing" ? null : storage,
-        new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
+      const paired = createStrictUploadService({ ...writerPool, query: db.query.bind(db) } as unknown as Pool,
+        admissions, mode === "missing" ? null : { provider: observed, pin, policy, root, physical,
+          provenance: { auditId: "cut1", writerId: "fixture" } });
+      const runtime = paired.uploads;
+      assert.equal(paired.downloads?.root ?? null, mode === "missing" ? null : root);
+      assert.equal(paired.downloads?.pin ?? null, mode === "missing" ? null : pin);
+      const downloadLifecycle = new ServerLifecycle({ async stopAndSettle() {} }, { async settle() {} });
+      const downloadApp = express();
+      downloadApp.use("/uploads", createUploadDownloadRouter(fixture, paired.downloads, downloadLifecycle));
+      const downloadServer = http.createServer(downloadApp);
+      await new Promise<void>(r => downloadServer.listen(0, "127.0.0.1", r));
+      const downloadPort = (downloadServer.address() as import("node:net").AddressInfo).port;
+      async function download(key: string) {
+        const response = await fetch(`http://127.0.0.1:${downloadPort}/uploads/${key}/blob`);
+        return { status: response.status, body: await response.text() };
+      }
+      assert.equal((await download("0".repeat(64))).status, mode === "missing" ? 503 : 404);
       let request: IncomingMessage | undefined, response: Promise<void> | undefined;
       let runtimeResult: ReturnType<StrictUploadRuntime["run"]> | undefined;
       let server: http.Server | undefined, client: http.ClientRequest | undefined;
@@ -156,10 +179,17 @@ async function main() {
       let duplicate: ReturnType<StrictUploadRuntime["run"]> | undefined;
       const pending = save().then(r => { settled = true; return r; });
       try {
-        if (mode === "pending-message") {
-          await entered; now = 100;
+        if (mode === "before-commit" || mode === "pending-message") {
+          await entered;
           assert.equal(settled, false); assert.equal(admissions.admit(binding), null);
-          assert.equal(Number((await db.query("SELECT count(*) FROM resume_message_receipts WHERE session_id=$1", [sessionId])).rows[0].count), 1);
+          const stagedKey = (await fs.readdir(rootPath)).find(x => !beforeFiles.includes(x))!;
+          assert.ok(stagedKey);
+          assert.equal(Number((await db.query("SELECT count(*) FROM resume_message_receipts WHERE session_id=$1", [sessionId])).rows[0].count), mode === "before-commit" ? 0 : 1);
+          const visible = await download(stagedKey);
+          assert.equal(visible.status, mode === "before-commit" ? 404 : 200);
+          if (mode === "before-commit") assert.equal(await paired.downloads!.publishedFile(stagedKey), null);
+          else assert.equal(visible.body, "abc");
+          if (mode === "pending-message") now = 100;
           if (protocol === "http-runtime") {
             duplicate = runtime.run(grant, request!);
             closing = runtime.close().then(() => { runtimeClosed = true; });
@@ -176,12 +206,26 @@ async function main() {
           assert.ok(!result.completed && result.commit === "not-dispatched");
           assert.equal(physicalCalls, 0); assert.equal(bodyReads, 0); assert.equal(newFiles.length, 0);
           assert.equal(messages.length, 0);
+        } else if (mode === "rollback") {
+          assert.ok(!result.completed && result.commit === "not-dispatched");
+          assert.equal(newFiles.length, 1); assert.equal(messages.length, 0);
+          assert.equal(await paired.downloads!.publishedFile(newFiles[0]), null);
+          assert.equal((await download(newFiles[0])).status, 404);
         } else {
           assert.equal(newFiles.length, 1); assert.equal(messages.length, 1);
           assert.equal((await fs.readFile(join(rootPath, newFiles[0], "blob"))).toString(), "abc");
           assert.equal(JSON.parse(messages[0].content).url, "/uploads/" + newFiles[0] + "/blob");
+          const published = await paired.downloads!.publishedFile(newFiles[0]);
+          assert.ok(published);
+          assert.equal(published.size, 3); assert.equal(published.name, "file.txt");
+          assert.deepEqual(await download(newFiles[0]), { status: 200, body: "abc" });
           if (mode === "lost-message") assert.ok(!result.completed && result.commit === "unknown");
           else assert.ok(result.completed && result.result.authorized && result.result.value.inserted);
+          // Publication is a message property, not a short-lived session receipt.
+          await db.query("DELETE FROM resume_message_receipts WHERE session_id=$1", [sessionId]);
+          assert.deepEqual(await download(newFiles[0]), { status: 200, body: "abc" });
+          await db.query("DELETE FROM messages WHERE content=$1", [messages[0].content]);
+          assert.equal((await download(newFiles[0])).status, 404);
         }
         assert.equal(afterRows - beforeRows, mode === "missing" ? 0 : 1);
         if (protocol === "http-runtime") {
@@ -190,7 +234,7 @@ async function main() {
           admissions.release(next);
           await closing;
           if (duplicate) assert.deepEqual(await duplicate, { status: "denied" });
-          if (mode === "pending-message") assert.equal(runtimeClosed, true);
+          if (mode === "pending-message" || mode === "before-commit") assert.equal(runtimeClosed, true);
         } else {
           assert.equal(admissions.admit(binding), null);
           assert.deepEqual(await save(), { completed: true, result: { authorized: false } });
@@ -199,6 +243,9 @@ async function main() {
           receipts: messages.length, bodyReads, physicalCalls, runtimeClosed });
       } finally {
         finish(); await pending; await response; await runtime.close();
+        await downloadLifecycle.stopAndSettle();
+        downloadServer.closeAllConnections();
+        await new Promise<void>((resolve, reject) => downloadServer.close(e => e ? reject(e) : resolve()));
         client?.destroy();
         if (server) await new Promise<void>((resolve, reject) => server!.close(e => e ? reject(e) : resolve()));
         admissions.release(grant);

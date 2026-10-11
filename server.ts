@@ -41,8 +41,7 @@ import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
 import { ResumeMessageWriter } from "./src/lib/resume-message";
 import { ResumeImageWriter } from "./src/lib/resume-image";
-import { ResumeFileWriter } from "./src/lib/resume-file";
-import { StrictUploadRuntime } from "./src/lib/strict-upload-runtime";
+import { createStrictUploadService } from "./src/lib/strict-upload-service";
 import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
@@ -257,9 +256,10 @@ export async function main() {
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
-  // No production physical provider or trusted strict download source yet. This
-  // server-owned composition stays fail-closed; legacy Multer is never a fallback.
-  const strictUploads = new StrictUploadRuntime(uploadAdmissions, null, new ResumeFileWriter(uploadGate));
+  // Paired writer/reader use one pool and root. No production physical provider
+  // yet: null provisioning keeps both disabled without a legacy fallback.
+  const strictFiles = createStrictUploadService(pool, uploadAdmissions, null);
+  const strictUploads = strictFiles.uploads;
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -376,8 +376,7 @@ export async function main() {
   })));
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
-  // Strict publication/root provisioning is deliberately absent: no fallback.
-  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, null, lifecycle));
+  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, strictFiles.downloads, lifecycle));
 
   // ── File uploads ──────────────────────────────────────────────────────────
   const storageSettlement = new UploadStorageSettlement();
