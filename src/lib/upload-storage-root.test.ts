@@ -104,3 +104,34 @@ test("failed fstat closes the opened descriptor", async t => {
   await assert.rejects(openStrictUploadRoot(f.binding, f.pin, 10), /fstat failed/);
   assert.equal(closed, true);
 });
+
+test("accessor root cannot switch namespace between validation and capture", async t => {
+  const f = await fixture(t);
+  let reads = 0;
+  const expected = { ...f.expected, get path() { return ++reads <= 6 ? f.path : "/wrong-root"; } };
+  assert.equal(bindStrictUploadRoot(f.pin, f.policy, expected), null);
+  assert.equal(reads, 0, "root identity accessors must never execute");
+});
+
+test("all expected identity fields must be own data properties", async t => {
+  const f = await fixture(t);
+  for (const key of ["path", "device", "inode", "uid", "gid"] as const) {
+    let reads = 0;
+    const expected = { ...f.expected };
+    Object.defineProperty(expected, key, { get() { reads++; return f.expected[key]; } });
+    assert.equal(bindStrictUploadRoot(f.pin, f.policy, expected), null);
+    assert.equal(reads, 0, key);
+    const inherited = Object.assign(Object.create({ [key]: f.expected[key] }), f.expected);
+    delete inherited[key];
+    assert.equal(bindStrictUploadRoot(f.pin, f.policy, inherited), null);
+  }
+});
+
+test("null-prototype own-data root identity is accepted", async t => {
+  const f = await fixture(t);
+  const expected = Object.assign(Object.create(null), f.expected);
+  const binding = bindStrictUploadRoot(f.pin, f.policy, expected);
+  assert.ok(binding);
+  const h = await openStrictUploadRoot(binding, f.pin, 10);
+  await h.close();
+});

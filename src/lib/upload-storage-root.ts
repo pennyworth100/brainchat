@@ -18,6 +18,26 @@ const bindings = new WeakMap<StrictUploadRootBinding, Bound>();
 const decimal = (s: unknown) => typeof s === "string" && /^(0|[1-9][0-9]{0,19})$/.test(s);
 const id = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0 && (n as number) <= 0xffffffff;
 
+// Snapshot own data properties before validation. Repeated accessor reads could
+// validate one namespace/identity and then capture another. As with policy pins,
+// this is a trusted provisioning boundary, not a hostile-JavaScript sandbox.
+function snapshotRoot(value: unknown): StrictUploadRootIdentity | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const data: Record<string, unknown> = {};
+  for (const key of ["path", "device", "inode", "uid", "gid"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) return null;
+    data[key] = descriptor.value;
+  }
+  if (typeof data.path !== "string" || !isAbsolute(data.path) ||
+      resolve(data.path) !== data.path || data.path.includes("\0") ||
+      !decimal(data.device) || !decimal(data.inode) || data.inode === "0" ||
+      !id(data.uid) || !id(data.gid)) return null;
+  return Object.freeze(data) as StrictUploadRootIdentity;
+}
+
 /** policy/pin must come from reviewed, trusted provisioning. The arithmetic
  * quote is NOT evidence that allAllocationCostsBounded is true in production.
  * Stable, server-controlled ancestors and no hostile same-uid mutation remain
@@ -27,14 +47,9 @@ export function bindStrictUploadRoot(
   pin: StrictUploadResourcePolicyPin, policy: unknown, expected: StrictUploadRootIdentity,
 ): StrictUploadRootBinding | null {
   const checked = recheckStrictUploadResourcePolicy(pin, policy);
-  if (!checked || !expected || typeof expected.path !== "string" ||
-      !isAbsolute(expected.path) || resolve(expected.path) !== expected.path ||
-      expected.path.includes("\0") || expected.path !== checked.quote.identity.namespace ||
-      !decimal(expected.device) || !decimal(expected.inode) || expected.inode === "0" ||
-      !id(expected.uid) || !id(expected.gid) ||
-      process.geteuid?.() !== expected.uid || process.getegid?.() !== expected.gid) return null;
-  const root = Object.freeze({ path: expected.path, device: expected.device,
-    inode: expected.inode, uid: expected.uid, gid: expected.gid });
+  const root = snapshotRoot(expected);
+  if (!checked || !root || root.path !== checked.quote.identity.namespace ||
+      process.geteuid?.() !== root.uid || process.getegid?.() !== root.gid) return null;
   const binding = Object.freeze({ kind: "strict-upload-root-binding-only" as const });
   bindings.set(binding, Object.freeze({ root, pin, limit: checked.quote.logicalFileBytes }));
   return binding;

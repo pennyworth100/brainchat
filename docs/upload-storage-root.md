@@ -11,6 +11,13 @@ Before read-only open it rejects copied bindings, other pins, different logical
 limits and effective identity drift. O_NOFOLLOW/O_DIRECTORY and fstat reject
 symlinks, replaced roots, changed ownership and modes other than 0700.
 
+Expected identity must contain own data properties on a plain or null-prototype
+object. Capture each descriptor value once before validating; never execute
+getters or inherit identity fields. This prevents validation of one namespace
+followed by capture of another from a stateful getter. The same frozen snapshot
+supplies all subsequent checks and retained values. This is not a proxy sandbox
+or a substitute for a trusted provisioner.
+
 A successful call returns only a read-only directory descriptor. It is NOT a
 reservation, physical-capacity grant, parser permission or mkdir/write authority.
 An accounting COMMIT cannot be passed as this token. No DB, policy seed, route,
