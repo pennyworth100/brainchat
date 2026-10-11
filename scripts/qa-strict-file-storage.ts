@@ -11,6 +11,7 @@ import { createStrictUploadLedgerProvider } from "../src/lib/upload-ledger-provi
 import { bindStrictUploadRoot } from "../src/lib/upload-storage-root";
 import { StrictUploadAccounting } from "../src/lib/strict-upload-accounting";
 import { StrictFileStorage, type StrictStorageRequest } from "../src/lib/strict-file-storage";
+import { StrictMultipartUpload } from "../src/lib/strict-multipart-upload";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeUploadOperationGate } from "../src/lib/resume-operation";
@@ -58,15 +59,16 @@ async function main() {
     await db.query("INSERT INTO public.upload_resource_policies VALUES ($1,'public','fixture',$2,'v1','g1',$3::jsonb)",
       [provider.binding.database, rootPath, JSON.stringify(policy)]);
     await db.query("INSERT INTO rooms(id) VALUES ('files123')");
-    for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message"] as const) {
+    for (const protocol of ["raw", "multipart"] as const) for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message"] as const) {
+      const sessionId = protocol + "-" + mode;
       const beforeFiles = await fs.readdir(rootPath);
       const beforeRows = Number((await db.query("SELECT count(*) FROM upload_resource_attempts")).rows[0].count);
       const bindingStore = new ResumeBindings();
-      const identity = { sessionId: mode, roomId: "files123", username: "Guest", authVersion: 1,
+      const identity = { sessionId, roomId: "files123", username: "Guest", authVersion: 1,
         generation: 1, issuedAt: new Date(), expiresAt: new Date(Date.now() + 60000) };
       const transport = "storage-fixture-transport";
       await db.query("INSERT INTO room_resume_sessions(id,token_hash,room_id,username,auth_version,generation,expires_at,last_transport_id) VALUES($1,$1,'files123','Guest',1,1,$2,$3)",
-        [mode, identity.expiresAt, transport]);
+        [sessionId, identity.expiresAt, transport]);
       const binding = await bindingStore.activate(identity, transport, async () => {}, () => true); assert.ok(binding);
       let now = 0, physicalCalls = 0, bodyReads = 0, finish!: () => void, enter!: () => void;
       const entered = new Promise<void>(r => { enter = r; });
@@ -107,19 +109,26 @@ async function main() {
       } };
       const upload = new ResumeFileUpload(storage, new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
       async function* source() { bodyReads++; yield Buffer.from("abc"); }
+      const multipartUpload = new StrictMultipartUpload(storage, new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
+      const wire = Buffer.from('--bound\r\nContent-Disposition: form-data; name="file"; filename="file.txt"\r\nContent-Type: text/plain\r\n\r\nabc\r\n--bound--\r\n');
+      async function* multipartSource() { bodyReads++; yield wire; }
+      const save = () => protocol === "raw"
+        ? upload.saveWithOutcome(grant, "key", { name: "file.txt", mime: "text/plain" }, source())
+        : multipartUpload.saveWithOutcome(grant, "key", { chunks: multipartSource(), abort: async () => {} },
+          { boundary: "bound", contentLength: wire.length });
       let settled = false;
-      const pending = upload.saveWithOutcome(grant, "key", { name: "file.txt", mime: "text/plain" }, source()).then(r => { settled = true; return r; });
+      const pending = save().then(r => { settled = true; return r; });
       try {
         if (mode === "pending-message") {
           await entered; now = 100;
           assert.equal(settled, false); assert.equal(admissions.admit(binding), null);
-          assert.equal(Number((await db.query("SELECT count(*) FROM resume_message_receipts WHERE session_id=$1", [mode])).rows[0].count), 1);
+          assert.equal(Number((await db.query("SELECT count(*) FROM resume_message_receipts WHERE session_id=$1", [sessionId])).rows[0].count), 1);
           finish();
         }
         const result = await pending;
         const newFiles = (await fs.readdir(rootPath)).filter(x => !beforeFiles.includes(x));
         const afterRows = Number((await db.query("SELECT count(*) FROM upload_resource_attempts")).rows[0].count);
-        const messages = (await db.query("SELECT m.content FROM resume_message_receipts r JOIN messages m ON m.id=r.message_id WHERE r.session_id=$1", [mode])).rows;
+        const messages = (await db.query("SELECT m.content FROM resume_message_receipts r JOIN messages m ON m.id=r.message_id WHERE r.session_id=$1", [sessionId])).rows;
         if (mode === "missing" || mode === "lost-accounting") {
           assert.ok(!result.completed && result.commit === "not-dispatched");
           assert.equal(physicalCalls, 0); assert.equal(bodyReads, 0); assert.equal(newFiles.length, 0);
@@ -133,9 +142,9 @@ async function main() {
         }
         assert.equal(afterRows - beforeRows, mode === "missing" ? 0 : 1);
         assert.equal(admissions.admit(binding), null);
-        assert.deepEqual(await upload.saveWithOutcome(grant, "key", { name: "file.txt", mime: "text/plain" }, source()),
+        assert.deepEqual(await save(),
           { completed: true, result: { authorized: false } });
-        cases.push({ mode, accountingRows: afterRows - beforeRows, files: newFiles.length, receipts: messages.length, bodyReads, physicalCalls });
+        cases.push({ protocol, mode, accountingRows: afterRows - beforeRows, files: newFiles.length, receipts: messages.length, bodyReads, physicalCalls });
       } finally { finish(); await pending; admissions.release(grant); }
     }
     assert.equal(Number((await db.query("SELECT count(*) FROM resume_upload_attempts")).rows[0].count), 0);

@@ -1,3 +1,5 @@
+import { consumeResumeMultipart, type ResumeMultipartSink } from "./resume-multipart";
+import type { ResumeUploadFraming } from "./resume-upload-framing";
 import { constants } from "node:fs";
 import { mkdir, open, type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -30,7 +32,7 @@ type SessionRecord = Readonly<{
 }>;
 const attempted = new WeakSet<ResumeUploadGrant>();
 
-/** PRIVATE strict sink. No runtime registration, parser, release, deletion,
+/** PRIVATE strict sink and bounded parser composition. No runtime registration, release, deletion,
  * refund, retry or physical-provider implementation. Stable exclusive ancestors
  * and no hostile same-uid filesystem mutation remain required by the root API.
  */
@@ -113,51 +115,102 @@ export class StrictFileStorage {
     source: AsyncIterable<Uint8Array>): Promise<ResumeStagedFile> {
     if (!this.isAuthorized(grant, session)) throw Error("Strict storage session denied");
     this.consumed.add(session); // synchronous single use, including invalid metadata
-    const r = this.sessions.get(session)!;
-    const { request: record, accounting: accountingReceipt, physical: permit } = r;
-    const request = record, storageKey = record.storageKey;
-    const initial = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
+    const captured = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
       storageKey: "0".repeat(64), size: 0, sha256: "0".repeat(64) });
+    return this.stageClaimed(grant, session, async sink => {
+      const signal = new AbortController().signal;
+      await sink.start(captured, signal);
+      for await (const chunk of source) await sink.write(chunk, signal);
+      await sink.finish(signal);
+    });
+  }
+
+  /** PRIVATE: authorize before any framing/header/body access; consume before
+   * parser entry, including malformed input and concurrent callers. */
+  async stageMultipart(grant: ResumeUploadGrant, clientMessageId: string,
+    source: Parameters<typeof consumeResumeMultipart>[0], framing: ResumeUploadFraming,
+    timeoutMs?: number): Promise<ResumeStagedFile> {
+    const session = await this.authorize(grant, clientMessageId);
+    return this.stageMultipartAuthorized(grant, session, source, framing, timeoutMs);
+  }
+
+  async stageMultipartAuthorized(grant: ResumeUploadGrant, session: StrictStorageSession,
+    source: Parameters<typeof consumeResumeMultipart>[0], framing: ResumeUploadFraming,
+    timeoutMs?: number): Promise<ResumeStagedFile> {
+    if (!this.isAuthorized(grant, session)) throw Error("Strict storage session denied");
+    this.consumed.add(session);
+    const limit = this.sessions.get(session)!.request.limit;
+    return this.stageClaimed(grant, session, async sink => {
+      await consumeResumeMultipart(source, framing, limit, sink, timeoutMs);
+    });
+  }
+
+  private async stageClaimed(grant: ResumeUploadGrant, session: StrictStorageSession,
+    produce: (sink: ResumeMultipartSink) => Promise<void>): Promise<ResumeStagedFile> {
+    const { request, accounting: accountingReceipt, physical: permit } = this.sessions.get(session)!;
+    const storageKey = request.storageKey;
     const current = () => !!this.accounting.resolve(grant, accountingReceipt) &&
       !!this.physical?.isCurrent(permit, request);
-    const check = () => { if (!current()) throw Error("Strict physical storage denied"); };
-    check(); // No body/filesystem access before both distinct authorities.
-    const rootPath = strictUploadRootPath(record.root, record.pin, record.limit);
+    const check = (signal?: AbortSignal) => {
+      if (signal?.aborted) throw signal.reason;
+      if (!current()) throw Error("Strict physical storage denied");
+    };
+    check();
+    const rootPath = strictUploadRootPath(request.root, request.pin, request.limit);
     if (!rootPath) throw Error("Strict root denied");
     let root: FileHandle | undefined, directory: FileHandle | undefined, file: FileHandle | undefined;
+    let initial: ResumeStoredFile | undefined, finished = false, size = 0;
+    const hash = createHash("sha256");
     try {
-      root = await openStrictUploadRoot(record.root, record.pin, record.limit);
+      await produce({
+        start: async (metadata, signal) => {
+          check(signal);
+          if (initial) throw Error("Strict storage already started");
+          initial = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
+            storageKey, size: 0, sha256: "0".repeat(64) });
+          root = await openStrictUploadRoot(request.root, request.pin, request.limit);
+          check(signal);
+          const path = join(rootPath, storageKey);
+          await mkdir(path, { mode: 0o700 });
+          check(signal);
+          directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          check(signal);
+          file = await open(join(path, "blob"), constants.O_WRONLY | constants.O_CREAT |
+            constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+          check(signal);
+        },
+        write: async (chunk, signal) => {
+          check(signal);
+          if (!file || finished || !(chunk instanceof Uint8Array) || chunk.byteLength > request.limit - size ||
+              !this.admissions.acceptChunk(grant, chunk.byteLength)) throw Error("Strict upload denied");
+          const bytes = Buffer.from(chunk);
+          await writeResumeChunk(async (b, offset, length) =>
+            (await file!.write(b, offset, length, null)).bytesWritten, bytes,
+            () => !signal.aborted && current());
+          check(signal);
+          hash.update(bytes); size += bytes.length;
+        },
+        finish: async signal => {
+          check(signal);
+          if (!file || !directory || !root || finished) throw Error("Strict storage incomplete");
+          await file.sync(); await file.close(); file = undefined;
+          await directory.sync(); await directory.close(); directory = undefined;
+          await root.sync(); await root.close(); root = undefined;
+          check(signal);
+          finished = true;
+        },
+        // Serial callbacks have settled. Cleanup below awaits every remaining
+        // handle even when transport abort/iterator return rejects after finish.
+        abort: async () => {},
+      });
       check();
-      const path = join(rootPath, storageKey);
-      await mkdir(path, { mode: 0o700 });
-      check();
-      directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      check();
-      file = await open(join(path, "blob"), constants.O_WRONLY | constants.O_CREAT |
-        constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      check();
-      const hash = createHash("sha256");
-      let size = 0;
-      for await (const chunk of source) {
-        check();
-        if (!(chunk instanceof Uint8Array) || chunk.byteLength > record.limit - size ||
-            !this.admissions.acceptChunk(grant, chunk.byteLength)) throw Error("Strict upload denied");
-        const bytes = Buffer.from(chunk);
-        await writeResumeChunk(async (b, offset, length) =>
-          (await file!.write(b, offset, length, null)).bytesWritten, bytes, current);
-        // Do not pull another source chunk after authority changed during IO.
-        check();
-        hash.update(bytes); size += bytes.length;
-      }
-      check();
-      await file.sync(); await file.close(); file = undefined;
-      await directory.sync(); await directory.close(); directory = undefined;
-      await root.sync(); await root.close(); root = undefined;
-      check();
+      if (!initial || !finished) throw Error("Strict storage incomplete");
+      // Publish authority only AFTER whole parser promise (including iterator
+      // return, deadline check and abort) and all durable IO have settled.
       const result = Object.freeze({ file: canonicalResumeFile({
         ...initial, storageKey, size, sha256: hash.digest("hex"),
       }) });
-      this.receipts.set(result, Object.freeze({ grant, accounting: accountingReceipt, request, physical: permit! }));
+      this.receipts.set(result, Object.freeze({ grant, accounting: accountingReceipt, request, physical: permit }));
       return result;
     } finally {
       const closed = await Promise.allSettled([file, directory, root].filter(

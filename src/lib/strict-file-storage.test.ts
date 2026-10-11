@@ -1,3 +1,4 @@
+import { StrictMultipartUpload } from "./strict-multipart-upload";
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { EventEmitter } from "node:events";
@@ -317,4 +318,145 @@ test("session is consumed synchronously before pending IO and rejects overlappin
   release(); const result = await first;
   assert.equal(storage.resolve(f.grant, result), result.file);
   assert.equal((await fs.readdir(f.rootPath)).length, 1);
+});
+
+function multipart(body = "abc") {
+  const wire = Buffer.from('--bound\r\nContent-Disposition: form-data; name="file"; filename="file.txt"\r\nContent-Type: text/plain\r\n\r\n' + body + '\r\n--bound--\r\n');
+  return { wire, framing: { boundary: "bound", contentLength: wire.length } };
+}
+test("multipart authorization denial touches neither framing getters nor request source", async t => {
+  const f = await fixture(t), storage = new StrictFileStorage(f.admissions, f.bridge, null);
+  const framing = { get boundary(): string { throw Error("framing touched"); }, contentLength: 100 };
+  let reads = 0;
+  await assert.rejects(storage.stageMultipart(f.grant, "msg_1",
+    { chunks: { [Symbol.asyncIterator]() { reads++; throw Error("read"); } }, abort: async () => {} }, framing), /denied/);
+  assert.equal(reads, 0); assert.equal(f.connections(), 0);
+  assert.deepEqual(await fs.readdir(f.rootPath), []);
+});
+test("multipart serial storage yields exact durable file only after EOF and iterator closure", async t => {
+  const f = await fixture(t), p = physicalFixture(), storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const { wire, framing } = multipart();
+  let closed = false, index = 0;
+  const result = await storage.stageMultipart(f.grant, "msg_1", {
+    chunks: { [Symbol.asyncIterator]() { return {
+      async next() { return index < wire.length ? { done: false as const, value: wire.subarray(index, ++index) } : { done: true as const, value: undefined }; },
+      async return() { closed = true; return { done: true as const, value: undefined }; },
+    }; } }, abort: async () => {},
+  }, framing);
+  assert.ok(closed); assert.equal(result.file.size, 3);
+  assert.equal((await fs.readFile(join(f.rootPath, result.file.storageKey, "blob"))).toString(), "abc");
+  assert.equal(storage.resolve(f.grant, result), result.file);
+  assert.equal(f.admissions.admit(f.binding), null);
+});
+test("multipart session is consumed before first header read across concurrent callers", async t => {
+  const f = await fixture(t), p = physicalFixture(), storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const session = await storage.authorize(f.grant, "msg_1"), { wire, framing } = multipart();
+  let release!: () => void, enter!: () => void, reads = 0;
+  const pause = new Promise<void>(r => { release = r; }), entered = new Promise<void>(r => { enter = r; });
+  t.after(() => release());
+  async function* chunks() { reads++; enter(); await pause; yield wire; }
+  const source = { chunks: chunks(), abort: async () => {} };
+  const task = storage.stageMultipartAuthorized(f.grant, session, source, framing);
+  await entered;
+  await assert.rejects(storage.stageMultipartAuthorized(f.grant, session, source, framing), /session denied/);
+  await assert.rejects(storage.stageAuthorized(f.grant, session, metadata, bytes()), /session denied/);
+  assert.equal(reads, 1); release(); await task;
+});
+for (const mode of ["bad-trailer", "return-fails", "deadline-after-finish"] as const)
+test("multipart " + mode + " never authorizes message dispatch or refunds retained file", async t => {
+  const f = await fixture(t), p = physicalFixture(), storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const { wire, framing } = multipart();
+  const data = mode === "bad-trailer" ? Buffer.concat([wire, Buffer.from("x")]) : wire;
+  let once = false, aborts = 0, dispatches = 0;
+  const upload = new StrictMultipartUpload(storage, { async saveOnceWithOutcome() {
+    dispatches++; throw Error("must not dispatch");
+  } } as never);
+  const outcome = await upload.saveWithOutcome(f.grant, "msg_1", {
+    chunks: { [Symbol.asyncIterator]() { return {
+      async next() { if (once) return { done: true as const, value: undefined }; once = true; return { done: false as const, value: data }; },
+      async return() {
+        if (mode === "return-fails") throw Error("closure failed");
+        if (mode === "deadline-after-finish") await new Promise(r => setTimeout(r, 1100));
+        return { done: true as const, value: undefined };
+      },
+    }; } }, abort: async () => { aborts++; },
+  }, { ...framing, contentLength: data.length }, mode === "deadline-after-finish" ? 1000 : undefined);
+  assert.equal(outcome.completed, false);
+  if (!outcome.completed) assert.equal(outcome.commit, "not-dispatched");
+  assert.equal(dispatches, 0); assert.equal(aborts, 1);
+  assert.equal(f.admissions.admit(f.binding), null);
+  assert.equal((await fs.readdir(f.rootPath)).length, 1);
+  await assert.rejects(storage.stageMultipart(f.grant, "msg_1", { chunks: bytes(), abort: async () => {} }, framing));
+});
+test("multipart composition waits for message outcome and never hands out second dispatch result", async t => {
+  const f = await fixture(t), p = physicalFixture(), storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  let enter!: () => void, release!: () => void, calls = 0;
+  const entered = new Promise<void>(r => { enter = r; }), pause = new Promise<void>(r => { release = r; });
+  t.after(() => release());
+  const writer = { async saveOnceWithOutcome(grant: unknown, key: string, file: { size: number }) {
+    assert.equal(grant, f.grant); assert.equal(key, "msg_1"); assert.equal(file.size, 3);
+    calls++; enter(); await pause; throw Error("lost COMMIT ACK");
+  } };
+  const upload = new StrictMultipartUpload(storage, writer as never), { wire, framing } = multipart();
+  async function* chunks() { yield wire; }
+  const source = { chunks: chunks(), abort: async () => {} };
+  const first = upload.saveWithOutcome(f.grant, "msg_1", source, framing);
+  await entered; let secondSettled = false;
+  const second = upload.saveWithOutcome(f.grant, "other_key", source, framing).then(r => { secondSettled = true; return r; });
+  await new Promise(r => setImmediate(r)); assert.equal(secondSettled, false);
+  release(); const outcome = await first;
+  assert.equal(outcome.completed, false);
+  if (!outcome.completed) assert.equal(outcome.commit, "unknown");
+  assert.deepEqual(await second, { completed: true, result: { authorized: false } });
+  assert.equal(calls, 1); assert.equal(f.admissions.admit(f.binding), null);
+  assert.equal((await fs.readdir(f.rootPath)).length, 1);
+});
+
+for (const operation of ["write", "close"] as const)
+test("multipart deadline during pending file " + operation + " retains admission and awaits IO", { timeout: 10000 }, async t => {
+  const f = await fixture(t), p = physicalFixture(), originalOpen = fs.open;
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  let release!: () => void, enter!: () => void, aborted!: () => void;
+  const pause = new Promise<void>(r => { release = r; }), entered = new Promise<void>(r => { enter = r; });
+  const abortSeen = new Promise<void>(r => { aborted = r; });
+  t.after(() => release());
+  const handles: import("node:fs/promises").FileHandle[] = [];
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const h = await originalOpen(...args); handles.push(h);
+    if (handles.length === 3) {
+      const method = h[operation];
+      t.mock.method(h, operation, async (...params: unknown[]) => {
+        enter(); await pause; return Reflect.apply(method, h, params);
+      });
+    }
+    return h;
+  });
+  const { wire, framing } = multipart();
+  async function* chunks() { yield wire; }
+  let settled = false;
+  const task = storage.stageMultipart(f.grant, "msg_1",
+    { chunks: chunks(), abort: async () => { aborted(); } }, framing, 1000)
+    .finally(() => { settled = true; });
+  // Attach rejection handler before waiting for the deadline.
+  const rejected = assert.rejects(task, /deadline/);
+  await Promise.race([entered, task.then(() => { throw Error("settled before IO"); })]);
+  await abortSeen;
+  assert.equal(settled, false); assert.equal(f.admissions.admit(f.binding), null);
+  release(); await rejected;
+  assert.ok(handles.every(h => h.fd === -1));
+  assert.equal((await fs.readdir(f.rootPath)).length, 1);
+});
+test("multipart completed insert is returned once, even across another upload coordinator", async t => {
+  const f = await fixture(t), p = physicalFixture(), storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  let calls = 0;
+  const expected = { completed: true, result: { authorized: true, inserted: true, message: { id: 7 } } };
+  const writer = { async saveOnceWithOutcome() { calls++; return expected; } } as never;
+  const upload = new StrictMultipartUpload(storage, writer), { wire, framing } = multipart();
+  async function* chunks() { yield wire; }
+  const source = () => ({ chunks: chunks(), abort: async () => {} });
+  assert.equal(await upload.saveWithOutcome(f.grant, "msg_1", source(), framing), expected);
+  assert.deepEqual(await upload.saveWithOutcome(f.grant, "msg_1", source(), framing),
+    { completed: true, result: { authorized: false } });
+  const other = await new StrictMultipartUpload(storage, writer).saveWithOutcome(f.grant, "msg_1", source(), framing);
+  assert.equal(other.completed, false); assert.equal(calls, 1);
 });
