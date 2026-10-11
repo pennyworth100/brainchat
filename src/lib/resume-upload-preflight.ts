@@ -11,7 +11,7 @@ const pending = new WeakSet<Socket>();
 type Request = { roomId?: unknown; sessionId?: unknown; token?: unknown } | null;
 type Limits = { capacity?: ResumeCapacity; timeoutMs?: number; now?: () => number };
 
-// PRIVATE pre-body seam, NOT installed in server.ts. Socket and owner must come
+// Pre-body seam installed for credential-bearing HTTP uploads. Socket and owner come
 // from the server's authoritative registry. Knowing socket.id is not sufficient:
 // the bounded bearer credential must authenticate through the durable store.
 // No parser/source/FS, CAS, publication, retry or upload lease release here.

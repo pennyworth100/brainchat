@@ -32,8 +32,13 @@ denial nor capacity release authorizes deletion; no reclamation claim is made.
 
 ## Remaining release gates
 
-- x-socket-id is still the legacy HTTP bearer capability, not independent caller
-  authentication. Credential-authenticated preflight is not wired yet.
+- Requests without credential headers still use x-socket-id as the legacy HTTP
+  bearer capability, not independent caller authentication. Requests supplying
+  either x-resume-session-id or x-resume-token now MUST pass strict framing and
+  credential-authenticated preflight; no invalid/partial credential falls back.
+  Tokens authenticate via the durable store and must match the exact live owner.
+  Denial is 403 (framing 400), before parser/FS. Credentials are not issued publicly
+  yet; legacy removal and browser credential use remain release gates.
 - Multer/raw body framing, resource-ledger reservation and receipt/idempotency
   composition remain to be integrated. This is not the completed upload pipeline.
 - Public resume and credentials remain unexposed. Keep the release draft.
@@ -45,6 +50,11 @@ pre-body denial without filesystem allocation and pauses real multipart AFTER
 storage starts: revocation/generation/expiry/policy changes prevent INSERT,
 while an admitted disconnect persists once. Concurrent same-session bodies deny
 without allocation; a settled denial releases the permit.
+These paused-body cases now exercise the credential-bearing route. Additional
+actual HTTP cases prove partial/forged/wrong-session/wrong-owner credentials,
+durable pre-body revocation/generation/expiry and invalid framing fail without
+filesystem effects or legacy downgrade. The disposable DB fixture installs a
+known token hash; it does not add a production credential-issuance endpoint.
 The full reconnect/upload regression covers parser limits, legacy responses,
 byte/path integrity and admitted-before-disconnect persistence/fanout/rejoin.
 qa-public-upload-outcome.ts extracts the real route/storage via AST but

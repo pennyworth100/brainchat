@@ -5,6 +5,8 @@ import { io, type Socket } from "socket.io-client";
 import { Pool } from "pg";
 import fs from "node:fs/promises";
 import http from "node:http";
+import { randomBytes } from "node:crypto";
+import { hashResumeToken } from "../src/lib/resume-store";
 
 // Actual server.ts, real Socket.IO and disposable PostgreSQL. No live services.
 async function main() {
@@ -143,10 +145,10 @@ async function main() {
     console.log("PUBLIC_DM_PASS: real PostgreSQL dual endpoint revocation before send/after ACK, no false success/replay, no locks over ACK, one in-flight request, reciprocal lock ordering");
     // Actual HTTP pre-body authority: valid socket IDs cannot bypass durable
     // revocation, wrong-room or expired/generation-mismatched session checks.
-    const upload = (socketId: string, roomId = created.roomId) => {
+    const upload = (socketId: string, roomId = created.roomId, headers: Record<string, string> = {}) => {
       const body = new FormData(); body.append("file", new Blob(["wire-upload"]), "proof.txt");
       return fetch(base + "/api/upload", { method: "POST", body,
-        headers: { "x-room-id": roomId, "x-socket-id": socketId }, signal: AbortSignal.timeout(5000) });
+        headers: { "x-room-id": roomId, "x-socket-id": socketId, ...headers }, signal: AbortSignal.timeout(5000) });
     };
     const filesBefore = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
     assert.equal((await upload(a.id!, "wrong123")).status, 401);
@@ -161,6 +163,48 @@ async function main() {
     const validUpload = await upload(a.id!);
     assert.equal(validUpload.status, 200);
     assert.equal((await validUpload.json()).message.username, "Alice");
+    // Fixture controls only the disposable DB's token hash. No public issuance
+    // seam or test-only endpoint is added to the real server.
+    const token = randomBytes(32).toString("base64url");
+    await db.query("UPDATE room_resume_sessions SET token_hash=$2 WHERE id=$1", [first.id, hashResumeToken(token)]);
+    const credentialHeaders = { "x-resume-session-id": first.id, "x-resume-token": token };
+    const credentialBefore = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+    // Send only headers: generic JSON parsing must not start/wait for the body.
+    const invalidFraming = http.request(base + "/api/upload", { method: "POST", headers: {
+      "x-room-id": created.roomId, "x-socket-id": a.id!, ...credentialHeaders,
+      "content-type": "application/json", "content-length": "1000",
+    } });
+    const invalidFramingStatus = new Promise<number>((resolve, reject) => {
+      invalidFraming.once("error", reject);
+      invalidFraming.setTimeout(3000, () => invalidFraming.destroy(Error("prebody rejection timeout")));
+      invalidFraming.once("response", res => { res.resume(); res.once("end", () => resolve(res.statusCode!)); });
+    });
+    invalidFraming.flushHeaders();
+    try { assert.equal(await invalidFramingStatus, 400); } finally { invalidFraming.destroy(); }
+    for (const headers of [
+      { "x-resume-token": token }, { "x-resume-session-id": first.id },
+      { ...credentialHeaders, "x-resume-token": randomBytes(32).toString("base64url") },
+      { ...credentialHeaders, "x-resume-session-id": "00000000-0000-4000-8000-000000000000" },
+    ]) {
+      assert.equal((await upload(a.id!, created.roomId, headers as Record<string, string>)).status, 403,
+        "credential denial must never downgrade to otherwise-valid legacy socket authority");
+    }
+    assert.equal((await upload(b.id!, created.roomId, credentialHeaders)).status, 403,
+      "a valid credential is bound to its exact server-owned session, not another room member");
+    assert.equal((await upload(a.id!, created.roomId, { ...credentialHeaders, "content-encoding": "gzip" })).status, 400);
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    const authenticatedUpload = await upload(a.id!, created.roomId, credentialHeaders);
+    assert.equal(authenticatedUpload.status, 200);
+    assert.equal((await authenticatedUpload.json()).message.username, "Alice");
+    for (const mutation of ["revoked_at=now()", "generation=generation+1", "expires_at=now()-interval '1 second'"]) {
+      const prior = (await db.query("SELECT expires_at, generation FROM room_resume_sessions WHERE id=$1", [first.id])).rows[0];
+      const before = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+      await db.query("UPDATE room_resume_sessions SET " + mutation + " WHERE id=$1", [first.id]);
+      assert.equal((await upload(a.id!, created.roomId, credentialHeaders)).status, 403);
+      assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), before);
+      await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
+    }
+    console.log("PUBLIC_UPLOAD_CREDENTIAL_PASS: real HTTP bearer lookup, partial/forged/wrong-owner denial without legacy downgrade or filesystem allocation; framing denial; valid upload");
     // Pause actual multipart AFTER storage allocation, then change authority.
     // Disconnect alone must not revoke the already admitted HTTP lifetime.
     for (const scenario of ["revoke", "generation", "expiry", "policy", "disconnect"]) {
@@ -170,11 +214,15 @@ async function main() {
       const username = "Lifetime-" + scenario;
       uploader.emit("join-room", { ...lifetimeRoom, username, password: join.password });
       await ready;
+      const lifetimeToken = randomBytes(32).toString("base64url");
+      const lifetimeSession = (await db.query("UPDATE room_resume_sessions SET token_hash=$2 WHERE room_id=$1 RETURNING id",
+        [lifetimeRoom.roomId, hashResumeToken(lifetimeToken)])).rows[0].id;
       const before = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
       const head = '--proofboundary\r\nContent-Disposition: form-data; name="file"; filename="lifetime.txt"\r\nContent-Type: text/plain\r\n\r\nfirst';
       const tail = 'last\r\n--proofboundary--\r\n';
       const request = http.request(base + "/api/upload", { method: "POST", headers: {
         "x-room-id": lifetimeRoom.roomId, "x-socket-id": uploader.id!,
+        "x-resume-session-id": lifetimeSession, "x-resume-token": lifetimeToken,
         "content-type": "multipart/form-data; boundary=proofboundary",
         "content-length": Buffer.byteLength(head + tail),
       } });

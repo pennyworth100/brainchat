@@ -1,7 +1,13 @@
 # Private pre-body upload authentication (3.0.11 draft)
 
-NOT wired to HTTP or multer. No public upload behavior, version, schema or dependency
-change. This is one bounded prerequisite, not complete resume or HTTP acceptance.
+Now wired to the actual /api/upload route when either x-resume-session-id or
+x-resume-token is supplied. Both are required; failure never falls back to legacy
+socket-id authorization. Strict validateResumeUploadFraming runs before lookup;
+framing validation precedes even the generic JSON body parser, and the granted
+upload then uses the existing Multer/admitted-lifetime transaction
+path. No public credential issuance, schema or dependency change. Requests without
+either header still use the transitional legacy path. This is NOT the complete
+resource-ledger/parser/storage/receipt pipeline or full public resume acceptance.
 
 ## Implemented seam
 
@@ -47,8 +53,8 @@ and policy can change after it returns. No new grant allows live socket fanout.
 
 ## Before public activation
 
-`validateResumeUploadFraming` is a separate PRIVATE synchronous header prerequisite,
-not yet wired to this preflight or any route. It requires HTTP/1.1 POST, one positive
+`validateResumeUploadFraming` is now a synchronous prerequisite of the actual
+credential-bearing upload path. It requires HTTP/1.1 POST, one positive
 canonical Content-Length (at most 100 MiB + 64 KiB envelope overhead), and one strict
 multipart/form-data boundary (1..70 ASCII characters). It scans rawHeaders, not
 Node's normalized map which can discard duplicate Content-Type. Duplicate framing
@@ -59,7 +65,7 @@ The accepted boundary is deliberately a narrow RFC-compatible subset; no extra
 parameters, quoted escapes or embedded spaces. The result is an immutable snapshot.
 
 No parser, body stream, authentication or filesystem is touched by this helper.
-The future HTTP adapter MUST call it before parser creation, and separately handle
+The HTTP adapter calls it before parser creation but still must separately handle
 Node's checkContinue/checkExpectation (Node may otherwise send 100 Continue before
 the request handler), header timeouts and parser-level maxHeaderSize. The declared
 length is NOT body validation or a memory/disk reservation. Total streaming bytes,
@@ -72,7 +78,8 @@ The current server's x-socket-id + x-room-id check is NOT bearer authentication:
 a socket ID can be learned from user presence. It must not be copied into this
 new path as proof of identity. Resolve socket/owner from an authoritative server
 registry, verify the resume bearer through this seam, and never log bearer headers
-or place tokens in URLs. No public route or owner registry is added here.
+or place tokens in URLs. This is now wired through the existing public route and
+server owner registry; public credential issuance and legacy removal remain OFF.
 
 Order: strict bounded headers and request framing; credential preflight and
 rate/admission/disk reservation; only then instantiate or consume multipart parser;
@@ -106,6 +113,16 @@ Still required (NOT implemented/proven by this seam):
   tests across all finalizers.
 
 ## Integration evidence
+
+qa-public-session.ts now runs actual server.ts with HTTP and disposable PostgreSQL:
+valid bearer upload, partial/forged/wrong-session/wrong-owner denial without legacy
+downgrade or filesystem effects, durable prebody revocation/generation/expiry,
+and a header-only invalid-JSON-content-type request rejected before any body.
+Paused credential-bearing multipart bodies prove post-admission revocation,
+generation/expiry/policy fencing and ordinary disconnect survival. The fixture
+sets a known disposable token hash, never a production test-only endpoint.
+
+Earlier helper-level evidence below retains its narrower scope:
 
 The eight local loopback lifecycle regressions stub the DB authentication result.
 The isolated PostgreSQL CI harness now additionally composes real Socket.IO

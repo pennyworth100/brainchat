@@ -24,6 +24,8 @@ import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
 import { ResumeMemberships } from "./src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
 import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
+import { preflightResumeUpload } from "./src/lib/resume-upload-preflight";
+import { validateResumeUploadFraming } from "./src/lib/resume-upload-framing";
 import { ResumeOperationGate, ResumeUploadOperationGate } from "./src/lib/resume-operation";
 import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "./src/lib/resume-history";
@@ -297,6 +299,15 @@ async function main() {
     nxt();
   });
 
+  // Credential uploads reject invalid framing before the generic JSON parser
+  // can consume a body with a forged Content-Type. Still no body/FS work here.
+  expressApp.use("/api/upload", (req, res, nxt) => {
+    if ((req.headers["x-resume-session-id"] !== undefined || req.headers["x-resume-token"] !== undefined) &&
+        !validateResumeUploadFraming(req)) {
+      return res.status(400).json({ error: "Invalid upload framing" });
+    }
+    nxt();
+  });
   expressApp.use(express.json({ limit: "32kb" }));
 
   // ── Room creation ─────────────────────────────────────────────────────────
@@ -414,6 +425,21 @@ async function main() {
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
       try {
+        // Supplying either credential header selects strict authentication.
+        // Invalid/partial credentials MUST NOT fall back to socket-id authority.
+        const sessionId = req.headers["x-resume-session-id"];
+        const token = req.headers["x-resume-token"];
+        if (sessionId !== undefined || token !== undefined) {
+          const grant = await preflightResumeUpload(activeSocket, owner,
+            resumeMembers, resumeStore, uploadAdmissions, { roomId, sessionId, token });
+          if (!grant) return res.status(403).json({ error: "Upload credential rejected" });
+          if (req.destroyed || res.destroyed) {
+            uploadAdmissions.release(grant); // No parser/source work started.
+            return;
+          }
+          res.locals.uploadGrant = grant;
+          return nxt();
+        }
         // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
         // A room projection or a physically connected revoked socket is not authority.
         const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
