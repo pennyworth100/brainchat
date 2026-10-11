@@ -228,3 +228,93 @@ test("oversize chunk never writes rejected bytes and never yields staged authori
   assert.equal((await fs.stat(join(f.rootPath, dirs[0], "blob"))).size, 0);
   assert.equal(f.admissions.admit(f.binding), null);
 });
+
+test("pre-parser session binds accounting and physical identity without touching filesystem", async t => {
+  const f = await fixture(t), p = physicalFixture();
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  let opened = 0;
+  const original = fs.open;
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    opened++; return original(...args);
+  });
+  const session = await storage.authorize(f.grant, "before_headers");
+  assert.ok(Object.isFrozen(session));
+  assert.equal(storage.isAuthorized(f.grant, session), true);
+  assert.equal(opened, 0); assert.deepEqual(await fs.readdir(f.rootPath), []);
+  const request = p.requests[0];
+  assert.equal(request.clientMessageId, "before_headers");
+  assert.equal(request.grant, f.grant); assert.equal(request.root, f.root); assert.equal(request.pin, f.pin);
+  assert.equal(request.limit, 8); assert.equal(request.attemptId, f.inserts[0][0]);
+  assert.equal(request.operationId, f.inserts[0][8]);
+  assert.equal(storage.resolve(f.grant, session as never), null, "authorization is not durable file proof");
+  const result = await storage.stageAuthorized(f.grant, session, metadata, bytes());
+  assert.equal(storage.resolve(f.grant, result), result.file);
+  assert.equal(result.file.name, "file.txt");
+  assert.equal(storage.isAuthorized(f.grant, session), false);
+  await assert.rejects(storage.stageAuthorized(f.grant, session, metadata, bytes()), /session denied/);
+  assert.equal(f.connections(), 1); assert.equal(p.calls(), 1);
+});
+test("pre-parser authorization without physical provider denies before accounting", async t => {
+  const f = await fixture(t);
+  const storage = new StrictFileStorage(f.admissions, f.bridge, null);
+  await assert.rejects(storage.authorize(f.grant, "msg_1"), /denied/);
+  assert.equal(f.connections(), 0);
+  assert.deepEqual(await fs.readdir(f.rootPath), []);
+});
+test("copied session, foreign storage and foreign grant cannot consume authentic session", async t => {
+  const f = await fixture(t), p = physicalFixture();
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const foreign = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const session = await storage.authorize(f.grant, "msg_1");
+  let reads = 0;
+  async function* source() { reads++; yield Buffer.from("abc"); }
+  await assert.rejects(storage.stageAuthorized(f.grant, { ...session }, metadata, source()));
+  await assert.rejects(foreign.stageAuthorized(f.grant, session, metadata, source()));
+  await assert.rejects(storage.stageAuthorized({ ...f.grant }, session, metadata, source()));
+  assert.equal(reads, 0); assert.deepEqual(await fs.readdir(f.rootPath), []);
+  assert.equal(storage.isAuthorized(f.grant, session), true);
+  await storage.stageAuthorized(f.grant, session, metadata, source());
+  assert.equal(reads, 1);
+});
+for (const reason of ["expiry", "physical revocation"]) test("session " + reason + " before metadata denies without IO", async t => {
+  const f = await fixture(t), p = physicalFixture();
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const session = await storage.authorize(f.grant, "msg_1");
+  if (reason === "expiry") f.expire(); else p.revoke();
+  let metadataReads = 0, reads = 0;
+  const meta = { get name() { metadataReads++; return "file.txt"; }, mime: "text/plain" };
+  async function* source() { reads++; yield Buffer.from("abc"); }
+  assert.equal(storage.isAuthorized(f.grant, session), false);
+  await assert.rejects(storage.stageAuthorized(f.grant, session, meta, source()), /session denied/);
+  assert.equal(metadataReads, 0); assert.equal(reads, 0);
+  assert.deepEqual(await fs.readdir(f.rootPath), []);
+  assert.equal(f.admissions.admit(f.binding), null, "failure never releases admission");
+});
+test("invalid metadata burns session and cannot trigger reauthorization or filesystem effects", async t => {
+  const f = await fixture(t), p = physicalFixture();
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const session = await storage.authorize(f.grant, "msg_1");
+  await assert.rejects(storage.stageAuthorized(f.grant, session, { name: "", mime: "" }, bytes()));
+  assert.equal(storage.isAuthorized(f.grant, session), false);
+  await assert.rejects(storage.stageAuthorized(f.grant, session, metadata, bytes()));
+  await assert.rejects(new StrictFileStorage(f.admissions, f.bridge, p.provider).authorize(f.grant, "other"));
+  assert.equal(f.connections(), 1); assert.equal(p.calls(), 1);
+  assert.deepEqual(await fs.readdir(f.rootPath), []);
+});
+test("session is consumed synchronously before pending IO and rejects overlapping stage", async t => {
+  const f = await fixture(t), p = physicalFixture();
+  const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
+  const session = await storage.authorize(f.grant, "msg_1");
+  let release!: () => void, enter!: () => void;
+  const pause = new Promise<void>(r => { release = r; });
+  const entered = new Promise<void>(r => { enter = r; });
+  t.after(() => release());
+  async function* source() { enter(); await pause; yield Buffer.from("abc"); }
+  const first = storage.stageAuthorized(f.grant, session, metadata, source());
+  await entered;
+  await assert.rejects(storage.stageAuthorized(f.grant, session, metadata, bytes()));
+  assert.equal(f.admissions.admit(f.binding), null);
+  release(); const result = await first;
+  assert.equal(storage.resolve(f.grant, result), result.file);
+  assert.equal((await fs.readdir(f.rootPath)).length, 1);
+});

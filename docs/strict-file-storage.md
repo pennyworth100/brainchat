@@ -58,3 +58,26 @@ claims native Railway acceptance or physical-resource bounds.
 A storage/accounting failure before that transaction reports message
 `not-dispatched`; this is NEVER evidence that accounting rolled back or that
 resource liability may be refunded. There is no automatic retry or reclamation.
+
+## Pre-parser authorization (3.0.17)
+
+`StrictFileStorage.authorize(grant, clientMessageId)` obtains accounting and
+physical receipts before multipart metadata is available. It performs no body
+reads or filesystem calls. A missing physical provider denies before accounting.
+The opaque, coordinator-local session binds the exact grant, client message ID,
+operation ID, attempt ID, byte ceiling, root, policy pin and physical request.
+
+`isAuthorized` rechecks a not-yet-consumed session. Copies, other coordinators,
+other grants, expiry and revoked physical authority fail closed.
+`stageAuthorized` consumes the session synchronously, validates metadata and
+uses the existing awaited durable write/sync/close path. Even invalid metadata
+consumes the attempt; no retry, deletion, refund or admission release is added.
+The client message ID cannot be changed by later metadata. Legacy private
+`stage` callers keep synchronous metadata snapshotting.
+
+This is only the authorization prerequisite. It does **not** connect the push
+multipart sink to storage, establish exact request EOF, dispatch message SQL,
+provide physical byte/inode authority or activate public resumable uploads.
+A future adapter must await the entire multipart promise and IO cleanup before
+issuing durable file authority, and preserve the existing duplicate/outcome
+semantics. Public 503/no-downgrade gates remain unchanged.
