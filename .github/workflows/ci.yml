@@ -57,6 +57,10 @@ jobs:
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: npm run test:operation-wire
+      - name: Bounded session cleanup (owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: python3 scripts/qa-resume-session-cleanup-fixture.py
       - name: Retain fixture evidence (no keys or database files)
         if: always()
         uses: actions/upload-artifact@v4
