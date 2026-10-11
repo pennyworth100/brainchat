@@ -17,6 +17,8 @@ import { createUploadParser } from "../src/lib/upload-parser";
 // Byte-preservation regression for unknown INSERT and post-save emit errors.
 // Not a quota, recovery or all-writer barrier test. No server startup,
 // production imports, authentication, Socket.IO transport or live volumes.
+// The gate is substituted: autocommit fault injection is byte-retention proof,
+// not evidence of the actual transaction gate's COMMIT implementation.
 async function main() {
   const connectionString = process.env.RESUME_TEST_DATABASE_URL;
   assert.ok(connectionString, "RESUME_TEST_DATABASE_URL required (isolated DB only)");
@@ -59,7 +61,7 @@ async function main() {
   // This is deterministic fault injection, not a network/power-loss simulation.
   (pool as unknown as { query: (...args: any[]) => Promise<any> }).query = (...args: any[]) => {
     const sql = typeof args[0] === "string" ? args[0] : args[0].text;
-    const insert = /^insert into "messages"/i.test(sql);
+    const insert = /^insert into "?messages"?/i.test(sql);
     const touch = /^update "rooms"/i.test(sql);
     const queryMode = mode;
     const work = (async () => {
@@ -87,6 +89,13 @@ async function main() {
   const context = vm.createContext({
     db: drizzle(pool), messagesTable, roomsTable, eq, Date, JSON, crypto, path, multer,
     UPLOAD_DIR: root,
+    // Persistence gate is substituted only in this byte-retention harness.
+    // Real authority/transaction checks live in qa-public-session.ts.
+    uploadGate: { runWithOutcome: async (_grant: unknown, work: (tx: unknown) => Promise<unknown>) => {
+      try { return { completed: true, result: { authorized: true, value: await work(pool) } }; }
+      catch (error) { return { completed: false, commit: "unknown", error }; }
+    } },
+    uploadAdmissions: { release: () => true },
     fs: { ...fs, promises: { ...fs.promises, unlink: (file: string) => {
       assert.ok(file.startsWith(root + path.sep));
       const result = fs.promises.unlink(file); unlinks.push(result); return result;
@@ -108,7 +117,7 @@ async function main() {
     if (mode === "after-save-response") {
       res.json = () => { throw Error("injected response failure after save"); };
     }
-    res.locals.uploadIdentity = { roomId: "proof123", username: "Fixture" }; next();
+    res.locals.uploadGrant = { binding: { roomId: "proof123", username: "Fixture" } }; next();
   }, createUploadParser(context.storage, 1024), context.handler);
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => server.once("listening", resolve));
@@ -224,7 +233,7 @@ async function main() {
       sourceSha: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
       serverSha256: crypto.createHash("sha256").update(source).digest("hex"),
       harnessSha256: crypto.createHash("sha256").update(await fs.promises.readFile("scripts/qa-public-upload-outcome.ts")).digest("hex"),
-      scope: "actual AST-extracted storage/save/handler; real HTTP/multipart/PG/files; substituted admission and event emitter; minimal schema; no live state",
+      scope: "actual AST-extracted storage/save/handler; real HTTP/multipart/PG/files; substituted admission, transaction gate and event emitter; minimal schema; no live state",
     }, null, 2));
   } finally {
     // Release injected work even on assertion failure, before fixture teardown.

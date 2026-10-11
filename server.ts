@@ -24,7 +24,8 @@ import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
 import { ResumeMemberships } from "./src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
 import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
-import { ResumeOperationGate } from "./src/lib/resume-operation";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "./src/lib/resume-operation";
+import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
 import { ResumeMessageWriter } from "./src/lib/resume-message";
@@ -238,6 +239,8 @@ async function main() {
   const resumeGate = new ResumeOperationGate(pool, resumeBindings);
   const socketOwners = new WeakMap<Socket, ResumeSocketOwner>();
   const legacyUploadAdmission = new LegacyUploadAdmission(resumeMembers, resumeGate);
+  const uploadAdmissions = new ResumeUploadAdmissions(resumeBindings);
+  const uploadGate = new ResumeUploadOperationGate(pool, uploadAdmissions);
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
@@ -418,48 +421,78 @@ async function main() {
             resumeMembers.bindingFor(activeSocket, owner, roomId) !== identity) {
           return res.status(401).json({ error: "Join the room before uploading" });
         }
-        res.locals.uploadIdentity = Object.freeze({ roomId: identity.roomId, username: identity.username });
+        const grant = uploadAdmissions.admit(identity);
+        if (!grant) return res.status(429).json({ error: "Upload already in progress or capacity exhausted" });
+        res.locals.uploadGrant = grant;
       } catch (error) {
         console.error("upload admission error:", error);
         return res.status(503).json({ error: "Could not authorize upload" });
       }
       nxt();
     },
-    uploadMiddleware,
+    (req, res, nxt) => {
+      // Parser callback settles storage work. Close alone cannot release a lease.
+      uploadMiddleware(req, res, error => {
+        if (error) uploadAdmissions.release(res.locals.uploadGrant);
+        nxt(error);
+      });
+    },
     async (req, res) => {
-      if (!req.file) return res.status(400).json({ error: "No file" });
-      const token = (req as express.Request & { _uploadToken: string })._uploadToken;
-      const file = {
-        url: `/uploads/${token}/${req.file.filename}`,
-        name: req.file.originalname,
-        size: req.file.size,
-        mime: req.file.mimetype || "application/octet-stream",
-      };
-      const { roomId, username } = res.locals.uploadIdentity;
-      let message: Awaited<ReturnType<typeof saveMessage>>;
+      const grant: ResumeUploadGrant = res.locals.uploadGrant;
       try {
-        message = await saveMessage(roomId, username, "file", JSON.stringify(file));
-      } catch (err) {
-        // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
-        // even when no row is visible: there is no safe retry/reclamation receipt.
-        console.error("upload persistence outcome unknown:", err);
-        return res.status(500).json({
-          code: "UPLOAD_OUTCOME_UNKNOWN",
-          error: "Attachment status is unknown. Check room history before uploading again.",
-        });
-      }
-      try {
-        // Publication failure cannot invalidate an acknowledged saved message.
-        resumeMembers.broadcast(roomId, "chat-file", message);
-      } catch (err) {
-        console.error("upload notification error after save:", err);
-      }
-      // A response failure/disconnected client must never trigger byte cleanup.
-      try {
-        res.json({ ...file, message });
-      } catch (err) {
-        console.error("upload response error after save:", err);
-        res.destroy();
+        if (!req.file) return res.status(400).json({ error: "No file" });
+        const token = (req as express.Request & { _uploadToken: string })._uploadToken;
+        const file = {
+          url: `/uploads/${token}/${req.file.filename}`,
+          name: req.file.originalname,
+          size: req.file.size,
+          mime: req.file.mimetype || "application/octet-stream",
+        };
+        const { roomId, username } = grant.binding;
+        let message: Awaited<ReturnType<typeof saveMessage>>;
+        try {
+          const outcome = await uploadGate.runWithOutcome(grant, async transaction => {
+            const saved = await transaction.query<MessageRow>(`INSERT INTO messages
+              (room_id, username, type, content, ts) VALUES ($1, $2, 'file', $3, clock_timestamp())
+              RETURNING id, room_id AS "roomId", username, type, content, ts`,
+            [roomId, username, JSON.stringify(file)]);
+            if (!saved.rows[0]) throw Error("Missing upload receipt");
+            return deserializeMessage(saved.rows[0]);
+          });
+          if (!outcome.completed) throw outcome.error;
+          if (!outcome.result.authorized) {
+            // Not 401: clients must not automatically re-upload. Preserve bytes.
+            return res.status(403).json({ error: "Upload authorization expired or changed" });
+          }
+          message = outcome.result.value;
+          // Outside the room SHARE lock to avoid lock upgrade deadlocks.
+          touchRoom(roomId).catch(() => {});
+        } catch (err) {
+          // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
+          // even when no row is visible: there is no safe retry/reclamation receipt.
+          console.error("upload persistence outcome unknown:", err);
+          return res.status(500).json({
+            code: "UPLOAD_OUTCOME_UNKNOWN",
+            error: "Attachment status is unknown. Check room history before uploading again.",
+          });
+        }
+        try {
+          // Publication failure cannot invalidate an acknowledged saved message.
+          resumeMembers.broadcast(roomId, "chat-file", message);
+        } catch (err) {
+          console.error("upload notification error after save:", err);
+        }
+        // A response failure/disconnected client must never trigger byte cleanup.
+        try {
+          res.json({ ...file, message });
+        } catch (err) {
+          console.error("upload response error after save:", err);
+          res.destroy();
+        }
+      } finally {
+        // Actual parser/persistence settlement, never timeout/disconnect alone.
+        // Capacity release does not authorize cleanup or retry.
+        uploadAdmissions.release(grant);
       }
     }
   );

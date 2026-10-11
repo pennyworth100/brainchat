@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { io, type Socket } from "socket.io-client";
 import { Pool } from "pg";
 import fs from "node:fs/promises";
+import http from "node:http";
 
 // Actual server.ts, real Socket.IO and disposable PostgreSQL. No live services.
 async function main() {
@@ -160,6 +161,63 @@ async function main() {
     const validUpload = await upload(a.id!);
     assert.equal(validUpload.status, 200);
     assert.equal((await validUpload.json()).message.username, "Alice");
+    // Pause actual multipart AFTER storage allocation, then change authority.
+    // Disconnect alone must not revoke the already admitted HTTP lifetime.
+    for (const scenario of ["revoke", "generation", "expiry", "policy", "disconnect"]) {
+      // Separate rooms preserve the real eight-joins/minute limiter baseline.
+      const lifetimeRoom = await (await fetch(base + "/api/rooms", { method: "POST" })).json();
+      const uploader = await connect(), ready = event(uploader, "room-snapshot");
+      const username = "Lifetime-" + scenario;
+      uploader.emit("join-room", { ...lifetimeRoom, username, password: join.password });
+      await ready;
+      const before = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+      const head = '--proofboundary\r\nContent-Disposition: form-data; name="file"; filename="lifetime.txt"\r\nContent-Type: text/plain\r\n\r\nfirst';
+      const tail = 'last\r\n--proofboundary--\r\n';
+      const request = http.request(base + "/api/upload", { method: "POST", headers: {
+        "x-room-id": lifetimeRoom.roomId, "x-socket-id": uploader.id!,
+        "content-type": "multipart/form-data; boundary=proofboundary",
+        "content-length": Buffer.byteLength(head + tail),
+      } });
+      const response = new Promise<number>((resolve, reject) => {
+        request.once("error", reject);
+        request.once("response", res => { res.resume(); res.once("end", () => resolve(res.statusCode!)); });
+      });
+      request.write(head);
+      let allocated = false;
+      for (let i = 0; i < 100; i++) {
+        if ((await fs.readdir(process.env.OWNED_UPLOAD_DIR!)).length > before.length) { allocated = true; break; }
+        await new Promise(r => setTimeout(r, 10));
+      }
+      assert.ok(allocated, "real parser began before authority changed");
+      if (scenario === "revoke") {
+        const inventory = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+        assert.equal((await upload(uploader.id!, lifetimeRoom.roomId)).status, 429);
+        assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), inventory,
+          "one admitted body per session; rejection cannot allocate another file");
+      }
+      if (scenario === "policy") {
+        await db.query("UPDATE rooms SET auth_version=auth_version+1 WHERE id=$1", [lifetimeRoom.roomId]);
+      } else if (scenario !== "disconnect") {
+        const mutation = { revoke: "revoked_at=now()", generation: "generation=generation+1",
+          expiry: "expires_at=now()-interval '1 second'" }[scenario];
+        assert.ok(mutation);
+        await db.query("UPDATE room_resume_sessions SET " + mutation + " WHERE room_id=$1 AND username=$2", [lifetimeRoom.roomId, username]);
+      } else {
+        uploader.disconnect();
+        await b.timeout(3000).emitWithAck("sync-room", { roomId: created.roomId, probeOnly: true });
+      }
+      request.end(tail);
+      assert.equal(await response, scenario === "disconnect" ? 200 : 403);
+      const rows = await db.query("SELECT id FROM messages WHERE room_id=$1 AND username=$2 AND type='file'", [lifetimeRoom.roomId, username]);
+      assert.equal(rows.rowCount, scenario === "disconnect" ? 1 : 0);
+      if (scenario === "revoke") {
+        await db.query("UPDATE room_resume_sessions SET revoked_at=NULL WHERE room_id=$1", [lifetimeRoom.roomId]);
+        assert.equal((await upload(uploader.id!, lifetimeRoom.roomId)).status, 200,
+          "settled denial releases the lifetime permit");
+      }
+      uploader.disconnect();
+    }
+    console.log("PUBLIC_UPLOAD_LIFETIME_PASS: actual paused multipart revocation/generation/expiry/policy deny INSERT; admitted disconnect persists once");
     // Hold the real admission's durable lock, disconnect while it waits, then
     // release: a late successful database result must not start the parser.
     const uploading = await connect(); const uploadingJoined = event(uploading, "room-snapshot");
