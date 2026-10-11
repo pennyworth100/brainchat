@@ -123,6 +123,13 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-public-session-fixture.py
 
+      - name: Actual concurrent HTTP/upload/socket producer drain (owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 scripts/qa-public-session-fixture.py --lifecycle
+          OWNED_LIFECYCLE_CANCEL=1 python3 scripts/qa-public-session-fixture.py --lifecycle
+
       - name: Start isolated application
         env:
           NODE_ENV: production

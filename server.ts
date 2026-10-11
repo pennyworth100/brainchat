@@ -10,6 +10,8 @@ import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
+import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
+import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
 import { consumeJoinLimits } from "./src/lib/join-rate-limits";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
@@ -223,7 +225,7 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function main() {
   // Run migrations
   console.log("Running database migrations...");
   await migrate(db, { migrationsFolder: "./drizzle" });
@@ -284,6 +286,7 @@ async function main() {
   // One owner for the shared table, replacing four dependency-owned timers.
   // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
   const rateLimitCleanup = new RateLimitCleanup(pool);
+  const lifecycle = new ServerLifecycle(rateLimitCleanup, roomActivity);
 
   // Security headers
   expressApp.disable("x-powered-by");
@@ -315,10 +318,10 @@ async function main() {
     }
     nxt();
   });
-  expressApp.use(express.json({ limit: "32kb" }));
+  const jsonBody = callbackStage(express.json({ limit: "32kb" }));
 
   // ── Room creation ─────────────────────────────────────────────────────────
-  expressApp.post("/api/rooms", async (req, res) => {
+  expressApp.post("/api/rooms", trackedHttp(lifecycle, jsonBody, handlerStage(async (req, res) => {
     try {
       await createRoomLimiter.consume(req.ip || req.socket.remoteAddress || "unknown");
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -352,7 +355,7 @@ async function main() {
       console.error("POST /api/rooms error:", err);
       return res.status(500).json({ error: "Internal error" });
     }
-  });
+  })));
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
   expressApp.use(
@@ -378,7 +381,8 @@ async function main() {
   );
 
   // ── File uploads ──────────────────────────────────────────────────────────
-  const storage = multer.diskStorage({
+  const storageSettlement = new UploadStorageSettlement();
+  const storage = storageSettlement.wrap(multer.diskStorage({
     destination: (req, _file, cb) => {
       const token = crypto.randomBytes(8).toString("hex");
       const dir = path.join(UPLOAD_DIR, token);
@@ -398,13 +402,13 @@ async function main() {
           .trim() || "file";
       cb(null, safe);
     },
-  });
+  }));
 
   const uploadMiddleware = createUploadParser(storage, MAX_FILE_SIZE);
 
   expressApp.post(
     "/api/upload",
-    async (req, res, nxt) => {
+    trackedHttp(lifecycle, jsonBody, handlerStage(async (req, res, nxt) => {
       const rawRoomId = req.headers["x-room-id"];
       const socketId = req.headers["x-socket-id"];
       if (
@@ -470,15 +474,21 @@ async function main() {
         return res.status(503).json({ error: "Could not authorize upload" });
       }
       nxt();
-    },
-    (req, res, nxt) => {
-      // Parser callback settles storage work. Close alone cannot release a lease.
-      uploadMiddleware(req, res, error => {
-        if (error) uploadAdmissions.release(res.locals.uploadGrant);
-        nxt(error);
-      });
-    },
+    }),
     async (req, res) => {
+      // Multer abort may call back before late storage/cleanup. Retain BOTH,
+      // including a synchronous parser throw after starting storage work.
+      let failed = false, parserError: unknown;
+      try { await callbackStage(uploadMiddleware)(req, res); }
+      catch (error) { failed = true; parserError = error; }
+      await storageSettlement.settle(req);
+      if (failed) {
+        uploadAdmissions.release(res.locals.uploadGrant);
+        throw parserError;
+      }
+      return true;
+    },
+    handlerStage(async (req, res) => {
       const grant: ResumeUploadGrant = res.locals.uploadGrant;
       try {
         if (!req.file) return res.status(400).json({ error: "No file" });
@@ -535,7 +545,7 @@ async function main() {
         // Capacity release does not authorize cleanup or retry.
         uploadAdmissions.release(grant);
       }
-    }
+    }))
   );
 
   // ── API key middleware ────────────────────────────────────────────────────
@@ -557,8 +567,7 @@ async function main() {
   // GET /api/messages/:roomId
   expressApp.get(
     "/api/messages/:roomId",
-    requireApiKey,
-    async (req, res) => {
+    trackedHttp(lifecycle, handlerStage(requireApiKey), handlerStage(async (req, res) => {
       try {
         const rawRoomId = req.params.roomId as string;
         if (!isValidRoomId(rawRoomId))
@@ -584,11 +593,11 @@ async function main() {
         console.error("GET /api/messages error:", err);
         res.status(500).json({ error: "Internal error" });
       }
-    }
+    }))
   );
 
   // POST /api/send
-  expressApp.post("/api/send", requireApiKey, async (req, res) => {
+  expressApp.post("/api/send", trackedHttp(lifecycle, jsonBody, handlerStage(requireApiKey), handlerStage(async (req, res) => {
     try {
       const { roomId: rawRoomId, message, clientMessageId } = req.body;
       const principal = res.locals.agentPrincipal as AgentPrincipal;
@@ -626,10 +635,17 @@ async function main() {
       console.error("POST /api/send error:", err);
       res.status(500).json({ error: "Internal error" });
     }
-  });
+  })));
 
   // ── Socket.io ─────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
+    if (!lifecycle.accepting) { socket.disconnect(true); return; }
+    const onWorkError = (error: unknown) => console.error("Socket handler error:", error);
+    const draining = (...args: unknown[]) => {
+      const ack = args.at(-1);
+      if (typeof ack === "function") ack({ error: "Server is draining" });
+      else socket.emit("join-error", "Server is draining");
+    };
     let currentRoom: string | null = null;
     let publishedBinding: ResumeBinding | null = null;
     // Normal authenticated joins now use the real durable/session owner. Do not
@@ -660,9 +676,10 @@ async function main() {
       },
     });
 
+    lifecycle.own(owner);
     socket.on(
       "join-room",
-      async ({
+      lifecycle.socket(async ({
         roomId: rawRoomId,
         username,
         password,
@@ -736,10 +753,10 @@ async function main() {
           console.error("join-room error:", err);
           socket.emit("join-error", "Server error", { code: "SERVER_ERROR" } satisfies JoinErrorDetails);
         }
-      }
+      }, draining, onWorkError)
     );
 
-    socket.on("sync-room", async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack) => {
+    socket.on("sync-room", lifecycle.socket(async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack: ((value: any) => void) | undefined) => {
       if (typeof ack !== "function") return;
       const roomId = payload?.roomId;
       const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
@@ -755,13 +772,13 @@ async function main() {
         console.error("sync-room error:", err);
         if (resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       }
-    });
+    }, draining, onWorkError));
 
     // Existing normal-join clients use the same exact physical/session authority.
     // Missing keys retain legacy one-attempt semantics; never auto-retry them.
     // An explicit key permits a same-session receipt lookup, not replayed fanout.
     for (const event of ["send-message", "send-image"] as const) {
-      socket.on(event, async (payload, ack) => {
+      socket.on(event, lifecycle.socket(async (payload: { roomId?: unknown; message?: unknown; dataUrl?: unknown; clientMessageId?: unknown } | null, ack: ((value: any) => void) | undefined) => {
         const reply = typeof ack === "function" ? ack : () => {};
         const roomId = payload?.roomId;
         if (event === "send-message" && (!roomId || typeof payload?.message !== "string" ||
@@ -801,15 +818,16 @@ async function main() {
           if (current()) reply({ error: "Write outcome unknown; sync before retrying",
             outcome: "unknown", clientMessageId: request.clientMessageId });
         }
-      });
+      }, draining, onWorkError));
     }
 
     // Files are saved by POST /api/upload; old send-file remains ignored.
 
-    registerPrivateMessages(socket, owner, resumeMembers, resumeGate);
+    registerPrivateMessages(socket, owner, resumeMembers, resumeGate, 5000, lifecycle);
     socketOwners.set(socket, owner);
 
     socket.on("disconnect", () => {
+      void lifecycle.closeOwner(owner);
       socketOwners.delete(socket);
       // Authority is released synchronously at disconnecting. A displaced
       // transport must not announce its live logical successor as departed.
@@ -838,12 +856,15 @@ async function main() {
     return handle(req, res);
   });
 
-  server.listen(PORT, () => {
-    console.log(`Dimle running on http://localhost:${PORT}`);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(PORT, () => { server.off("error", reject); resolve(); });
   });
+  console.log(`Dimle running on http://localhost:${PORT}`);
+  return { lifecycle, server, io, app };
 }
 
-main().catch((err) => {
+if (require.main === module) main().catch((err) => {
   console.error("Failed to start:", err);
   process.exit(1);
 });

@@ -1,3 +1,4 @@
+import type { ServerLifecycle } from "./server-lifecycle";
 import type { Socket } from "socket.io";
 import type { ResumeMemberships } from "./resume-membership";
 import type { ResumeSocketOwner } from "./resume-socket";
@@ -14,9 +15,10 @@ export function registerPrivateMessages(
   members: ResumeMemberships,
   gate: Pick<ResumeOperationGate, "authorizePair">,
   timeoutMs = 5000,
+  lifecycle?: ServerLifecycle,
 ) {
   let inFlight = false;
-  socket.on("private-message", async (payload: unknown, ack?: (result: PrivateMessageResult) => void) => {
+  const handler = async (payload: unknown, ack?: (result: PrivateMessageResult) => void) => {
     const data = payload as { roomId?: unknown; toUsername?: unknown; message?: unknown } | null;
     const { roomId, toUsername, message } = data || {};
     const reply = (result: PrivateMessageResult) => {
@@ -59,5 +61,10 @@ export function registerPrivateMessages(
     } finally {
       inFlight = false;
     }
-  });
+  };
+  socket.on("private-message", lifecycle ? lifecycle.socket(handler, (_payload, ack) => {
+    const result = { error: "Server is draining" };
+    if (typeof ack === "function") ack(result);
+    else socket.emit("private-error", result);
+  }, error => console.error("Private handler error:", error)) : handler);
 }

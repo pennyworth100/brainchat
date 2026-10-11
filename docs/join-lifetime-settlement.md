@@ -47,10 +47,10 @@ server shutdown acceptance.
 | disconnecting / disconnect | Synchronous fencing plus retained owner close/cleanup and synchronous presence fanout. WeakMap alone does not enumerate all owners. |
 | Expiry scheduler / activity writer | Stop expiry scheduling, then settle its actual query; settle activity only after producers can no longer enqueue. |
 
-Next is an owned shared server lifecycle with admission closed before new body,
-parser, DB and socket-handler work. It must retain admitted handler completion,
-enumerate owners without leaking disconnected owners, and compose expiry and
-activity only in the correct order. Do not install a partial SIGTERM hook and
-call it a global fence. Real concurrent HTTP/upload/socket + PostgreSQL drain
-and fault acceptance, kernel/filesystem flush, external writers/replicas, physical
+The initialized-process composition is now implemented and verified by
+[server lifecycle settlement](server-lifecycle-settlement.md), including
+concurrent HTTP/upload/socket + PostgreSQL drain and cancellation acceptance.
+Its private stop API is not a deployed global cutover/signal boundary.
+Kernel/filesystem flush, startup/replica/external-writer fencing, physical
 byte+inode authority and a current-candidate recovery point remain unproven.
+Do not install a partial SIGTERM hook and call it a global fence.
