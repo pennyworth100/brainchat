@@ -100,6 +100,8 @@ export class StrictFileStorage {
         const bytes = Buffer.from(chunk);
         await writeResumeChunk(async (b, offset, length) =>
           (await file!.write(b, offset, length, null)).bytesWritten, bytes, current);
+        // Do not pull another source chunk after authority changed during IO.
+        check();
         hash.update(bytes); size += bytes.length;
       }
       check();

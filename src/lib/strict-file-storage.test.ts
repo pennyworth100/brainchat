@@ -205,12 +205,17 @@ test("physical revocation during pending file write waits for IO and keeps orpha
     }
     return h;
   });
-  let done = false;
+  let done = false, bodyReads = 0;
+  async function* source() {
+    bodyReads++; yield Buffer.from("abc");
+    bodyReads++; yield Buffer.from("def");
+  }
   const pending = new StrictFileStorage(f.admissions, f.bridge, p.provider)
-    .stage(f.grant, metadata, bytes()).finally(() => { done = true; });
+    .stage(f.grant, metadata, source()).finally(() => { done = true; });
   await entered; p.revoke(); await new Promise(r => setImmediate(r));
   assert.equal(done, false); assert.equal(f.admissions.admit(f.binding), null);
   release(); await assert.rejects(pending, /physical/);
+  assert.equal(bodyReads, 1, "revoked pending write must not pull another body chunk");
   assert.ok(handles.every(h => h.fd === -1));
   const dirs = await fs.readdir(f.rootPath); assert.equal(dirs.length, 1);
   assert.equal((await fs.readFile(join(f.rootPath, dirs[0], "blob"))).toString(), "abc");
