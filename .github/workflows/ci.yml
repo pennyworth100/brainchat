@@ -49,6 +49,10 @@ jobs:
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py --accounting
+      - name: Strict storage and durable receipt composition (synthetic physical authority)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py --storage
       - name: Real operation-gate socket loss (owned PostgreSQL cluster)
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin

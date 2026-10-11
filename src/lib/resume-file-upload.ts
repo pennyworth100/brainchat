@@ -8,7 +8,8 @@ import type { ResumeUploadGrant } from "./resume-upload-admission";
 export class ResumeFileUpload {
   private readonly attempts = new WeakMap<ResumeUploadGrant, Promise<OperationOutcome<ResumeFileWrite>>>();
 
-  constructor(private readonly storage: ResumeFileStorage, private readonly writer: ResumeFileWriter) {}
+  constructor(private readonly storage: Pick<ResumeFileStorage, "stage" | "resolve">,
+    private readonly writer: ResumeFileWriter) {}
 
   async saveWithOutcome(grant: ResumeUploadGrant, clientMessageId: string,
     metadata: Readonly<{ name: string; mime: string }>,
