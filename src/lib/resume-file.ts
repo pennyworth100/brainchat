@@ -30,7 +30,7 @@ export function canonicalResumeFile(file: ResumeStoredFile): ResumeStoredFile {
 
 type FileRow = { id: number; room_id: string; username: string; type: string; content: string; ts: Date };
 
-// PRIVATE database-only primitive, not imported by public upload handlers.
+// Database-only primitive used by the server-owned strict upload composition.
 // No filesystem effects, cleanup, retry, release, ACK or broadcast here.
 export class ResumeFileWriter {
   constructor(private readonly gate: ResumeUploadOperationGate) {}

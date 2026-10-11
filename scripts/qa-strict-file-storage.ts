@@ -12,6 +12,8 @@ import { bindStrictUploadRoot } from "../src/lib/upload-storage-root";
 import { StrictUploadAccounting } from "../src/lib/strict-upload-accounting";
 import { StrictFileStorage, type StrictStorageRequest } from "../src/lib/strict-file-storage";
 import { StrictMultipartUpload } from "../src/lib/strict-multipart-upload";
+import { StrictUploadRuntime } from "../src/lib/strict-upload-runtime";
+import http, { type IncomingMessage } from "node:http";
 import { ResumeFileUpload } from "../src/lib/resume-file-upload";
 import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeUploadOperationGate } from "../src/lib/resume-operation";
@@ -59,7 +61,7 @@ async function main() {
     await db.query("INSERT INTO public.upload_resource_policies VALUES ($1,'public','fixture',$2,'v1','g1',$3::jsonb)",
       [provider.binding.database, rootPath, JSON.stringify(policy)]);
     await db.query("INSERT INTO rooms(id) VALUES ('files123')");
-    for (const protocol of ["raw", "multipart"] as const) for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message"] as const) {
+    for (const protocol of ["raw", "multipart", "http-runtime"] as const) for (const mode of ["committed", "missing", "lost-accounting", "lost-message", "pending-message"] as const) {
       const sessionId = protocol + "-" + mode;
       const beforeFiles = await fs.readdir(rootPath);
       const beforeRows = Number((await db.query("SELECT count(*) FROM upload_resource_attempts")).rows[0].count);
@@ -112,17 +114,58 @@ async function main() {
       const multipartUpload = new StrictMultipartUpload(storage, new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
       const wire = Buffer.from('--bound\r\nContent-Disposition: form-data; name="file"; filename="file.txt"\r\nContent-Type: text/plain\r\n\r\nabc\r\n--bound--\r\n');
       async function* multipartSource() { bodyReads++; yield wire; }
-      const save = () => protocol === "raw"
+      const runtime = new StrictUploadRuntime(admissions, mode === "missing" ? null : storage,
+        new ResumeFileWriter(new ResumeUploadOperationGate(writerPool, admissions)));
+      let request: IncomingMessage | undefined, response: Promise<void> | undefined;
+      let runtimeResult: ReturnType<StrictUploadRuntime["run"]> | undefined;
+      let server: http.Server | undefined, client: http.ClientRequest | undefined;
+      const httpSave = async () => {
+        if (runtimeResult) return runtimeResult;
+        let accept!: (value: Awaited<ReturnType<StrictUploadRuntime["run"]>>) => void;
+        const result = new Promise<Awaited<ReturnType<StrictUploadRuntime["run"]>>>(r => { accept = r; });
+        server = http.createServer((req, res) => {
+          request = req;
+          runtimeResult = runtime.run(grant, req);
+          void runtimeResult.then(value => {
+            bodyReads = req.readableDidRead ? 1 : 0;
+            accept(value); res.end("settled");
+          });
+        });
+        await new Promise<void>(r => server!.listen(0, "127.0.0.1", r));
+        const port = (server.address() as import("node:net").AddressInfo).port;
+        response = new Promise<void>((resolve, reject) => {
+          client = http.request({ hostname: "127.0.0.1", port, method: "POST", headers: {
+            "Content-Type": "multipart/form-data; boundary=bound",
+            "Content-Length": String(wire.length), "x-client-message-id": "key",
+          } }, res => { res.resume(); res.on("end", resolve); });
+          client.on("error", reject); client.end(wire);
+        });
+        return result;
+      };
+      const save = async () => protocol === "http-runtime"
+        ? await httpSave().then(r => r.status === "saved"
+          ? { completed: true as const, result: { authorized: true as const, value: r.value } }
+          : r.status === "denied" ? { completed: true as const, result: { authorized: false as const } }
+          : { completed: false as const, commit: r.status === "failed" ? r.commit : "not-dispatched" as const, error: r })
+        : protocol === "raw"
         ? upload.saveWithOutcome(grant, "key", { name: "file.txt", mime: "text/plain" }, source())
         : multipartUpload.saveWithOutcome(grant, "key", { chunks: multipartSource(), abort: async () => {} },
           { boundary: "bound", contentLength: wire.length });
       let settled = false;
+      let runtimeClosed = false, closing: Promise<void> | undefined;
+      let duplicate: ReturnType<StrictUploadRuntime["run"]> | undefined;
       const pending = save().then(r => { settled = true; return r; });
       try {
         if (mode === "pending-message") {
           await entered; now = 100;
           assert.equal(settled, false); assert.equal(admissions.admit(binding), null);
           assert.equal(Number((await db.query("SELECT count(*) FROM resume_message_receipts WHERE session_id=$1", [sessionId])).rows[0].count), 1);
+          if (protocol === "http-runtime") {
+            duplicate = runtime.run(grant, request!);
+            closing = runtime.close().then(() => { runtimeClosed = true; });
+            await new Promise(r => setImmediate(r));
+            assert.equal(runtimeClosed, false, "runtime shutdown must retain pending COMMIT return");
+          }
           finish();
         }
         const result = await pending;
@@ -141,11 +184,25 @@ async function main() {
           else assert.ok(result.completed && result.result.authorized && result.result.value.inserted);
         }
         assert.equal(afterRows - beforeRows, mode === "missing" ? 0 : 1);
-        assert.equal(admissions.admit(binding), null);
-        assert.deepEqual(await save(),
-          { completed: true, result: { authorized: false } });
-        cases.push({ protocol, mode, accountingRows: afterRows - beforeRows, files: newFiles.length, receipts: messages.length, bodyReads, physicalCalls });
-      } finally { finish(); await pending; admissions.release(grant); }
+        if (protocol === "http-runtime") {
+          assert.equal(admissions.isCurrent(grant), false);
+          const next = admissions.admit(binding); assert.ok(next);
+          admissions.release(next);
+          await closing;
+          if (duplicate) assert.deepEqual(await duplicate, { status: "denied" });
+          if (mode === "pending-message") assert.equal(runtimeClosed, true);
+        } else {
+          assert.equal(admissions.admit(binding), null);
+          assert.deepEqual(await save(), { completed: true, result: { authorized: false } });
+        }
+        cases.push({ protocol, mode, accountingRows: afterRows - beforeRows, files: newFiles.length,
+          receipts: messages.length, bodyReads, physicalCalls, runtimeClosed });
+      } finally {
+        finish(); await pending; await response; await runtime.close();
+        client?.destroy();
+        if (server) await new Promise<void>((resolve, reject) => server!.close(e => e ? reject(e) : resolve()));
+        admissions.release(grant);
+      }
     }
     assert.equal(Number((await db.query("SELECT count(*) FROM resume_upload_attempts")).rows[0].count), 0);
     const domain = (await db.query("SELECT outstanding_bytes,outstanding_objects FROM upload_resource_domains")).rows[0];
