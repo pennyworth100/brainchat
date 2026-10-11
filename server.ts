@@ -20,7 +20,7 @@ import type { JoinErrorDetails } from "./src/lib/join-error";
 import { registerPrivateMessages } from "./src/lib/private-message";
 import { claimRoomPolicy } from "./src/lib/room-policy";
 import { ResumeStore } from "./src/lib/resume-store";
-import { ResumeBindings } from "./src/lib/resume-bindings";
+import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
 import { ResumeMemberships } from "./src/lib/resume-membership";
 import { attachResumeSocket } from "./src/lib/resume-socket";
 import { ResumeOperationGate } from "./src/lib/resume-operation";
@@ -443,7 +443,7 @@ async function main() {
       }
       try {
         // Publication failure cannot invalidate an acknowledged saved message.
-        io.to(roomId).emit("chat-file", message);
+        resumeMembers.broadcast(roomId, "chat-file", message);
       } catch (err) {
         console.error("upload notification error after save:", err);
       }
@@ -536,7 +536,7 @@ async function main() {
         message,
         clientMessageId
       );
-      if (!result.deduplicated) io.to(roomId).emit("chat-message", result.message);
+      if (!result.deduplicated) resumeMembers.broadcast(roomId, "chat-message", result.message);
       res.json({ ok: true, ...result });
     } catch (err) {
       if (err instanceof IdempotencyConflictError) {
@@ -550,6 +550,7 @@ async function main() {
   // ── Socket.io ─────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
     let currentRoom: string | null = null;
+    let publishedBinding: ResumeBinding | null = null;
     // Normal authenticated joins now use the real durable/session owner. Do not
     // expose credentials or register resume until ALL protected paths migrate.
     const owner = attachResumeSocket(socket, {
@@ -572,6 +573,7 @@ async function main() {
         const users = resumeMembers.presence(roomId).users.map(user => user.username);
         if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
         if (!resumeMembers.send(binding, roomId, "room-snapshot", { history, users }) || !current()) return false;
+        publishedBinding = binding;
         resumeMembers.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
         if (!current()) return false;
         resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
@@ -733,21 +735,20 @@ async function main() {
     registerPrivateMessages(io, socket, onlineUsers);
 
     socket.on("disconnect", () => {
-      if (!currentRoom) return;
-      const users = onlineUsers.get(currentRoom);
-      if (!users) return;
-      const username = users.get(socket.id);
-      users.delete(socket.id);
-      if (users.size === 0) {
-        onlineUsers.delete(currentRoom);
-      } else {
-        io.to(currentRoom).emit("system-message", `${username} left`);
-        io.to(currentRoom).emit("user-count", users.size);
-        io.to(currentRoom).emit(
-          "user-list",
-          Array.from(users.values())
-        );
+      // Projection cleanup is only for the still-legacy upload/DM paths.
+      if (currentRoom) {
+        const users = onlineUsers.get(currentRoom);
+        users?.delete(socket.id);
+        if (users?.size === 0) onlineUsers.delete(currentRoom);
       }
+      // Authority is released synchronously at disconnecting. A displaced
+      // transport must not announce its live logical successor as departed.
+      if (!publishedBinding) return;
+      const { roomId, sessionId, username } = publishedBinding;
+      if (resumeMembers.presence(roomId).users.some(user => user.id === sessionId)) return;
+      resumeMembers.broadcast(roomId, "system-message", `${username} left`);
+      resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+      resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
     });
   });
 

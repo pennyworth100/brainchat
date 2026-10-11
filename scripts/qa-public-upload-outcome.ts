@@ -92,10 +92,10 @@ async function main() {
       const result = fs.promises.unlink(file); unlinks.push(result); return result;
     } } },
     console: { error: () => errors.push(mode) },
-    io: { to: () => ({ emit: () => {
+    resumeMembers: { broadcast: () => {
       if (mode === "after-save-emit") throw Error("injected emit failure after save");
       emitted++;
-    } }) },
+    } },
   });
   const compiled = ts.transpileModule([...functions.values(),
     "globalThis.handler = (" + handlers[0] + ");",

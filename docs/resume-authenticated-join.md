@@ -3,8 +3,11 @@
 Normal authenticated join is now wired into server.ts, sharing one ResumeStore,
 ResumeBindings and ResumeMemberships registry. This is an integration slice,
 not public resume acceptance or release readiness. No token or resume handler is
-exposed. Existing upload/DM and agent/file/disconnect broadcasts still use a
-temporary legacy projection and MUST migrate before resume is enabled.
+exposed. Agent/file/disconnect broadcasts now use exact session memberships;
+disconnect presence is recomputed from live leases, not the compatibility map.
+Existing upload admission/persistence and DM still use a temporary legacy
+projection and MUST migrate before resume is enabled. Outbound membership
+fencing is local authority, not a fresh per-recipient database policy check.
 
 Call owner.join only AFTER server-side password/creation authentication, with the
 room, normalized username and authVersion observed by that authentication. The
