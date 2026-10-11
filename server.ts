@@ -416,13 +416,13 @@ export async function main() {
         typeof socketId !== "string" ||
         !isValidRoomId(rawRoomId)
       ) {
-        return res.status(401).json({ error: "Join the room before uploading" });
+        return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
       }
       const roomId = normalizeRoomId(rawRoomId);
       const activeSocket = io.sockets.sockets.get(socketId);
       const owner = activeSocket && socketOwners.get(activeSocket);
       if (!activeSocket || !owner || !resumeMembers.bindingFor(activeSocket, owner, roomId)) {
-        return res.status(401).json({ error: "Join the room before uploading" });
+        return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
       }
       try {
         await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
@@ -465,7 +465,7 @@ export async function main() {
         const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
         if (!identity || req.destroyed || res.destroyed ||
             resumeMembers.legacyUploadBindingFor(activeSocket, owner, roomId) !== identity) {
-          return res.status(401).json({ error: "Join the room before uploading" });
+          return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
         }
         const grant = uploadAdmissions.admit(identity);
         if (!grant) return res.status(429).json({ error: "Upload already in progress or capacity exhausted" });

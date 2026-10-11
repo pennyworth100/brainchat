@@ -10,7 +10,7 @@ export async function uploadRoomFile(
 ): Promise<{ message: ChatMessage }> {
   if (file.size > MAX_FILE_SIZE) throw new Error("File is too large (maximum 100 MB).");
   let socketId = await session.sync();
-  // Only retry a rejected authentication request: it cannot have saved a file.
+  // Retry only an explicit server pre-body authentication rejection.
   // Never retry ambiguous network failures, which might already be committed.
   for (let attempt = 0; attempt < 2; attempt++) {
     const controller = new AbortController();
@@ -24,16 +24,20 @@ export async function uploadRoomFile(
         body: form,
         signal: controller.signal,
       });
-      if (response.status === 401 && attempt === 0) {
+      const data = await response.json().catch(() => ({}));
+      const body = data && typeof data === "object" ? data : {};
+      if (body.code === "UPLOAD_OUTCOME_UNKNOWN") {
+        throw new Error("Attachment status is unknown. Check room history before uploading again.");
+      }
+      if (response.status === 401 && body.code === "UPLOAD_AUTH_REQUIRED" && attempt === 0) {
         socketId = await session.reconnect();
         continue;
       }
-      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         const fallback = response.status === 413 ? "File is too large (maximum 100 MB)."
           : response.status === 429 ? "Too many uploads. Please try again later."
           : `Upload rejected (HTTP ${response.status}).`;
-        throw new Error(typeof data.error === "string" ? data.error : fallback);
+        throw new Error(typeof body.error === "string" ? body.error : fallback);
       }
       return data;
     } catch (err) {
