@@ -28,6 +28,7 @@ async function main() {
     const db = pool;
     const postgresVersion = (await db.query("SHOW server_version")).rows[0].server_version;
     await db.query(readFileSync(new URL("../drizzle/0009_upload_resource_ledger.sql", import.meta.url), "utf8"));
+    await db.query(readFileSync(new URL("../drizzle/0010_strict_resource_adapter.sql", import.meta.url), "utf8"));
     const identity = (namespace = "a", generation = "g1") => ({
       database: "owned-fixture/" + databaseName, schema: "public", quotaDomain: "volume",
       namespace, policyVersion: "v1", writerGeneration: generation,

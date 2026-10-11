@@ -71,6 +71,13 @@
       "when": 1791612755512,
       "tag": "0009_upload_resource_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1791702805970,
+      "tag": "0010_strict_resource_adapter",
+      "breakpoints": true
     }
   ]
 }

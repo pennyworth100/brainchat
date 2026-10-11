@@ -120,8 +120,8 @@ const snapshotCheck = (t: { policySnapshot: AnyPgColumn; databaseIdentity: AnyPg
   schemaIdentity: AnyPgColumn; quotaDomain: AnyPgColumn; namespace: AnyPgColumn;
   policyVersion: AnyPgColumn; writerGeneration: AnyPgColumn }) => sql`(
   jsonb_typeof(${t.policySnapshot}) = 'object'
+  AND ${t.policySnapshot}->>'adapter' IN ('multer-crossing-byte-v1', 'resume-strict-writer-v1')
   AND ${t.policySnapshot} @> jsonb_build_object(
-    'adapter', 'multer-crossing-byte-v1',
     'layout', 'provisioned-root-one-directory-one-file-v1',
     'allocationModel', 'audited-rounded-copies-v1',
     'stableExclusiveNamespace', true, 'allAllocationCostsBounded', true,

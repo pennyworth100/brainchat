@@ -1,7 +1,7 @@
 /** Private fixed-table accounting callback. No runtime consumer or storage grant. */
-import { evaluateUploadResourceDomain } from "./upload-resource-domain";
-import { recheckUploadResourcePolicy, type UploadResourcePolicyPin } from "./upload-resource-policy-pin";
-import type { runUploadLedgerTransaction } from "./upload-ledger-transaction";
+import { evaluateUploadResourceDomain, evaluateStrictUploadResourceDomain } from "./upload-resource-domain";
+import { recheckUploadResourcePolicy, recheckStrictUploadResourcePolicy, type UploadResourcePolicyPin, type StrictUploadResourcePolicyPin } from "./upload-resource-policy-pin";
+import type { runUploadLedgerTransaction, runStrictUploadLedgerTransaction } from "./upload-ledger-transaction";
 
 type Work = Parameters<typeof runUploadLedgerTransaction>[2];
 type Provenance = Readonly<{ auditId: string; operationId: string; writerId: string }>;
@@ -17,6 +17,22 @@ export function createUploadResourceSqlWork(
   pin: UploadResourcePolicyPin, policy: unknown, provenance: Provenance,
 ): Work | null {
   const captured = recheckUploadResourcePolicy(pin, policy);
+  return createWork(pin, captured, provenance, evaluateUploadResourceDomain);
+}
+
+/** Strict writer only. No adapter inference from database rows or fallback. */
+export function createStrictUploadResourceSqlWork(
+  pin: StrictUploadResourcePolicyPin, policy: unknown, provenance: Provenance,
+): Parameters<typeof runStrictUploadLedgerTransaction>[2] | null {
+  return createWork(pin, recheckStrictUploadResourcePolicy(pin, policy), provenance, evaluateStrictUploadResourceDomain);
+}
+
+function createWork<Pin>(
+  pin: Pin,
+  captured: ReturnType<typeof recheckUploadResourcePolicy> | ReturnType<typeof recheckStrictUploadResourcePolicy>,
+  provenance: Provenance,
+  evaluate: typeof evaluateUploadResourceDomain,
+): ((context: Readonly<Omit<Parameters<Work>[0], "pin"> & { pin: Pin }>) => Promise<"prepared" | "denied">) | null {
   const { auditId, operationId, writerId } = provenance;
   if (!captured || ![auditId, operationId, writerId].every(validText)) return null;
   const identity = captured.quote.identity;
@@ -46,7 +62,7 @@ export function createUploadResourceSqlWork(
       AND namespace=$4 AND policy_version=$5 AND writer_generation=$6`,
     [...key, identity.namespace, identity.policyVersion, identity.writerGeneration]);
     if (policies.rowCount !== 1 || policies.rows.length !== 1) return "denied";
-    const evaluated = evaluateUploadResourceDomain(pin, policies.rows[0].policy_snapshot, domains.rows[0], auditId);
+    const evaluated = evaluate(pin, policies.rows[0].policy_snapshot, domains.rows[0], auditId);
     if (!evaluated) return "denied";
     const updated = await context.query(`UPDATE public.upload_resource_domains
       SET outstanding_bytes=$4::bigint, outstanding_objects=$5::bigint

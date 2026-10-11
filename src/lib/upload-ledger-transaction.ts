@@ -2,8 +2,8 @@
  * No runtime consumer. See docs/upload-ledger-transaction.md.
  */
 import { randomUUID } from "node:crypto";
-import type { createUploadLedgerProvider } from "./upload-ledger-provider";
-import type { UploadResourcePolicyPin } from "./upload-resource-policy-pin";
+import type { createUploadLedgerProvider, createStrictUploadLedgerProvider } from "./upload-ledger-provider";
+import type { UploadResourcePolicyPin, StrictUploadResourcePolicyPin } from "./upload-resource-policy-pin";
 import type { UploadLedgerLease } from "./upload-ledger-lease";
 
 type Provider = ReturnType<typeof createUploadLedgerProvider>;
@@ -14,8 +14,8 @@ export type UploadLedgerTransactionOutcome = Readonly<{
   attemptId: string;
   commitDispatched: boolean;
 }>;
-type Work = (context: Readonly<{
-  attemptId: string; pin: UploadResourcePolicyPin;
+type Work<Pin = UploadResourcePolicyPin> = (context: Readonly<{
+  attemptId: string; pin: Pin;
   binding: Provider["binding"]; query: Query;
 }>) => Promise<"prepared" | "denied">;
 
@@ -27,11 +27,32 @@ type Work = (context: Readonly<{
 export async function runUploadLedgerTransaction(
   provider: Provider, pin: UploadResourcePolicyPin, work: Work,
 ): Promise<UploadLedgerTransactionOutcome> {
+  return runTransaction(provider, pin, work, "upload-resource-policy-pin-only");
+}
+
+/** Explicit strict-writer accounting path; never a storage/admission grant. */
+export async function runStrictUploadLedgerTransaction(
+  provider: ReturnType<typeof createStrictUploadLedgerProvider>,
+  pin: StrictUploadResourcePolicyPin, work: Work<StrictUploadResourcePolicyPin>,
+): Promise<UploadLedgerTransactionOutcome> {
+  return runTransaction(provider, pin, work, "strict-upload-resource-policy-pin-only");
+}
+
+type BoundProvider<Pin> = {
+  binding: Provider["binding"];
+  checkout(pin: Pin): Promise<
+    { status: "acquired"; lease: UploadLedgerLease; binding: Provider["binding"]; pin: Pin } |
+    { status: "failed" | "timeout" }>;
+};
+async function runTransaction<Pin extends { readonly kind: string }>(
+  provider: BoundProvider<Pin>, pin: Pin, work: Work<Pin>, expectedKind: Pin["kind"],
+): Promise<UploadLedgerTransactionOutcome> {
   const attemptId = randomUUID(); // retained on every outcome; never regenerated on failure
   let commitDispatched = false;
   const outcome = (status: UploadLedgerTransactionOutcome["status"]) =>
     Object.freeze({ kind: "upload-ledger-transaction-only" as const, status, attemptId, commitDispatched });
-  let checked: Awaited<ReturnType<Provider["checkout"]>>;
+  if (!pin || pin.kind !== expectedKind) return outcome("not-committed");
+  let checked: Awaited<ReturnType<BoundProvider<Pin>["checkout"]>>;
   try { checked = await provider.checkout(pin); }
   catch { return outcome("not-committed"); }
   if (checked.status !== "acquired") return outcome("not-committed");

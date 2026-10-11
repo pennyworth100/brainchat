@@ -10,8 +10,8 @@ import { createServer, createConnection, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
 import { createUploadLedgerProvider, createStrictUploadLedgerProvider } from "../src/lib/upload-ledger-provider";
-import { runUploadLedgerTransaction } from "../src/lib/upload-ledger-transaction";
-import { createUploadResourceSqlWork } from "../src/lib/upload-resource-sql";
+import { runUploadLedgerTransaction, runStrictUploadLedgerTransaction } from "../src/lib/upload-ledger-transaction";
+import { createUploadResourceSqlWork, createStrictUploadResourceSqlWork } from "../src/lib/upload-resource-sql";
 
 async function main() {
   const fixture = process.env.LEDGER_TLS_FIXTURE || "";
@@ -49,8 +49,7 @@ async function main() {
       stableExclusiveNamespace: true, allAllocationCostsBounded: true, maxFileBytes: 6,
       allocationUnitBytes: 1, allocationCopies: 1, directoryAndParentBytes: 3,
       metadataBytes: 0, temporaryBytes: 0, additionalObjects: 0 };
-    // Separate strict transport/provenance evidence. No strict transaction or SQL
-    // composition is claimed here; those remain a separate implementation gate.
+    // Separate strict transport/provenance evidence; accounting exercised below.
     const strict = createStrictUploadLedgerProvider(config);
     const strictPolicy = { ...policy, adapter: "resume-strict-writer-v1" };
     try {
@@ -434,19 +433,92 @@ async function main() {
       cut();
       await new Promise<void>((resolve, reject) => proxy.close(error => error ? reject(error) : resolve()));
     }
+    // Strict and Multer share the canonical domain liability, never reinterpret
+    // each other's policy. This adds no filesystem or physical-admission proof.
+    const beforeMigration = await state();
+    await db.query("BEGIN");
+    await db.query(readFileSync(new URL("../drizzle/0010_strict_resource_adapter.sql", import.meta.url), "utf8"));
+    await db.query("COMMIT");
+    check(JSON.stringify(await state()) === JSON.stringify(beforeMigration));
+    // SQL NULL and unknown/nonstring adapters cannot exploit CHECK semantics.
+    for (const table of ["upload_resource_policies", "upload_resource_attempts"]) {
+      for (const adapter of [null, "unknown-adapter", 7, {}]) {
+        await assert.rejects(db.query("UPDATE public." + table +
+          " SET policy_snapshot=jsonb_set(policy_snapshot,'{adapter}',$1::jsonb)", [JSON.stringify(adapter)]),
+          (error: { code?: string }) => error.code === "23514"); checks++;
+      }
+      await assert.rejects(db.query("UPDATE public." + table + " SET policy_snapshot=policy_snapshot-'adapter'"),
+        (error: { code?: string }) => error.code === "23514"); checks++;
+    }
+    const strictAccounting = createStrictUploadLedgerProvider({ ...config, user: role });
+    const strictOutcomes: Record<string, unknown>[] = [];
+    try {
+      const strictPolicy = { ...policy, adapter: "resume-strict-writer-v1",
+        identity: { ...policy.identity, namespace: "strict" } };
+      const strictPin = strictAccounting.pin(strictPolicy)!; check(strictPin !== null);
+      await db.query("BEGIN");
+      await db.query("SELECT * FROM public.upload_resource_domains FOR UPDATE");
+      await db.query("INSERT INTO public.upload_resource_policies VALUES ($1,'public','volume','strict','v1','g1',$2::jsonb)",
+        [provider.binding.database, JSON.stringify(strictPolicy)]);
+      await db.query("COMMIT");
+      const before = await state();
+      for (const loseAck of [false, true]) {
+        const calls: string[] = [];
+        const observedStrict = { ...strictAccounting, checkout: async (p: typeof strictPin) => {
+          const acquired = await strictAccounting.checkout(p);
+          if (acquired.status !== "acquired") return acquired;
+          const query = acquired.lease.query.bind(acquired.lease);
+          acquired.lease.query = async (sql, values) => {
+            calls.push(sql);
+            const result = await query(sql, values);
+            if (loseAck && sql === "COMMIT") throw Error("strict fixture lost ACK after actual COMMIT");
+            return result;
+          };
+          return acquired;
+        } };
+        const work = createStrictUploadResourceSqlWork(strictPin, strictPolicy,
+          { auditId: "cut1", operationId: randomUUID(), writerId: "strict-fixture" })!;
+        const outcome = await runStrictUploadLedgerTransaction(observedStrict, strictPin, work);
+        strictOutcomes.push({ lostAcknowledgement: loseAck, outcome });
+        check(outcome.status === (loseAck ? "unknown" : "committed") && outcome.commitDispatched);
+        check(calls.filter(sql => sql === "COMMIT").length === 1 && !calls.includes("ROLLBACK"));
+        const after = await state();
+        const attempt = after.attempts.find(row => row.attempt_id === outcome.attemptId);
+        check(attempt?.allocated_bytes === "9" && attempt?.objects === "2");
+        check(attempt?.policy_snapshot.adapter === "resume-strict-writer-v1");
+      }
+      const after = await state();
+      check(BigInt(after.domain.outstanding_bytes) === BigInt(before.domain.outstanding_bytes) + 18n);
+      check(BigInt(after.domain.outstanding_objects) === BigInt(before.domain.outstanding_objects) + 4n);
+      check(after.attempts.length === before.attempts.length + 2);
+      for (const domainPatch of ["active=false", "capacity_bytes=baseline_bytes+outstanding_bytes+headroom_bytes",
+        "capacity_objects=baseline_objects+outstanding_objects+headroom_objects"]) {
+        await db.query("UPDATE public.upload_resource_domains SET " + domainPatch);
+        const work = createStrictUploadResourceSqlWork(strictPin, strictPolicy,
+          { auditId: "cut1", operationId: randomUUID(), writerId: "strict-denied" })!;
+        const denied = await runStrictUploadLedgerTransaction(strictAccounting, strictPin, work);
+        check(denied.status === "not-committed" && !denied.commitDispatched);
+        check((await state()).attempts.length === after.attempts.length);
+        await db.query("UPDATE public.upload_resource_domains SET active=true,capacity_bytes=120,capacity_objects=24");
+      }
+    } finally { await strictAccounting.close(); }
+    const finalState = await state();
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     resultReport = { status: "PASS", checks, version, tls: ssl.version,
       defaultRoleCanProbe, permissionCode, permissionDeniedAfterFixtureOnlyRevoke: true,
       bootstrapRolePositiveOnly: false, fixtureLimitedRolePositive: true,
       fixtureOnlyExplicitGrants: true, sameLeaseProbeBeforeBegin: true,
       committed: valid.result, lostAcknowledgement: unknown.result,
-      finalLiability: { bytes: 30, objects: 6 },
+      finalLiability: { bytes: Number(finalState.domain.outstanding_bytes), objects: Number(finalState.domain.outstanding_objects) },
+      strictAccounting: { outcomes: strictOutcomes, chargeBytes: 9, chargeObjects: 2,
+        sharedDomain: true, disabledAndBothCapacitiesDenied: true, migrationPreservedExistingRows: true,
+        invalidAdaptersRejected: 10 },
       backendTermination: failures, terminationPreservedLedger: true,
       transportDisconnect: transport,
       explicitReplacement: { pid: fresh.pid, outcome: fresh.result, sameLeaseProbeBeforeBegin: true,
         commitCount: 1, insertCount: 1, originalRowsUnchanged: true, retainedUnknown: [unknown.result, terminated],
         unknownReplay: false, poisonedProviderRevived: false, automaticRecovery: false },
-      actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "transaction", "SQL callback", "lease"],
+      actual: ["verified TLS", "provider owned pool", "policy pin", "0009", "0010", "transaction", "SQL callback", "strict transaction/SQL", "lease"],
       excluded: ["managed-provider privileges", "clone uniqueness", "physical fencing", "TCP blackhole", "COMMIT packet loss", "live migration", "storage authority"] };
   } finally {
     for (const provider of providers) await provider.close();
