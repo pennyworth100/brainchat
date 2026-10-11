@@ -40,6 +40,8 @@ import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
 import { ResumeMessageWriter } from "./src/lib/resume-message";
 import { ResumeImageWriter } from "./src/lib/resume-image";
+import { ResumeFileWriter } from "./src/lib/resume-file";
+import { StrictUploadRuntime } from "./src/lib/strict-upload-runtime";
 import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
@@ -254,6 +256,9 @@ export async function main() {
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
+  // No production physical provider or strict download mapping yet. This
+  // server-owned composition stays fail-closed; legacy Multer is never a fallback.
+  const strictUploads = new StrictUploadRuntime(uploadAdmissions, null, new ResumeFileWriter(uploadGate));
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -298,6 +303,7 @@ export async function main() {
       return { rateLimits, sessions };
     },
   }, roomActivity);
+  lifecycle.own(strictUploads);
 
   // Security headers
   expressApp.disable("x-powered-by");
@@ -460,16 +466,32 @@ export async function main() {
             uploadAdmissions.release(grant); // No parser/source work started.
             return;
           }
-          // Authentication is NOT physical-resource admission. No audited
-          // resource domain / bounded parser-storage-receipt composition is
-          // installed yet. Fail closed even for valid credentials; never let
-          // this branch inherit the legacy Multer writer or a byte-only quota.
-          // No reservation/parser/storage work has started, so release now.
-          uploadAdmissions.release(grant);
-          return res.status(503).json({
-            code: "UPLOAD_RESOURCE_UNAVAILABLE",
-            error: "Authenticated uploads are not available yet",
-          });
+          const result = await strictUploads.run(grant, req);
+          if (result.status === "saved") {
+            const { inserted, message } = result.value;
+            // A replay returns its durable receipt, never a second broadcast.
+            // Notification/activity/response failures cannot undo a committed file.
+            if (inserted) {
+              try { await roomActivity.touch(roomId); }
+              catch (error) { console.error("strict upload activity after save:", error); }
+              try { resumeMembers.broadcast(roomId, "chat-file", message); }
+              catch (error) { console.error("strict upload notification after save:", error); }
+            }
+            try { return res.json({ url: message.url, name: message.name,
+              size: message.size, mime: message.mime, message }); }
+            catch (error) { console.error("strict upload response after save:", error); res.destroy(); return; }
+          }
+          if (result.status === "invalid") return res.status(400).json({ error: "Invalid strict upload" });
+          if (result.status === "denied") return res.status(403).json({ error: "Upload authorization expired or changed" });
+          if (result.status === "failed") {
+            console.error("strict upload persistence:", result.error);
+            return res.status(result.commit === "unknown" ? 500 : 503).json({
+              code: result.commit === "unknown" ? "UPLOAD_OUTCOME_UNKNOWN" : "UPLOAD_NOT_COMMITTED",
+              error: "Attachment was not acknowledged. Check room history before uploading again.",
+            });
+          }
+          return res.status(503).json({ code: "UPLOAD_RESOURCE_UNAVAILABLE",
+            error: "Authenticated uploads are not available yet" });
         }
         // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
         // A room projection or a physically connected revoked socket is not authority.
