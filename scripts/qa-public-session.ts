@@ -202,10 +202,10 @@ async function main() {
     const messageCountBefore = (await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n;
     // A valid credential must not admit the legacy writer when the physical
     // resource pipeline is unprovisioned. Headers only: no body to parse.
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       const request = http.request(base + "/api/upload", { method: "POST", headers: {
-        "x-room-id": created.roomId, "x-socket-id": a.id!, ...credentialHeaders,
-        "content-type": "multipart/form-data; boundary=resourceproof", "content-length": "1000",
+        "x-room-id": created.roomId, "x-socket-id": a.id!, ...(attempt < 2 ? credentialHeaders : {}),
+        "content-type": attempt === 3 ? "application/json" : "multipart/form-data; boundary=resourceproof", "content-length": "1000",
       } });
       const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
         request.once("error", reject);
@@ -218,8 +218,8 @@ async function main() {
       request.flushHeaders();
       try {
         const result = await response;
-        assert.equal(result.status, 503, "repeat denial must release the unused session grant");
-        assert.equal(JSON.parse(result.body).code, "UPLOAD_RESOURCE_UNAVAILABLE");
+        assert.equal(result.status, attempt < 2 ? 503 : 403, "strict denial must not wait for a body or downgrade");
+        if (attempt < 2) assert.equal(JSON.parse(result.body).code, "UPLOAD_RESOURCE_UNAVAILABLE");
       } finally { request.destroy(); }
     }
     const authenticatedUpload = await upload(a.id!, created.roomId, credentialHeaders);
@@ -241,13 +241,15 @@ async function main() {
       await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
     }
     console.log("PUBLIC_UPLOAD_CREDENTIAL_PASS: real HTTP bearer lookup; partial/forged/wrong-owner denial; valid credentials fail closed before body/FS/file-ledger mutation without resource composition; repeated denial releases grant");
-    // Activation gate, not a secure fallback: an otherwise identical request
-    // with BOTH credential headers omitted still selects the legacy writer.
-    // Prove compatibility and its exact persisted bytes independently. Public
-    // resume must remain disabled until server-owned policy removes this path.
+    // Server-owned strict classification survives omission of both headers.
+    // Prove separate normal-join compatibility and persisted bytes independently.
     const omittedHeaders = await upload(a.id!);
-    assert.equal(omittedHeaders.status, 200);
-    const omittedMessage = (await omittedHeaders.json()).message;
+    assert.equal(omittedHeaders.status, 403, "authenticated strict owner cannot downgrade by omitting headers");
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n, messageCountBefore);
+    const compatibleLegacy = await upload(b.id!);
+    assert.equal(compatibleLegacy.status, 200, "untouched normal join retains legacy compatibility");
+    const omittedMessage = (await compatibleLegacy.json()).message;
     assert.ok(omittedMessage.id);
     const omittedRow = await db.query("SELECT content FROM messages WHERE id=$1 AND type='file'", [omittedMessage.id]);
     assert.equal(omittedRow.rowCount, 1);
@@ -256,7 +258,7 @@ async function main() {
     assert.equal((await db.query("SELECT count(*)::int AS n FROM upload_resource_attempts")).rows[0].n, 0,
       "legacy compatibility is NOT strict physical accounting");
     assert.ok(!JSON.stringify(packets).includes(token), "fixture bearer is never publicly published");
-    console.log("PUBLIC_UPLOAD_ACTIVATION_GATE_PASS: empty/combined credentials cannot downgrade; neither-header request still writes legacy bytes with no strict charge; public resume must remain disabled");
+    console.log("PUBLIC_UPLOAD_ACTIVATION_GATE_PASS: authenticated strict owner cannot omit headers to downgrade; separate normal join retains compatibility; public resume remains disabled");
     // Pause actual multipart AFTER storage allocation, then change authority.
     // Disconnect alone must not revoke the already admitted HTTP lifetime.
     for (const scenario of ["revoke", "generation", "expiry", "policy", "disconnect"]) {

@@ -1,6 +1,6 @@
 import type { Socket } from "socket.io";
 import type { ResumeBinding, ResumeBindings } from "./resume-bindings";
-import { onResumeSocketClose, ownsResumeSocket, type ResumeSocketOwner } from "./resume-socket";
+import { onResumeSocketClose, ownsResumeSocket, permitsLegacyUpload, type ResumeSocketOwner } from "./resume-socket";
 
 export type ResumeMembership = Readonly<{
   binding: ResumeBinding;
@@ -64,6 +64,11 @@ export class ResumeMemberships {
   bindingFor(socket: Socket, owner: ResumeSocketOwner, roomId: string): ResumeBinding | null {
     const binding = this.currentBindingFor(socket, owner);
     return binding?.roomId === roomId ? binding : null;
+  }
+
+  legacyUploadBindingFor(socket: Socket, owner: ResumeSocketOwner, roomId: string): ResumeBinding | null {
+    const binding = this.bindingFor(socket, owner, roomId);
+    return binding && permitsLegacyUpload(socket, owner, binding) ? binding : null;
   }
 
   // Rate scope comes from physical authority even for wrong-room credentials.

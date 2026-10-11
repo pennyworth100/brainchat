@@ -1,5 +1,5 @@
 import type { Socket } from "socket.io";
-import type { ResumeSocketOwner } from "./resume-socket";
+import { requireStrictUpload, type ResumeSocketOwner } from "./resume-socket";
 import type { ResumeMemberships } from "./resume-membership";
 import { hashResumeToken, type ResumeStore } from "./resume-store";
 import type { ResumeUploadAdmissions, ResumeUploadGrant } from "./resume-upload-admission";
@@ -51,6 +51,7 @@ export async function preflightResumeUpload(socket: Socket, owner: ResumeSocketO
     // No await between exact-owner revalidation and opaque grant acquisition.
     // Durable upload gate still rechecks policy before/after DB work: lookup is
     // not a lock and cannot prevent later revocation or a remote successor.
+    if (!requireStrictUpload(socket, owner, binding)) return null;
     return uploads.admit(binding);
   } finally {
     // A deadline does not cancel lookup. Hung lookup retains BOTH leases; no

@@ -1,5 +1,10 @@
 # Credential-bearing upload boundary (draft 3.0.11)
 
+Update for candidate 3.0.12: [server-owned no-downgrade policy](upload-no-downgrade.md)
+now also selects strict authentication for resumed/strict owners when both
+headers are omitted. Only untouched normal-join owners retain legacy authority.
+The remaining text describes the original resource boundary; its 503 gate remains.
+
 `POST /api/upload` with either resume credential header selects the strict
 branch. Framing and bearer/session/owner authentication run before the body.
 Malformed framing returns 400; invalid credentials return 403. There is no

@@ -16,7 +16,7 @@ export class LegacyUploadAdmission {
     private readonly now = () => performance.now()) {}
 
   async authorize(socket: Socket, owner: ResumeSocketOwner, roomId: string) {
-    const binding = this.members.bindingFor(socket, owner, roomId);
+    const binding = this.members.legacyUploadBindingFor(socket, owner, roomId);
     if (!binding || this.pending.has(socket)) return null;
     const release = this.capacity.acquire();
     if (!release) return null;
@@ -27,7 +27,7 @@ export class LegacyUploadAdmission {
       const finished = this.now();
       if (!result.authorized || !Number.isFinite(started) || !Number.isFinite(finished) ||
           finished < started || finished - started >= 10_000 ||
-          this.members.bindingFor(socket, owner, roomId) !== binding) return null;
+          this.members.legacyUploadBindingFor(socket, owner, roomId) !== binding) return null;
       // Caller must recheck this exact binding at its parser handoff boundary.
       return binding;
     } finally {
