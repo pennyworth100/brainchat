@@ -193,9 +193,39 @@ async function main() {
       "a valid credential is bound to its exact server-owned session, not another room member");
     assert.equal((await upload(a.id!, created.roomId, { ...credentialHeaders, "content-encoding": "gzip" })).status, 400);
     assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    const messageCountBefore = (await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n;
+    // A valid credential must not admit the legacy writer when the physical
+    // resource pipeline is unprovisioned. Headers only: no body to parse.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const request = http.request(base + "/api/upload", { method: "POST", headers: {
+        "x-room-id": created.roomId, "x-socket-id": a.id!, ...credentialHeaders,
+        "content-type": "multipart/form-data; boundary=resourceproof", "content-length": "1000",
+      } });
+      const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
+        request.once("error", reject);
+        request.setTimeout(3000, () => request.destroy(Error("resource gate waited for body")));
+        request.once("response", res => {
+          let body = ""; res.on("data", chunk => body += chunk);
+          res.once("end", () => resolve({ status: res.statusCode!, body }));
+        });
+      });
+      request.flushHeaders();
+      try {
+        const result = await response;
+        assert.equal(result.status, 503, "repeat denial must release the unused session grant");
+        assert.equal(JSON.parse(result.body).code, "UPLOAD_RESOURCE_UNAVAILABLE");
+      } finally { request.destroy(); }
+    }
     const authenticatedUpload = await upload(a.id!, created.roomId, credentialHeaders);
-    assert.equal(authenticatedUpload.status, 200);
-    assert.equal((await authenticatedUpload.json()).message.username, "Alice");
+    assert.equal(authenticatedUpload.status, 503);
+    assert.equal((await authenticatedUpload.json()).code, "UPLOAD_RESOURCE_UNAVAILABLE");
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n, messageCountBefore);
+    for (const table of ["upload_resource_domains", "upload_resource_policies", "upload_resource_attempts",
+      "resume_upload_budget", "resume_upload_attempts"]) {
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM ${table}`)).rows[0].n, 0,
+        "denial cannot provision policy, reserve or refund guessed resources");
+    }
     for (const mutation of ["revoked_at=now()", "generation=generation+1", "expires_at=now()-interval '1 second'"]) {
       const prior = (await db.query("SELECT expires_at, generation FROM room_resume_sessions WHERE id=$1", [first.id])).rows[0];
       const before = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
@@ -204,7 +234,7 @@ async function main() {
       assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), before);
       await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
     }
-    console.log("PUBLIC_UPLOAD_CREDENTIAL_PASS: real HTTP bearer lookup, partial/forged/wrong-owner denial without legacy downgrade or filesystem allocation; framing denial; valid upload");
+    console.log("PUBLIC_UPLOAD_CREDENTIAL_PASS: real HTTP bearer lookup; partial/forged/wrong-owner denial; valid credentials fail closed before body/FS/file-ledger mutation without resource composition; repeated denial releases grant");
     // Pause actual multipart AFTER storage allocation, then change authority.
     // Disconnect alone must not revoke the already admitted HTTP lifetime.
     for (const scenario of ["revoke", "generation", "expiry", "policy", "disconnect"]) {
@@ -214,15 +244,11 @@ async function main() {
       const username = "Lifetime-" + scenario;
       uploader.emit("join-room", { ...lifetimeRoom, username, password: join.password });
       await ready;
-      const lifetimeToken = randomBytes(32).toString("base64url");
-      const lifetimeSession = (await db.query("UPDATE room_resume_sessions SET token_hash=$2 WHERE room_id=$1 RETURNING id",
-        [lifetimeRoom.roomId, hashResumeToken(lifetimeToken)])).rows[0].id;
       const before = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
       const head = '--proofboundary\r\nContent-Disposition: form-data; name="file"; filename="lifetime.txt"\r\nContent-Type: text/plain\r\n\r\nfirst';
       const tail = 'last\r\n--proofboundary--\r\n';
       const request = http.request(base + "/api/upload", { method: "POST", headers: {
         "x-room-id": lifetimeRoom.roomId, "x-socket-id": uploader.id!,
-        "x-resume-session-id": lifetimeSession, "x-resume-token": lifetimeToken,
         "content-type": "multipart/form-data; boundary=proofboundary",
         "content-length": Buffer.byteLength(head + tail),
       } });
@@ -265,7 +291,7 @@ async function main() {
       }
       uploader.disconnect();
     }
-    console.log("PUBLIC_UPLOAD_LIFETIME_PASS: actual paused multipart revocation/generation/expiry/policy deny INSERT; admitted disconnect persists once");
+    console.log("PUBLIC_UPLOAD_LIFETIME_PASS: legacy actual paused multipart revocation/generation/expiry/policy deny INSERT; admitted disconnect persists once; strict credential branch remains unavailable");
     // Hold the real admission's durable lock, disconnect while it waits, then
     // release: a late successful database result must not start the parser.
     const uploading = await connect(); const uploadingJoined = event(uploading, "room-snapshot");

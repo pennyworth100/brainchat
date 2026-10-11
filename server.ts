@@ -437,8 +437,16 @@ async function main() {
             uploadAdmissions.release(grant); // No parser/source work started.
             return;
           }
-          res.locals.uploadGrant = grant;
-          return nxt();
+          // Authentication is NOT physical-resource admission. No audited
+          // resource domain / bounded parser-storage-receipt composition is
+          // installed yet. Fail closed even for valid credentials; never let
+          // this branch inherit the legacy Multer writer or a byte-only quota.
+          // No reservation/parser/storage work has started, so release now.
+          uploadAdmissions.release(grant);
+          return res.status(503).json({
+            code: "UPLOAD_RESOURCE_UNAVAILABLE",
+            error: "Authenticated uploads are not available yet",
+          });
         }
         // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
         // A room projection or a physically connected revoked socket is not authority.
