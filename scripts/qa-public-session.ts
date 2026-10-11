@@ -6,6 +6,7 @@ import { Pool } from "pg";
 import fs from "node:fs/promises";
 import http from "node:http";
 import { randomBytes } from "node:crypto";
+import { uploadRoomFile } from "../src/lib/upload-client";
 import { hashResumeToken } from "../src/lib/resume-store";
 
 // Actual server.ts, real Socket.IO and disposable PostgreSQL. No live services.
@@ -150,16 +151,33 @@ async function main() {
       return fetch(base + "/api/upload", { method: "POST", body,
         headers: { "x-room-id": roomId, "x-socket-id": socketId, ...headers }, signal: AbortSignal.timeout(5000) });
     };
+    const deniedBeforeBody = async (response: Response) => {
+      assert.equal(response.status, 401);
+      assert.equal((await response.json()).code, "UPLOAD_AUTH_REQUIRED");
+    };
     const filesBefore = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
-    assert.equal((await upload(a.id!, "wrong123")).status, 401);
-    assert.equal((await upload(bad.id!)).status, 401);
+    await deniedBeforeBody(await upload(a.id!, "wrong123"));
+    await deniedBeforeBody(await upload(bad.id!));
     for (const mutation of ["revoked_at=now()", "generation=generation+1", "expires_at=now()-interval '1 second'"]) {
       const prior = (await db.query("SELECT expires_at, generation FROM room_resume_sessions WHERE id=$1", [first.id])).rows[0];
       await db.query("UPDATE room_resume_sessions SET " + mutation + " WHERE id=$1", [first.id]);
-      assert.equal((await upload(a.id!)).status, 401);
+      await deniedBeforeBody(await upload(a.id!));
       await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
     }
     assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), filesBefore, "denial never starts parser or creates token directories");
+    // Real client retries exactly once only after the actual pre-body marker.
+    let retryRequests = 0, retryReconnects = 0;
+    const retryResult = await uploadRoomFile(new File(["retry-proof"], "retry.txt"), created.roomId, {
+      sync: async () => "stale-socket",
+      reconnect: async () => { retryReconnects++; return a.id!; },
+    }, async (url, options) => { retryRequests++; return fetch(base + url, options); });
+    assert.equal(retryRequests, 2); assert.equal(retryReconnects, 1);
+    const retryRows = await db.query("SELECT id FROM messages WHERE room_id=$1 AND type=$2 AND content::jsonb->>$3=$4",
+      [created.roomId, "file", "name", "retry.txt"]);
+    assert.equal(retryRows.rowCount, 1);
+    assert.equal(Number(retryRows.rows[0].id), retryResult.message.id);
+    assert.equal((await fs.readdir(process.env.OWNED_UPLOAD_DIR!)).length, filesBefore.length + 1);
+    console.log("PUBLIC_UPLOAD_RETRY_PASS: explicit pre-body rejection, one reconnect, two requests, exactly one durable file/message");
     const validUpload = await upload(a.id!);
     assert.equal(validUpload.status, 200);
     assert.equal((await validUpload.json()).message.username, "Alice");
