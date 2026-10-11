@@ -69,6 +69,8 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   let mode: "join" | "resume" | undefined;
   let closed = false;
   let closing: Promise<void> | undefined;
+  // Client-visible timeout is not completion of issuance/publication work.
+  let joinSettlement: Promise<unknown> | undefined;
   const releases = new Set<() => void>();
   const admission = new ResumeAdmission(store, bindings, incarnation,
     () => !closed && socket.connected, prepare, {
@@ -86,7 +88,12 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   const close = () => {
     closed = true; // synchronous permanent fence, even if CAS/prepare never settles
     socket.off("disconnecting", onDisconnect);
-    const result = closing ??= admission.close();
+    const result = closing ??= Promise.allSettled([admission.close(), joinSettlement])
+      .then(([cleanup]) => {
+        // Issuance failures stay with join()/the late-error reporter. Cleanup
+        // failures retain close()'s existing contract, after BOTH paths settle.
+        if (cleanup.status === "rejected") throw cleanup.reason;
+      });
     // Publish the promise before callbacks, allowing reentrant close.
     const callbacks = [...releases];
     releases.clear();
@@ -191,6 +198,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
       }
       throw error;
     });
+    joinSettlement = settled;
     return joinFlight = Promise.race([settled, timeout]);
   };
   const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, join, close });

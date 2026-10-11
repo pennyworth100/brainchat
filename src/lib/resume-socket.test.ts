@@ -981,7 +981,11 @@ test("explicit close during history read fences publication and exact retries", 
   const gate = deferred<readonly unknown[]>(), entered = deferred<void>();
   const f = await publicationFixture(t, async () => { entered.resolve(); return gate.promise; });
   const flight = f.owner.join(authenticatedJoin); await entered.promise;
-  await f.owner.close(); gate.resolve([]); assert.equal(await flight, null);
+  let settled = false;
+  const closing = f.owner.close(); void closing.then(() => { settled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "close retains the already-admitted history read");
+  gate.resolve([]); await closing; assert.equal(await flight, null);
   assert.equal(await f.owner.join(authenticatedJoin), null); assert.deepEqual(f.events, []);
 });
 
@@ -1139,6 +1143,50 @@ test("join deadline during preparation releases late membership without publishi
   assert.equal(cleanups, 1); assert.equal(members.broadcast("candy986", "room-info", {}), 0);
 });
 const issuedJoin = () => ({ ...identity(0), token: request().credential.token });
+
+for (const outcome of ["success", "rejection", "disconnect"] as const) {
+  test(`owner close retains actual issuance after ${outcome}`, async t => {
+    const f = await fixture(t), { socket } = await f.connect(), opts = options();
+    const entered = deferred<void>(), gate = deferred<void>();
+    const capacity = new ResumeCapacity(1);
+    let advances = 0, closed = false;
+    const errors: unknown[] = [];
+    const owner = attachResumeSocket(socket, { ...opts, timeoutMs: 20,
+      issueCapacity: capacity, memberships: new ResumeMemberships(opts.bindings),
+      issue: async () => { entered.resolve(); await gate.promise;
+        if (outcome === "rejection") throw Error("late issuance failure");
+        return issuedJoin(); },
+      store: { advanceGeneration: async () => { advances++; return identity(); } },
+      onCleanupError: error => { errors.push(error); } });
+    t.after(() => { gate.resolve(); });
+    const flight = owner.join(authenticatedJoin); await entered.promise;
+    if (outcome === "disconnect") socket.disconnect(true);
+    else assert.equal(await flight, null);
+    const closing = owner.close(); assert.equal(owner.close(), closing);
+    void closing.then(() => { closed = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(closed, false, "transport timeout/disconnect is not SQL settlement");
+    assert.equal(capacity.acquire(), null, "unresolved issuance retains capacity");
+    assert.equal(await owner.join(authenticatedJoin), null);
+    gate.resolve(); await closing; assert.equal(await flight, null);
+    assert.equal(advances, 0); assert.equal(errors.length, outcome === "rejection" ? 1 : 0);
+    const release = capacity.acquire(); assert.ok(release); release();
+  });
+}
+
+test("owner close retains publication after admission has settled", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const entered = deferred<void>(), gate = deferred<void>(); let closed = false;
+  const owner = attachResumeSocket(socket, { ...opts,
+    issue: async () => issuedJoin(), memberships: new ResumeMemberships(opts.bindings),
+    publishJoin: async (_binding, live) => { entered.resolve(); await gate.promise; return live(); } });
+  t.after(() => { gate.resolve(); });
+  const flight = owner.join(authenticatedJoin); await entered.promise;
+  const closing = owner.close(); void closing.then(() => { closed = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(closed, false);
+  gate.resolve(); await closing; assert.equal(await flight, null);
+});
 
 test("authenticated join reserves before issuance and shares one credential/membership", async t => {
   const f = await fixture(t), { socket } = await f.connect(), opts = options();

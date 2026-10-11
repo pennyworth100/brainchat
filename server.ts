@@ -10,6 +10,7 @@ import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
+import { consumeJoinLimits } from "./src/lib/join-rate-limits";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
 import {
@@ -688,10 +689,7 @@ async function main() {
         }
         try {
           const clientIp = getSocketClientIp(socket, trustProxyHops);
-          await Promise.all([
-            joinIpLimiter.consume(clientIp),
-            joinRoomLimiter.consume(`${clientIp}:${roomId}`),
-          ]);
+          await consumeJoinLimits(joinIpLimiter, joinRoomLimiter, clientIp, roomId);
 
           let room = await getRoom(roomId);
           if (!room) {
