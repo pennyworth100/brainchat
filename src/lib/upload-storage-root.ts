@@ -85,6 +85,13 @@ export async function openStrictUploadRoot(
 }
 
 /** In-memory identity check ONLY; no path observation or physical authority. */
+export function strictUploadRootPath(
+  binding: StrictUploadRootBinding, pin: StrictUploadResourcePolicyPin, limit: number,
+): string | null {
+  return matchesStrictUploadRoot(binding, pin, limit) ? bindings.get(binding)!.root.path : null;
+}
+
+/** In-memory identity check ONLY; no path observation or physical authority. */
 export function matchesStrictUploadRoot(
   binding: StrictUploadRootBinding, pin: StrictUploadResourcePolicyPin, limit: number,
 ): boolean {
