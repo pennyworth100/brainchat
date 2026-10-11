@@ -1,4 +1,5 @@
 import express from "express";
+import { createUploadDownloadRouter } from "./src/lib/upload-download";
 import http from "http";
 import { Server, type Socket } from "socket.io";
 import next from "next";
@@ -256,7 +257,7 @@ export async function main() {
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
-  // No production physical provider or strict download mapping yet. This
+  // No production physical provider or trusted strict download source yet. This
   // server-owned composition stays fail-closed; legacy Multer is never a fallback.
   const strictUploads = new StrictUploadRuntime(uploadAdmissions, null, new ResumeFileWriter(uploadGate));
 
@@ -375,27 +376,8 @@ export async function main() {
   })));
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
-  expressApp.use(
-    "/uploads",
-    (req, res, nxt) => {
-      let rel: string;
-      try {
-        rel = decodeURIComponent(req.path);
-      } catch {
-        return res.status(400).end();
-      }
-      // Reject parent-directory segments, not ordinary names like report..pdf.
-      if (rel.split(/[\\/]/).includes("..")) return res.status(403).end();
-      nxt();
-    },
-    express.static(UPLOAD_DIR, {
-      setHeaders: (res) => {
-        res.setHeader("Content-Disposition", "attachment");
-        res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-        res.setHeader("Cache-Control", "private, max-age=3600");
-      },
-    })
-  );
+  // Strict publication/root provisioning is deliberately absent: no fallback.
+  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, null));
 
   // ── File uploads ──────────────────────────────────────────────────────────
   const storageSettlement = new UploadStorageSettlement();
