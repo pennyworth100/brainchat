@@ -16,7 +16,9 @@ cleanup is not awaited on this response path. Cleanup failures go to the existin
 reporter and remain observable through `close()`. No blind CAS retry or cancellation
 claim: capacity remains held until underlying work settles, even after timeout.
 
-This is private and unused by `server.ts`. It grants no room/history/presence or
-outbound authority. Ordinary joins, broadcast fencing, public resume, UI and full
-physical-device acceptance remain unfinished. The loopback lifecycle tests use
-stubbed persistence; they are not PostgreSQL integration evidence.
+server.ts now uses this composition for ordinary authenticated joins and guarded
+history/presence publication; sync uses the same owner and registry. Public resume
+is NOT exposed. The temporary legacy send/upload/DM/broadcast projection, browser
+resume, snapshot-gap handling and physical-device acceptance remain unfinished.
+The original loopback lifecycle unit tests use stubbed persistence; the separate
+qa-public-session fixture boots the actual server with owned PostgreSQL.

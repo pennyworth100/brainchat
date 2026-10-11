@@ -12,7 +12,8 @@ const reading = new WeakSet<Socket>();
 const capacity = new ResumeCapacity(100);
 type SyncLimits = { capacity?: ResumeCapacity; timeoutMs?: number; onLateError?: (error: unknown) => void };
 
-// PRIVATE. All authority arguments are server-owned, never client payloads.
+// Used by server.ts normal-session sync. All authority arguments are
+// server-owned, never client payloads.
 // ack must belong to this physical socket/request and synchronously hand off.
 // false means no handoff (including busy/denied/stale/timeout). Early DB and ACK
 // errors propagate; abandoned reads report late errors without retry. The public

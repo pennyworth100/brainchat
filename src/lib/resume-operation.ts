@@ -9,7 +9,7 @@ export type OperationResult<T> = { authorized: false } | { authorized: true; val
 export type OperationOutcome<T> = { completed: true; result: OperationResult<T> } |
   { completed: false; commit: "not-dispatched" | "unknown"; error: unknown };
 
-// Private persistence gate; no public/socket handler imports this yet.
+// Persistence gate, now used by public normal-join/sync history reads.
 // Use a dedicated pool checkout, never a caller-owned/nested transaction.
 // Work MUST use this transaction for ALL writes; no network ACK, broadcast,
 // filesystem operation, transaction control, or leaked/deferred query promises.

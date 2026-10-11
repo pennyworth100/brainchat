@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { isValidRoomId } from "./room-id";
 
-// Server-only persistence foundation. No socket handler uses this yet.
+// Server-only persistence; normal authenticated joins now use issuance/CAS.
 // A successful lookup is NOT membership or authority to send/leave a room.
 type Database = Pick<Pool | PoolClient, "query">;
 export type ResumeCredential = { roomId: string; sessionId: string; token: string };

@@ -1,6 +1,10 @@
 # Private authenticated-join composition (3.0.11 draft)
 
-Not wired into server.ts. This is not public resume acceptance or rollout approval.
+Normal authenticated join is now wired into server.ts, sharing one ResumeStore,
+ResumeBindings and ResumeMemberships registry. This is an integration slice,
+not public resume acceptance or release readiness. No token or resume handler is
+exposed. Existing send/image/upload/DM and disconnect broadcasts still use a
+temporary legacy projection and MUST migrate before resume is enabled.
 
 Call owner.join only AFTER server-side password/creation authentication, with the
 room, normalized username and authVersion observed by that authentication. The
@@ -26,7 +30,19 @@ awaitable semantics. The callable issue closure is trusted server code.
 
 Optional publishJoin now composes a guarded, one-shot history/presence sequence
 inside this same promise and deadline; see [join publication](resume-join-publication.md).
-Without this option no history/presence is emitted. Public auth handlers are still
-unchanged. Next: migrate normal join and resumed connections to a single
-authoritative projection, then all protected outbound/send/DM handlers, before
-enabling the feature.
+Without this option no history/presence is emitted. The public normal-join handler
+authenticates first, then calls owner.join with the observed room authVersion.
+Its publication reads history through ResumeHistoryReader/ResumeOperationGate,
+rechecks exact membership and emits compatibility history/snapshot/presence.
+Exact join retries share issuance/admission/publication; room-info may be resent.
+Public sync now uses syncResumeSocket and the same transaction-authorized reader;
+probeOnly remains local liveness, not DB policy validation.
+
+The real-server regression scripts/qa-public-session.ts runs against an owned
+loopback PostgreSQL cluster via scripts/qa-public-session-fixture.py. It covers
+issuance, exact join retry, password rejection, no credential serialization,
+legacy message compatibility, policy-change history denial and disconnect
+during an actual blocked history SELECT. This does not prove atomic snapshot/
+delta reconciliation, resumed transports, resource-ledger coverage or physical
+mobile acceptance. Next: eliminate the legacy protected-path projection, then
+wire resume and the browser protocol. Do not deploy this partial draft.

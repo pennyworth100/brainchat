@@ -53,7 +53,8 @@ export function onResumeSocketClose(socket: Socket, owner: ResumeSocketOwner,
   return record?.owner === owner ? record.subscribe(release) : null;
 }
 
-// PRIVATE, not registered by server.ts. One module instance in one server process.
+// Server-owned: normal authenticated joins use this in server.ts. Public resume
+// remains unregistered. One module instance in one server process.
 // Repeated installation requires the same options object; a competing installer
 // fails before creating an admission, listener or incarnation.
 export function attachResumeSocket(socket: Socket, options: Options): ResumeSocketOwner {

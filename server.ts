@@ -19,6 +19,13 @@ import {
 import type { JoinErrorDetails } from "./src/lib/join-error";
 import { registerPrivateMessages } from "./src/lib/private-message";
 import { claimRoomPolicy } from "./src/lib/room-policy";
+import { ResumeStore } from "./src/lib/resume-store";
+import { ResumeBindings } from "./src/lib/resume-bindings";
+import { ResumeMemberships } from "./src/lib/resume-membership";
+import { attachResumeSocket } from "./src/lib/resume-socket";
+import { ResumeOperationGate } from "./src/lib/resume-operation";
+import { ResumeHistoryReader } from "./src/lib/resume-history";
+import { syncResumeSocket } from "./src/lib/resume-sync";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -230,6 +237,10 @@ async function main() {
   if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);
   const io = new Server(server);
+  const resumeStore = new ResumeStore(pool);
+  const resumeBindings = new ResumeBindings();
+  const resumeMembers = new ResumeMemberships(resumeBindings);
+  const resumeHistory = new ResumeHistoryReader(new ResumeOperationGate(pool, resumeBindings));
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -534,6 +545,36 @@ async function main() {
   // ── Socket.io ─────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
     let currentRoom: string | null = null;
+    // Normal authenticated joins now use the real durable/session owner. Do not
+    // expose credentials or register resume until ALL protected paths migrate.
+    const owner = attachResumeSocket(socket, {
+      store: resumeStore, bindings: resumeBindings, memberships: resumeMembers,
+      issue: (roomId, username, authVersion) =>
+        resumeStore.issueAfterAuthenticatedJoin(roomId, username, authVersion),
+      prepare: async () => async () => {},
+      onCleanupError: error => console.error("Session cleanup error:", error),
+      publishJoin: async (binding, live) => {
+        const roomId = binding.roomId;
+        const current = () => live() && resumeMembers.isCurrent(binding, roomId);
+        const history = await resumeHistory.read(binding);
+        if (history === null || !current()) return false;
+        // Temporary compatibility projection for legacy send/upload/DM paths.
+        // Never use this map to authenticate join/sync or to enable resume.
+        currentRoom = roomId;
+        getOrCreateOnlineRoom(roomId).set(socket.id, binding.username);
+        await socket.join(roomId);
+        if (!current()) return false;
+        const users = resumeMembers.presence(roomId).users.map(user => user.username);
+        if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
+        if (!resumeMembers.send(binding, roomId, "room-snapshot", { history, users }) || !current()) return false;
+        resumeMembers.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
+        return current();
+      },
+    });
 
     socket.on(
       "join-room",
@@ -601,18 +642,9 @@ async function main() {
           if (!socket.connected) return;
           // This client has one active room. Do not leave stale memberships.
           if (currentRoom && currentRoom !== roomId) return;
-          currentRoom = roomId;
-          const users = getOrCreateOnlineRoom(roomId);
-          users.set(socket.id, username);
-          await socket.join(roomId);
-          socket.emit("room-info", { hasPassword: !!room.passwordHash });
-          const history = await loadHistory(roomId);
-          if (!socket.connected) return;
-          socket.emit("chat-history", history); // v3.0.1 compatibility
-          socket.emit("room-snapshot", { history, users: Array.from(users.values()) });
-          socket.to(roomId).emit("system-message", `${username} joined`);
-          io.to(roomId).emit("user-count", users.size);
-          io.to(roomId).emit("user-list", Array.from(users.values()));
+          const joined = await owner.join({ roomId, username, authVersion: room.authVersion });
+          if (!joined || !resumeMembers.isCurrent(joined.binding, roomId)) return;
+          resumeMembers.send(joined.binding, roomId, "room-info", { hasPassword: !!room.passwordHash });
         } catch (err) {
           if (typeof err === "object" && err && "msBeforeNext" in err) {
             socket.emit("join-error", "Too many attempts. Try again later.", {
@@ -629,19 +661,18 @@ async function main() {
     socket.on("sync-room", async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack) => {
       if (typeof ack !== "function") return;
       const roomId = payload?.roomId;
-      if (typeof roomId !== "string" || roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
+      const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+      if (!binding) {
         return ack({ error: "Rejoin the room" });
       }
       // Membership/transport liveness only, not database or history readiness.
       // Keep the existing event for rolling compatibility with older clients.
-      if (payload?.probeOnly === true) return ack({ ok: true });
       try {
-        const history = await loadHistory(roomId);
-        if (!socket.connected) return;
-        ack({ history, users: Array.from(onlineUsers.get(roomId)?.values() || []) });
+        const handedOff = await syncResumeSocket(socket, owner, binding, resumeMembers, resumeHistory, payload, ack);
+        if (!handedOff && resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       } catch (err) {
         console.error("sync-room error:", err);
-        ack({ error: "Could not sync the room" });
+        if (resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       }
     });
 

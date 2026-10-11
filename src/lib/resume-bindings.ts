@@ -6,7 +6,7 @@ export type ResumeBinding = Readonly<{
 }>;
 type Slot = { binding: ResumeBinding; active: boolean; cancelled: boolean };
 
-// Single-process fencing primitive, deliberately NOT wired to socket handlers.
+// Single-process fencing primitive, shared by public normal join and sync.
 // Only pass identities returned by an authenticated DB CAS, never client data.
 // This is not DB authorization, a distributed lock, or an async operation guard.
 // Future protected handlers must combine it with transactional DB validation;

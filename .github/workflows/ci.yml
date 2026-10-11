@@ -111,6 +111,14 @@ jobs:
       - name: Production build
         run: npm run build
 
+      - name: Install owned public-session fixture tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-16
+
+      - name: Actual public join and sync (separate owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py
+
       - name: Start isolated application
         env:
           NODE_ENV: production
