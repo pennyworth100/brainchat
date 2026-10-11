@@ -14,6 +14,7 @@ import { eq } from "drizzle-orm";
 import { rooms as roomsTable, messages as messagesTable } from "../src/lib/db/schema";
 import { createUploadParser } from "../src/lib/upload-parser";
 import { RoomActivityWriter } from "../src/lib/room-activity";
+import { UploadStorageSettlement } from "../src/lib/upload-storage-settlement";
 
 // Byte-preservation regression for unknown INSERT and post-save emit errors.
 // Not a quota, recovery or all-writer barrier test. No server startup,
@@ -42,7 +43,15 @@ async function main() {
     }
     if (ts.isCallExpression(node) && node.expression.getText(tree) === "expressApp.post" &&
         node.arguments[0]?.getText(tree) === '"/api/upload"') {
-      const handler = node.arguments.at(-1)!;
+      // Match the current route composition explicitly; never silently extract
+      // an admission/parser stage as the persistence handler after a refactor.
+      const route = node.arguments.at(-1)!;
+      assert.ok(ts.isCallExpression(route) && route.expression.getText(tree) === "trackedHttp");
+      assert.equal(route.arguments[0]?.getText(tree), "lifecycle");
+      const stage = route.arguments.at(-1)!;
+      assert.ok(ts.isCallExpression(stage) && stage.expression.getText(tree) === "handlerStage");
+      assert.equal(stage.arguments.length, 1);
+      const handler = stage.arguments[0];
       assert.ok(ts.isArrowFunction(handler)); handlers.push(handler.getText(tree));
     }
     ts.forEachChild(node, visit);
@@ -95,7 +104,7 @@ async function main() {
   };
   const context = vm.createContext({
     db: drizzle(pool), messagesTable, roomsTable, eq, Date, JSON, crypto, path, multer, RoomActivityWriter,
-    UPLOAD_DIR: root,
+    UPLOAD_DIR: root, storageSettlement: new UploadStorageSettlement(),
     // Persistence gate is substituted only in this byte-retention harness.
     // Real authority/transaction checks live in qa-public-session.ts.
     uploadGate: { runWithOutcome: async (_grant: unknown, work: (tx: unknown) => Promise<unknown>) => {
