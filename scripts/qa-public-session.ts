@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { io, type Socket } from "socket.io-client";
 import { Pool } from "pg";
+import fs from "node:fs/promises";
 
 // Actual server.ts, real Socket.IO and disposable PostgreSQL. No live services.
 async function main() {
@@ -139,6 +140,52 @@ async function main() {
     assert.deepEqual(reciprocal, [{ delivered: true }, { delivered: true }]);
     assert.equal(dmSent, 1, "reciprocal DM completes without deadlock");
     console.log("PUBLIC_DM_PASS: real PostgreSQL dual endpoint revocation before send/after ACK, no false success/replay, no locks over ACK, one in-flight request, reciprocal lock ordering");
+    // Actual HTTP pre-body authority: valid socket IDs cannot bypass durable
+    // revocation, wrong-room or expired/generation-mismatched session checks.
+    const upload = (socketId: string, roomId = created.roomId) => {
+      const body = new FormData(); body.append("file", new Blob(["wire-upload"]), "proof.txt");
+      return fetch(base + "/api/upload", { method: "POST", body,
+        headers: { "x-room-id": roomId, "x-socket-id": socketId }, signal: AbortSignal.timeout(5000) });
+    };
+    const filesBefore = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+    assert.equal((await upload(a.id!, "wrong123")).status, 401);
+    assert.equal((await upload(bad.id!)).status, 401);
+    for (const mutation of ["revoked_at=now()", "generation=generation+1", "expires_at=now()-interval '1 second'"]) {
+      const prior = (await db.query("SELECT expires_at, generation FROM room_resume_sessions WHERE id=$1", [first.id])).rows[0];
+      await db.query("UPDATE room_resume_sessions SET " + mutation + " WHERE id=$1", [first.id]);
+      assert.equal((await upload(a.id!)).status, 401);
+      await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
+    }
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), filesBefore, "denial never starts parser or creates token directories");
+    const validUpload = await upload(a.id!);
+    assert.equal(validUpload.status, 200);
+    assert.equal((await validUpload.json()).message.username, "Alice");
+    // Hold the real admission's durable lock, disconnect while it waits, then
+    // release: a late successful database result must not start the parser.
+    const uploading = await connect(); const uploadingJoined = event(uploading, "room-snapshot");
+    uploading.emit("join-room", { roomId: created.roomId, username: "Uploader", password: join.password });
+    await uploadingJoined;
+    const admissionLock = await db.connect();
+    const beforePending = await fs.readdir(process.env.OWNED_UPLOAD_DIR!);
+    let pendingUpload: Promise<Response>;
+    try {
+      await admissionLock.query("BEGIN");
+      await admissionLock.query("SELECT id FROM room_resume_sessions WHERE room_id=$1 AND username='Uploader' FOR UPDATE", [created.roomId]);
+      pendingUpload = upload(uploading.id!);
+      let blocked = false;
+      for (let i = 0; i < 100; i++) {
+        const waiting = await db.query("SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT id FROM room_resume_sessions WHERE id = $1%'");
+        if (waiting.rowCount) { blocked = true; break; }
+        await new Promise(r => setTimeout(r, 20));
+      }
+      assert.ok(blocked, "actual HTTP admission waits for session authority");
+      // One unresolved admission per physical socket, not another DB waiter.
+      assert.equal((await upload(uploading.id!)).status, 401);
+      const uploadLeft = event(b, "user-list"); uploading.disconnect(); await uploadLeft;
+    } finally { await admissionLock.query("ROLLBACK"); admissionLock.release(); }
+    assert.equal((await pendingUpload!).status, 401);
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), beforePending);
+    console.log("PUBLIC_UPLOAD_ADMISSION_PASS: durable revocation/generation/expiry/wrong-room denial before parser/FS, valid identity, blocked admission disconnect, one in-flight admission");
     const left = event(b, "user-list"); a.disconnect();
     assert.deepEqual(await left, ["Bob"]);
     // Hold the actual history SELECT in PostgreSQL, then lose the physical
@@ -190,6 +237,7 @@ async function main() {
     await db.query("SELECT id FROM room_resume_sessions WHERE room_id=$1 AND username='Writer' FOR UPDATE", [created.roomId]);
     assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='must-rollback'")).rows[0].n, 0);
     await db.query("UPDATE rooms SET auth_version=auth_version+1 WHERE id=$1", [created.roomId]);
+    assert.equal((await upload(b.id!)).status, 401, "room policy change denies HTTP upload");
     const countBefore = (await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n;
     assert.ok((await b.timeout(3000).emitWithAck("send-message", { roomId: created.roomId, message: "revoked" })).error);
     assert.ok((await b.timeout(3000).emitWithAck("send-image", imagePayload)).error);

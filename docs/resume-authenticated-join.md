@@ -5,8 +5,10 @@ ResumeBindings and ResumeMemberships registry. This is an integration slice,
 not public resume acceptance or release readiness. No token or resume handler is
 exposed. Agent/file/disconnect broadcasts now use exact session memberships;
 disconnect presence is recomputed from live leases, not the compatibility map.
-Existing upload admission/persistence still uses a temporary legacy
-projection and MUST migrate before resume is enabled. Outbound membership
+HTTP upload admission now uses the exact physical owner, shared membership and
+durable session gate; the compatibility map and Socket.IO room joins are gone.
+Upload bearer/grant/persistence/resource migration is still incomplete; see
+[the exact boundary](legacy-upload-admission.md). Outbound membership
 fencing is local authority, not a fresh per-recipient database policy check.
 
 Call owner.join only AFTER server-side password/creation authentication, with the
@@ -48,5 +50,5 @@ legacy compatibility, policy-change history/text/image denial, text/image retry
 receipts and conflicts, shared send exclusion, and disconnect during actual
 blocked history SELECT and message INSERT. This does not prove atomic snapshot/
 delta reconciliation, resumed transports, resource-ledger coverage or physical
-mobile acceptance. Next: eliminate the legacy protected-path projection, then
-wire resume and the browser protocol. Do not deploy this partial draft.
+mobile acceptance. Next: integrate upload grant/persistence/resource handling,
+then wire resume and the browser protocol. Do not deploy this partial draft.

@@ -18,7 +18,9 @@ claim: capacity remains held until underlying work settles, even after timeout.
 
 server.ts now uses this composition for ordinary authenticated joins and guarded
 history/presence publication; sync uses the same owner and registry. Public resume
-is NOT exposed. The temporary legacy send/upload/DM/broadcast projection, browser
-resume, snapshot-gap handling and physical-device acceptance remain unfinished.
+is NOT exposed. Shared memberships now replace the old send/upload/DM/broadcast
+projection. Upload admission is durable, but credential/grant/persistence/resource
+integration, browser resume, snapshot-gap handling and physical-device acceptance
+remain unfinished; see [upload admission](legacy-upload-admission.md).
 The original loopback lifecycle unit tests use stubbed persistence; the separate
 qa-public-session fixture boots the actual server with owned PostgreSQL.

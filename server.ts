@@ -22,7 +22,8 @@ import { claimRoomPolicy } from "./src/lib/room-policy";
 import { ResumeStore } from "./src/lib/resume-store";
 import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
 import { ResumeMemberships } from "./src/lib/resume-membership";
-import { attachResumeSocket } from "./src/lib/resume-socket";
+import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
+import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
 import { ResumeOperationGate } from "./src/lib/resume-operation";
 import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
@@ -57,14 +58,6 @@ const MAX_MESSAGE_LENGTH = 10_000;
 class IdempotencyConflictError extends Error {}
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-// In-memory: online users per room (transient socket state)
-const onlineUsers = new Map<string, Map<string, string>>();
-
-function getOrCreateOnlineRoom(roomId: string) {
-  if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Map());
-  return onlineUsers.get(roomId)!;
-}
 
 function getSocketClientIp(
   socket: Socket,
@@ -243,6 +236,8 @@ async function main() {
   const resumeBindings = new ResumeBindings();
   const resumeMembers = new ResumeMemberships(resumeBindings);
   const resumeGate = new ResumeOperationGate(pool, resumeBindings);
+  const socketOwners = new WeakMap<Socket, ResumeSocketOwner>();
+  const legacyUploadAdmission = new LegacyUploadAdmission(resumeMembers, resumeGate);
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
@@ -399,15 +394,13 @@ async function main() {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
       const roomId = normalizeRoomId(rawRoomId);
-      const users = onlineUsers.get(roomId);
       const activeSocket = io.sockets.sockets.get(socketId);
-      if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
+      const owner = activeSocket && socketOwners.get(activeSocket);
+      if (!activeSocket || !owner || !resumeMembers.bindingFor(activeSocket, owner, roomId)) {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
-      res.locals.uploadIdentity = { roomId, username: users.get(socketId)! };
       try {
         await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
-        nxt();
       } catch (err) {
         if (typeof err === "object" && err && "msBeforeNext" in err) {
           res.setHeader(
@@ -417,6 +410,20 @@ async function main() {
         }
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
+      try {
+        // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
+        // A room projection or a physically connected revoked socket is not authority.
+        const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
+        if (!identity || req.destroyed || res.destroyed ||
+            resumeMembers.bindingFor(activeSocket, owner, roomId) !== identity) {
+          return res.status(401).json({ error: "Join the room before uploading" });
+        }
+        res.locals.uploadIdentity = Object.freeze({ roomId: identity.roomId, username: identity.username });
+      } catch (error) {
+        console.error("upload admission error:", error);
+        return res.status(503).json({ error: "Could not authorize upload" });
+      }
+      nxt();
     },
     uploadMiddleware,
     async (req, res) => {
@@ -564,11 +571,7 @@ async function main() {
         const current = () => live() && resumeMembers.isCurrent(binding, roomId);
         const history = await resumeHistory.read(binding);
         if (history === null || !current()) return false;
-        // Temporary compatibility projection for legacy upload/DM paths.
-        // Never use this map to authenticate join/sync or to enable resume.
         currentRoom = roomId;
-        getOrCreateOnlineRoom(roomId).set(socket.id, binding.username);
-        await socket.join(roomId);
         if (!current()) return false;
         const users = resumeMembers.presence(roomId).users.map(user => user.username);
         if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
@@ -733,14 +736,10 @@ async function main() {
     // Files are saved by POST /api/upload; old send-file remains ignored.
 
     registerPrivateMessages(socket, owner, resumeMembers, resumeGate);
+    socketOwners.set(socket, owner);
 
     socket.on("disconnect", () => {
-      // Projection cleanup is only for the still-legacy upload/DM paths.
-      if (currentRoom) {
-        const users = onlineUsers.get(currentRoom);
-        users?.delete(socket.id);
-        if (users?.size === 0) onlineUsers.delete(currentRoom);
-      }
+      socketOwners.delete(socket);
       // Authority is released synchronously at disconnecting. A displaced
       // transport must not announce its live logical successor as departed.
       if (!publishedBinding) return;
