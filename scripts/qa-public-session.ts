@@ -183,6 +183,12 @@ async function main() {
     try { assert.equal(await invalidFramingStatus, 400); } finally { invalidFraming.destroy(); }
     for (const headers of [
       { "x-resume-token": token }, { "x-resume-session-id": first.id },
+      { "x-resume-token": "" }, { "x-resume-session-id": "" },
+      { "x-resume-token": "", "x-resume-session-id": "" },
+      { ...credentialHeaders, "x-resume-token": "" },
+      { ...credentialHeaders, "x-resume-session-id": "" },
+      { ...credentialHeaders, "x-resume-token": token + ", " + token },
+      { ...credentialHeaders, "x-resume-session-id": first.id + ", " + first.id },
       { ...credentialHeaders, "x-resume-token": randomBytes(32).toString("base64url") },
       { ...credentialHeaders, "x-resume-session-id": "00000000-0000-4000-8000-000000000000" },
     ]) {
@@ -235,6 +241,22 @@ async function main() {
       await db.query("UPDATE room_resume_sessions SET revoked_at=NULL, generation=$2, expires_at=$3 WHERE id=$1", [first.id, prior.generation, prior.expires_at]);
     }
     console.log("PUBLIC_UPLOAD_CREDENTIAL_PASS: real HTTP bearer lookup; partial/forged/wrong-owner denial; valid credentials fail closed before body/FS/file-ledger mutation without resource composition; repeated denial releases grant");
+    // Activation gate, not a secure fallback: an otherwise identical request
+    // with BOTH credential headers omitted still selects the legacy writer.
+    // Prove compatibility and its exact persisted bytes independently. Public
+    // resume must remain disabled until server-owned policy removes this path.
+    const omittedHeaders = await upload(a.id!);
+    assert.equal(omittedHeaders.status, 200);
+    const omittedMessage = (await omittedHeaders.json()).message;
+    assert.ok(omittedMessage.id);
+    const omittedRow = await db.query("SELECT content FROM messages WHERE id=$1 AND type='file'", [omittedMessage.id]);
+    assert.equal(omittedRow.rowCount, 1);
+    const omittedFile = JSON.parse(omittedRow.rows[0].content);
+    assert.equal(await (await fetch(base + omittedFile.url)).text(), "wire-upload");
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM upload_resource_attempts")).rows[0].n, 0,
+      "legacy compatibility is NOT strict physical accounting");
+    assert.ok(!JSON.stringify(packets).includes(token), "fixture bearer is never publicly published");
+    console.log("PUBLIC_UPLOAD_ACTIVATION_GATE_PASS: empty/combined credentials cannot downgrade; neither-header request still writes legacy bytes with no strict charge; public resume must remain disabled");
     // Pause actual multipart AFTER storage allocation, then change authority.
     // Disconnect alone must not revoke the already admitted HTTP lifetime.
     for (const scenario of ["revoke", "generation", "expiry", "policy", "disconnect"]) {

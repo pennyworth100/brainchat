@@ -1,5 +1,12 @@
 # DB/uploads all-writer coverage audit — 3.0.11 draft
 
+**2026-10-11 activation re-audit:** this historical inventory is not the current
+runtime call graph. Normal joins now issue durable sessions and protected
+handlers use private owners/gates. The current [public activation audit](public-upload-activation-gate.md)
+records strict credential denial, the still-writable neither-header legacy path,
+and the exact remaining activation/fencing gates. Public resume remains disabled;
+there is still no common cross-store all-writer barrier.
+
 Source audit: 2026-10-09. Audited PR #20 source: `2efac859ab5ce5ac78b4798998f5932cf948f7bf`.
 Baseline main: `99d5f0bd3fae431bd5f0eb08ac49bc604685932b` (3.0.10).
 Known production remains 3.0.3 / `4520b649a247e18c1bb30732ba11e40dfaede0e1`;
