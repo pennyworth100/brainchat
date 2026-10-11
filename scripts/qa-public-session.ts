@@ -101,6 +101,44 @@ async function main() {
     const legacyEcho = event(a, "chat-image");
     a.emit("send-image", { roomId: created.roomId, dataUrl: imagePayload.dataUrl });
     assert.equal((await legacyEcho).dataUrl, imagePayload.dataUrl);
+    // Actual DM handler + PostgreSQL: BOTH endpoint policies, before emission
+    // and after receiver ACK. Revocation during ACK must not report delivery.
+    const dmPayload = { roomId: created.roomId, toUsername: "Bob", message: "private-wire" };
+    let dmDeliveries = 0, dmSent = 0;
+    a.on("private-message-sent", () => dmSent++);
+    b.on("private-message", () => dmDeliveries++);
+    for (const username of ["Alice", "Bob"]) {
+      await db.query("UPDATE room_resume_sessions SET revoked_at=now() WHERE room_id=$1 AND username=$2", [created.roomId, username]);
+      const denied = await a.timeout(3000).emitWithAck("private-message", dmPayload);
+      assert.match(denied.error, /Rejoin/);
+      assert.equal(dmDeliveries, 0, "revoked endpoint cannot receive payload");
+      await db.query("UPDATE room_resume_sessions SET revoked_at=NULL WHERE room_id=$1 AND username=$2", [created.roomId, username]);
+    }
+    for (const username of ["Alice", "Bob"]) {
+      const incoming = new Promise<(value: unknown) => void>(resolve =>
+        b.once("private-message", (_data, ack) => resolve(ack)));
+      const pendingDM = a.timeout(3000).emitWithAck("private-message", dmPayload);
+      const recipientAck = await incoming;
+      const overlap = await a.timeout(3000).emitWithAck("private-message", dmPayload);
+      assert.match(overlap.error, /pending/);
+      // This UPDATE completing before ACK also proves no DB lock is retained
+      // across the network wait (would deadlock/time out otherwise).
+      await db.query("UPDATE room_resume_sessions SET revoked_at=now() WHERE room_id=$1 AND username=$2", [created.roomId, username]);
+      recipientAck({ received: true });
+      assert.match((await pendingDM).error, /Delivery not confirmed/);
+      assert.equal(dmSent, 0);
+      await db.query("UPDATE room_resume_sessions SET revoked_at=NULL WHERE room_id=$1 AND username=$2", [created.roomId, username]);
+    }
+    assert.equal(dmDeliveries, 2, "no replay for unconfirmed DM");
+    a.once("private-message", (_data, ack) => ack({ received: true }));
+    b.once("private-message", (_data, ack) => ack({ received: true }));
+    const reciprocal = await Promise.all([
+      a.timeout(3000).emitWithAck("private-message", dmPayload),
+      b.timeout(3000).emitWithAck("private-message", { ...dmPayload, toUsername: "Alice" }),
+    ]);
+    assert.deepEqual(reciprocal, [{ delivered: true }, { delivered: true }]);
+    assert.equal(dmSent, 1, "reciprocal DM completes without deadlock");
+    console.log("PUBLIC_DM_PASS: real PostgreSQL dual endpoint revocation before send/after ACK, no false success/replay, no locks over ACK, one in-flight request, reciprocal lock ordering");
     const left = event(b, "user-list"); a.disconnect();
     assert.deepEqual(await left, ["Bob"]);
     // Hold the actual history SELECT in PostgreSQL, then lose the physical

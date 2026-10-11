@@ -42,6 +42,23 @@ export class ResumeMemberships {
     return binding.roomId === roomId && slot?.lease.binding === binding && slot.lease.isCurrent();
   }
 
+  privateCandidates(roomId: string, username: string): readonly ResumeBinding[] {
+    return [...this.sessions.values()].filter(slot => slot.lease.binding.roomId === roomId &&
+      slot.lease.binding.username === username && slot.lease.isCurrent()).map(slot => slot.lease.binding);
+  }
+
+  // Exact recipient only: never redirect an awaited send to a successor.
+  async deliverPrivate(sender: ResumeBinding, recipient: ResumeBinding, payload: unknown,
+    timeoutMs: number): Promise<unknown> {
+    const candidates = this.privateCandidates(sender.roomId, recipient.username);
+    const slot = this.sessions.get(recipient.sessionId);
+    if (!this.isCurrent(sender, sender.roomId) || !this.isCurrent(recipient, sender.roomId) ||
+        candidates.length !== 1 || candidates[0] !== recipient || slot?.lease.binding !== recipient) {
+      throw Error("Private-message authority changed");
+    }
+    return slot.socket.timeout(timeoutMs).emitWithAck("private-message", payload);
+  }
+
   // Server-owned physical lookup, never a binding reconstructed from headers.
   // This does not authenticate an HTTP caller who merely knows socket.id.
   bindingFor(socket: Socket, owner: ResumeSocketOwner, roomId: string): ResumeBinding | null {

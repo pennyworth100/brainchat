@@ -24,6 +24,15 @@ export class ResumeOperationGate {
     return execute(this.pool, binding, () => this.bindings.isCurrent(binding), work, () => {});
   }
 
+  // Validate both DM endpoints in ONE transaction. Never hold locks while
+  // waiting for a network ACK. Call again after ACK, then fence local handoff.
+  async authorizePair(sender: ResumeBinding, recipient: ResumeBinding): Promise<boolean> {
+    if (sender.roomId !== recipient.roomId) return false;
+    const current = () => this.bindings.isCurrent(sender) && this.bindings.isCurrent(recipient);
+    const result = await execute(this.pool, sender, current, async () => true, () => {}, recipient);
+    return result.authorized && current();
+  }
+
   // Private upload foundation. Keep legacy run's original rejection behavior.
   // Unknown outcomes retain potentially referenced files; a successful ROLLBACK
   // after a failed COMMIT does NOT establish that COMMIT failed. No retries here.
@@ -66,7 +75,7 @@ export class ResumeUploadOperationGate {
 async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
     isCurrent: () => boolean,
     work: (transaction: Pick<PoolClient, "query">) => Promise<T>,
-    beforeCommit: () => void): Promise<OperationResult<T>> {
+    beforeCommit: () => void, peer?: ResumeBinding): Promise<OperationResult<T>> {
     if (!isCurrent()) return { authorized: false };
     const client = await pool.connect();
     let destroy = false;
@@ -80,20 +89,28 @@ async function execute<T>(pool: Pick<Pool, "connect">, binding: ResumeBinding,
       await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
       // Same lock order as generation CAS: room policy, then session.
       await client.query("SELECT id FROM rooms WHERE id = $1 FOR SHARE", [binding.roomId]);
-      await client.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [binding.sessionId]);
+      // Stable order prevents reciprocal DMs from locking A/B and B/A.
+      const identities = peer && peer !== binding ? [binding, peer].sort((a, b) =>
+        a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0) : [binding];
+      for (const identity of identities) {
+        await client.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [identity.sessionId]);
+      }
       const valid = async () => {
         // Separate statement AFTER both locks: clock and row values cannot be
         // snapshots taken before a lock wait. Locks remain held through COMMIT.
-        const result = await client.query(`
-          SELECT s.id FROM room_resume_sessions s JOIN rooms r ON r.id = s.room_id
-          WHERE s.id = $1 AND s.room_id = $2 AND s.username = $3
-            AND s.auth_version = $4 AND r.auth_version = s.auth_version
-            AND s.generation = $5 AND s.last_transport_id = $6
-            AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
-        `, [binding.sessionId, binding.roomId, binding.username, binding.authVersion,
-          binding.generation, binding.transportId]);
-        assertHealthy();
-        return result.rowCount === 1 && isCurrent();
+        for (const identity of identities) {
+          const result = await client.query(`
+            SELECT s.id FROM room_resume_sessions s JOIN rooms r ON r.id = s.room_id
+            WHERE s.id = $1 AND s.room_id = $2 AND s.username = $3
+              AND s.auth_version = $4 AND r.auth_version = s.auth_version
+              AND s.generation = $5 AND s.last_transport_id = $6
+              AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
+          `, [identity.sessionId, identity.roomId, identity.username, identity.authVersion,
+            identity.generation, identity.transportId]);
+          assertHealthy();
+          if (result.rowCount !== 1 || !isCurrent()) return false;
+        }
+        return isCurrent();
       };
       if (!await valid()) {
         await client.query("ROLLBACK");

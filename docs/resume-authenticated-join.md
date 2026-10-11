@@ -5,7 +5,7 @@ ResumeBindings and ResumeMemberships registry. This is an integration slice,
 not public resume acceptance or release readiness. No token or resume handler is
 exposed. Agent/file/disconnect broadcasts now use exact session memberships;
 disconnect presence is recomputed from live leases, not the compatibility map.
-Existing upload admission/persistence and DM still use a temporary legacy
+Existing upload admission/persistence still uses a temporary legacy
 projection and MUST migrate before resume is enabled. Outbound membership
 fencing is local authority, not a fresh per-recipient database policy check.
 

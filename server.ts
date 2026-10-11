@@ -732,7 +732,7 @@ async function main() {
 
     // Files are saved by POST /api/upload; old send-file remains ignored.
 
-    registerPrivateMessages(io, socket, onlineUsers);
+    registerPrivateMessages(socket, owner, resumeMembers, resumeGate);
 
     socket.on("disconnect", () => {
       // Projection cleanup is only for the still-legacy upload/DM paths.
