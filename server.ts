@@ -23,6 +23,7 @@ import { ResumeStore } from "./src/lib/resume-store";
 import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
 import { ResumeMemberships } from "./src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
+import { RoomActivityWriter } from "./src/lib/room-activity";
 import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
 import { preflightResumeUpload } from "./src/lib/resume-upload-preflight";
 import { validateResumeUploadFraming } from "./src/lib/resume-upload-framing";
@@ -100,12 +101,12 @@ async function roomExists(roomId: string) {
   return rows.length > 0;
 }
 
-async function touchRoom(roomId: string) {
+const roomActivity = new RoomActivityWriter(async (roomId: string) => {
   await db
     .update(roomsTable)
     .set({ lastActiveAt: new Date() })
     .where(eq(roomsTable.id, roomId));
-}
+});
 
 async function saveMessage(
   roomId: string,
@@ -117,7 +118,7 @@ async function saveMessage(
     .insert(messagesTable)
     .values({ roomId, username, type, content, ts: new Date() })
     .returning();
-  touchRoom(roomId).catch(() => {});
+  await roomActivity.touch(roomId);
   return deserializeMessage(row);
 }
 
@@ -140,7 +141,7 @@ async function saveAgentMessage(
     .returning();
 
   if (inserted) {
-    touchRoom(roomId).catch(() => {});
+    await roomActivity.touch(roomId);
     return { message: deserializeMessage(inserted), deduplicated: false };
   }
 
@@ -500,7 +501,7 @@ async function main() {
           }
           message = outcome.result.value;
           // Outside the room SHARE lock to avoid lock upgrade deadlocks.
-          touchRoom(roomId).catch(() => {});
+          await roomActivity.touch(roomId);
         } catch (err) {
           // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
           // even when no row is visible: there is no safe retry/reclamation receipt.
@@ -784,7 +785,7 @@ async function main() {
               { ...request, dataUrl: payload?.dataUrl }, handoff);
           if (result.committed === true) {
             // Best effort activity only, outside the gate's room SHARE lock.
-            if (result.inserted) touchRoom(binding.roomId).catch(() => {});
+            if (result.inserted) await roomActivity.touch(binding.roomId);
             for (const failure of result.errors) console.error(event + " handoff " + failure.stage, failure.error);
           } else if (current()) {
             reply(result.committed === null
