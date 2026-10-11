@@ -9,6 +9,7 @@ import crypto from "crypto";
 import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
+import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { db, pool } from "./src/lib/db";
 import {
@@ -253,6 +254,7 @@ async function main() {
     storeType: "pool" as const,
     tableName: "rate_limits",
     tableCreated: true,
+    clearExpiredByTimeout: false,
   };
   const createRoomLimiter = new RateLimiterPostgres({
     ...rateLimiterStore,
@@ -278,6 +280,9 @@ async function main() {
     points: 30,
     duration: 60 * 60,
   });
+  // One owner for the shared table, replacing four dependency-owned timers.
+  // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
+  const rateLimitCleanup = new RateLimitCleanup(pool);
 
   // Security headers
   expressApp.disable("x-powered-by");

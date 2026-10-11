@@ -13,6 +13,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { eq } from "drizzle-orm";
 import { rooms as roomsTable, messages as messagesTable } from "../src/lib/db/schema";
 import { createUploadParser } from "../src/lib/upload-parser";
+import { RoomActivityWriter } from "../src/lib/room-activity";
 
 // Byte-preservation regression for unknown INSERT and post-save emit errors.
 // Not a quota, recovery or all-writer barrier test. No server startup,
@@ -27,14 +28,17 @@ async function main() {
   const source = await fs.promises.readFile("server.ts", "utf8");
   const tree = ts.createSourceFile("server.ts", source, ts.ScriptTarget.Latest, true);
   const functions = new Map<string, string>();
-  const handlers: string[] = [], stores: string[] = [];
+  const handlers: string[] = [], stores: string[] = [], activity: string[] = [];
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name &&
-        ["saveMessage", "touchRoom", "deserializeMessage"].includes(node.name.text)) {
+        ["saveMessage", "deserializeMessage"].includes(node.name.text)) {
       assert.ok(!functions.has(node.name.text)); functions.set(node.name.text, node.getText(tree));
     }
     if (ts.isVariableDeclaration(node) && node.name.getText(tree) === "storage" && node.initializer) {
       stores.push(node.initializer.getText(tree));
+    }
+    if (ts.isVariableDeclaration(node) && node.name.getText(tree) === "roomActivity" && node.initializer) {
+      activity.push(node.initializer.getText(tree));
     }
     if (ts.isCallExpression(node) && node.expression.getText(tree) === "expressApp.post" &&
         node.arguments[0]?.getText(tree) === '"/api/upload"') {
@@ -44,7 +48,8 @@ async function main() {
     ts.forEachChild(node, visit);
   }
   visit(tree);
-  assert.equal(functions.size, 3); assert.equal(handlers.length, 1); assert.equal(stores.length, 1);
+  assert.equal(functions.size, 2); assert.equal(handlers.length, 1); assert.equal(stores.length, 1);
+  assert.equal(activity.length, 1);
   const schema = "public_upload_qa_" + crypto.randomBytes(8).toString("hex");
   const admin = new Pool({ connectionString, connectionTimeoutMillis: 2000 });
   const pool = new Pool({ connectionString, options: "-c search_path=" + schema, connectionTimeoutMillis: 2000 });
@@ -54,6 +59,7 @@ async function main() {
   const writes = new Set<Promise<unknown>>(), unlinks: Promise<unknown>[] = [];
   let releaseTouch: (() => void) | undefined;
   let touchGate: Promise<void> | undefined;
+  let enteredTouch: (() => void) | undefined;
   let touchAttempts = 0, touchCompleted = 0;
   const errors: string[] = [];
   // Throw ONLY after the real PG query resolves: an acknowledged autocommit
@@ -67,6 +73,7 @@ async function main() {
     const work = (async () => {
       if (touch) {
         touchAttempts++;
+        enteredTouch?.();
         if (touchGate) await touchGate;
         if (queryMode === "delayed-touch-reject") throw Error("injected deferred UPDATE rejection");
       }
@@ -87,7 +94,7 @@ async function main() {
     return work;
   };
   const context = vm.createContext({
-    db: drizzle(pool), messagesTable, roomsTable, eq, Date, JSON, crypto, path, multer,
+    db: drizzle(pool), messagesTable, roomsTable, eq, Date, JSON, crypto, path, multer, RoomActivityWriter,
     UPLOAD_DIR: root,
     // Persistence gate is substituted only in this byte-retention harness.
     // Real authority/transaction checks live in qa-public-session.ts.
@@ -107,6 +114,7 @@ async function main() {
     } },
   });
   const compiled = ts.transpileModule([...functions.values(),
+    "const roomActivity = (" + activity[0] + "); globalThis.roomActivity = roomActivity;",
     "globalThis.handler = (" + handlers[0] + ");",
     "globalThis.storage = (" + stores[0] + ");"].join("\n"),
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
@@ -136,16 +144,53 @@ async function main() {
       assert.equal(writes.size, 0, "previous scenario has no outstanding intercepted queries");
       touchAttempts = 0; touchCompleted = 0;
       const delayedTouch = scenario.startsWith("delayed-touch-");
+      const touchEntered = new Promise<void>(resolve => { enteredTouch = resolve; });
       touchGate = delayedTouch ? new Promise<void>(resolve => { releaseTouch = resolve; }) : undefined;
       await admin.query(`UPDATE "${schema}".rooms SET last_active_at = '2000-01-01' WHERE id = 'proof123'`);
       const body = new FormData(), bytes = "fixture:" + scenario;
       body.append("file", new Blob([bytes], { type: "text/plain" }), scenario + ".txt");
       let response: Response | undefined;
       let responseLost = false;
+      let deferredEvidence: object | undefined;
       try {
-        response = await fetch(`http://127.0.0.1:${address.port}/api/upload`, {
+        let httpFinished = false;
+        const request: Promise<Response> = fetch(`http://127.0.0.1:${address.port}/api/upload`, {
           method: "POST", body, signal: AbortSignal.timeout(5000),
         });
+        void request.then(() => { httpFinished = true; }, () => { httpFinished = true; });
+        if (delayedTouch) {
+          // Source handler must await activity: HTTP has not completed while
+          // an independent pool already observes the committed message.
+          await Promise.race([touchEntered, request.then(() => { throw Error("HTTP finished before activity entry"); })]);
+          assert.equal(touchAttempts, 1); assert.equal(touchCompleted, 0);
+          assert.equal(writes.size, 1);
+          const observe = async () => (await admin.query(`SELECT
+            last_active_at = '2000-01-01'::timestamp AS untouched,
+            (SELECT count(*)::int FROM "${schema}".messages WHERE content::jsonb->>'name' = $1) AS messages
+            FROM "${schema}".rooms WHERE id = 'proof123'`, [scenario + ".txt"])).rows[0];
+          const beforeRelease = await observe();
+          assert.deepEqual(beforeRelease, { untouched: true, messages: 1 });
+          assert.equal(httpFinished, false, "HTTP cannot finish before awaited activity settles");
+          let settled = false;
+          const drain = (context.roomActivity as RoomActivityWriter).settle().then(value => {
+            settled = true; return value;
+          });
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(settled, false);
+          const pending = [...writes];
+          releaseTouch!(); releaseTouch = undefined;
+          const results = await Promise.allSettled(pending);
+          const expectedStatus = scenario === "delayed-touch-reject" ? "rejected" : "fulfilled";
+          assert.deepEqual(results.map(result => result.status), [expectedStatus]);
+          assert.deepEqual(await drain, { failedWrites: expectedStatus === "rejected" ? 1 : 0 });
+          const afterSettlement = await observe();
+          assert.deepEqual(afterSettlement, { untouched: expectedStatus === "rejected", messages: 1 });
+          assert.equal(touchCompleted, expectedStatus === "fulfilled" ? 1 : 0);
+          assert.equal(writes.size, 0);
+          deferredEvidence = { httpPendingBeforeRelease: true, outstandingBeforeRelease: 1,
+            beforeRelease, settlement: expectedStatus, afterSettlement, outstandingAfterSettlement: writes.size };
+        }
+        response = await request;
       } catch (error) {
         assert.equal(scenario, "after-save-response");
         assert.ok(error instanceof TypeError, "connection failure, not a test timeout");
@@ -154,33 +199,6 @@ async function main() {
       assert.equal(responseLost, scenario === "after-save-response");
       const payload: { code?: string; error?: string; message?: { id: number } } =
         response ? await response.json() : {};
-      let deferredEvidence: object | undefined;
-      if (delayedTouch) {
-        // HTTP body has completed, but the actual-source touchRoom query is
-        // held BEFORE submission to PG. An independent pool observes both facts.
-        assert.equal(response?.status, 200);
-        assert.equal(touchAttempts, 1); assert.equal(touchCompleted, 0);
-        assert.equal(writes.size, 1, "HTTP completion is not deferred-writer settlement");
-        const observe = async () => (await admin.query(`SELECT
-          last_active_at = '2000-01-01'::timestamp AS untouched,
-          (SELECT count(*)::int FROM "${schema}".messages WHERE content::jsonb->>'name' = $1) AS messages
-          FROM "${schema}".rooms WHERE id = 'proof123'`, [scenario + ".txt"])).rows[0];
-        const beforeRelease = await observe();
-        assert.deepEqual(beforeRelease, { untouched: true, messages: 1 });
-        assert.equal(payload.message?.id, (await admin.query(`SELECT id FROM "${schema}".messages
-          WHERE content::jsonb->>'name' = $1`, [scenario + ".txt"])).rows[0].id);
-        const pending = [...writes];
-        releaseTouch!(); releaseTouch = undefined;
-        const settled = await Promise.allSettled(pending);
-        const expectedStatus = scenario === "delayed-touch-reject" ? "rejected" : "fulfilled";
-        assert.deepEqual(settled.map(result => result.status), [expectedStatus]);
-        const afterSettlement = await observe();
-        assert.deepEqual(afterSettlement, { untouched: expectedStatus === "rejected", messages: 1 });
-        assert.equal(touchCompleted, expectedStatus === "fulfilled" ? 1 : 0);
-        assert.equal(writes.size, 0);
-        deferredEvidence = { outstandingAtHttpCompletion: 1, beforeRelease,
-          settlement: expectedStatus, afterSettlement, outstandingAfterSettlement: writes.size };
-      }
       await Promise.allSettled([...writes]);
       const cleanup = await Promise.allSettled(unlinks);
       assert.ok(cleanup.every(r => r.status === "fulfilled"));

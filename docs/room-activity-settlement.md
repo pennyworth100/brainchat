@@ -19,13 +19,21 @@ settlement pending; there is no timeout that pretends cancellation or completion
 
 - Stop new HTTP/socket work and account for every already admitted handler,
   multipart/parser callback, upload lease, filesystem cleanup and transaction.
-- Replace the four independent `rate-limiter-flexible` expiry timers with one
-  owned, non-overlapping scheduler with stop-and-settle. Existing dependency
-  cleanup resolves even on SQL failure; do not treat that as successful deletion.
+- Compose the owned rate-limit scheduler's `stopAndSettle()` into the same
+  lifecycle. The four dependency timers are disabled; see
+  [expiry settlement](rate-limit-cleanup-settlement.md). Failures stay observable.
 - Only after producers stop, settle activity/background work, close the database
   pool, and establish the external/replica/filesystem boundary required by capture.
 - Fault-inject actual HTTP uploads and socket work during drain. Unit tests here
   are delayed/rejected callback tests, not a live server, PostgreSQL or kernel proof.
+
+The updated `qa-public-upload-outcome.ts` additionally extracts the actual activity
+initializer and upload handler, uses real HTTP/multipart/files/PostgreSQL, and
+holds the UPDATE before submission. It independently observes the committed
+message while HTTP and activity settlement remain pending. Both successful and
+rejected UPDATE settlement preserve the message and exact attachment bytes.
+Admission, transaction gate and event emitter remain substituted: this is not
+whole-server concurrent socket/drain acceptance or an all-writer fence.
 
 The draft remains 3.0.11 within PR #20. Production, staging, migrations, listener,
 and recovery maintenance configuration are unchanged by this patch.
