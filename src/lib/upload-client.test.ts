@@ -40,3 +40,16 @@ test("oversized files are rejected before networking; failed PDF does not discon
   assert.equal(requests, 1, "ambiguous failure is never automatically duplicated");
   await uploadRoomFile(pdf(), "qa", session, async () => response());
 });
+
+test("unknown persistence outcome is displayed without an automatic upload retry", async () => {
+  let requests = 0;
+  const message = "Attachment status is unknown. Check room history before uploading again.";
+  await assert.rejects(uploadRoomFile(pdf(), "qa", {
+    sync: async () => "valid-id",
+    reconnect: async () => assert.fail("unknown outcome must not reconnect/retry"),
+  }, async () => {
+    requests++;
+    return Response.json({ code: "UPLOAD_OUTCOME_UNKNOWN", error: message }, { status: 500 });
+  }), { message });
+  assert.equal(requests, 1);
+});

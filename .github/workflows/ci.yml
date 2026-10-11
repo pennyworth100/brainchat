@@ -17,18 +17,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ledger-tls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 18]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Ubuntu's default repositories provide PG16, not PG18. Use the
+      # official packaged PGDG setup helper; apt still verifies signatures.
+      - name: Configure official PostgreSQL apt repository for PG18
+        if: matrix.postgres == 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+      - name: Install isolated fixture tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-${{ matrix.postgres }} openssl
+      - name: Verified TLS provider composition (owned PostgreSQL ${{ matrix.postgres }} cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py
+      - name: Real operation-gate socket loss (owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: npm run test:operation-wire
+      - name: Retain fixture evidence (no keys or database files)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-tls-pg${{ matrix.postgres }}
+          path: |
+            /tmp/dimle-provider-tls-*/report.json
+            /tmp/dimle-provider-tls-*/server.log
+          if-no-files-found: warn
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Official Image mirror; digest verified against Docker Hub.
+        # See docs/ci-postgres-image.md for provenance and update procedure.
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_DB: dimle_ci
           POSTGRES_USER: dimle
           POSTGRES_PASSWORD: dimle_ci
         ports:
           - 5432:5432
+          - 55439:5432
         options: >-
           --health-cmd "pg_isready -U dimle -d dimle_ci"
           --health-interval 5s
@@ -66,6 +111,14 @@ jobs:
       - name: Production build
         run: npm run build
 
+      - name: Install owned public-session fixture tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-16
+
+      - name: Actual public join and sync (separate owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py
+
       - name: Start isolated application
         env:
           NODE_ENV: production
@@ -83,6 +136,31 @@ jobs:
 
       - name: HTTP, Socket.IO and PostgreSQL integration tests
         run: node --import tsx scripts/qa-reconnect-upload.ts
+
+      - name: Resume persistence PostgreSQL tests (isolated schema)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-resume-store.ts
+
+      - name: Durable upload reservation PostgreSQL and crash tests (isolated schema)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-upload-reservation.ts
+
+      - name: Two-dimensional reservation transaction experiment (isolated schema only)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-upload-resource-vector.ts
+
+      - name: Actual resource ledger migration and transaction (owned random database)
+        env:
+          RESOURCE_TEST_ADMIN_URL: postgres://dimle:dimle_ci@127.0.0.1:55439/postgres
+        run: node --import tsx scripts/qa-upload-resource-ledger.ts
+
+      - name: Upload storage SIGKILL and read-only recovery (isolated schema)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-upload-storage-crash.ts
+
+      - name: Independent upload evidence composition (isolated schema and files)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-upload-evidence.ts
+
+      # Preservation plus proof HTTP completion is not deferred-writer settlement.
+      # Neither establishes a common all-writer barrier or storage quota.
+      - name: Public upload preservation and deferred writes (isolated fixtures)
+        run: RESUME_TEST_DATABASE_URL="$DATABASE_URL" node --import tsx scripts/qa-public-upload-outcome.ts
 
       - name: Upload server log on failure
         if: failure()

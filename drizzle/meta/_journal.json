@@ -29,6 +29,48 @@
       "when": 1791428478021,
       "tag": "0003_spotty_zombie",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791497873756,
+      "tag": "0004_long_nighthawk",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791499083632,
+      "tag": "0005_free_blazing_skull",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1791505380692,
+      "tag": "0006_cold_zuras",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791506670335,
+      "tag": "0007_motionless_wolfpack",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1791564893022,
+      "tag": "0008_dark_grim_reaper",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1791612755512,
+      "tag": "0009_upload_resource_ledger",
+      "breakpoints": true
     }
   ]
 }

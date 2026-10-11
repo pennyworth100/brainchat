@@ -18,6 +18,19 @@ import {
 } from "./src/lib/agent-api-auth";
 import type { JoinErrorDetails } from "./src/lib/join-error";
 import { registerPrivateMessages } from "./src/lib/private-message";
+import { claimRoomPolicy } from "./src/lib/room-policy";
+import { ResumeStore } from "./src/lib/resume-store";
+import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
+import { ResumeMemberships } from "./src/lib/resume-membership";
+import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
+import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "./src/lib/resume-operation";
+import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./src/lib/resume-upload-admission";
+import { ResumeHistoryReader } from "./src/lib/resume-history";
+import { syncResumeSocket } from "./src/lib/resume-sync";
+import { ResumeMessageWriter } from "./src/lib/resume-message";
+import { ResumeImageWriter } from "./src/lib/resume-image";
+import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -42,19 +55,10 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_PASSWORD_LENGTH = 256;
 const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
-const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 
 class IdempotencyConflictError extends Error {}
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-// In-memory: online users per room (transient socket state)
-const onlineUsers = new Map<string, Map<string, string>>();
-
-function getOrCreateOnlineRoom(roomId: string) {
-  if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Map());
-  return onlineUsers.get(roomId)!;
-}
 
 function getSocketClientIp(
   socket: Socket,
@@ -229,6 +233,17 @@ async function main() {
   if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);
   const io = new Server(server);
+  const resumeStore = new ResumeStore(pool);
+  const resumeBindings = new ResumeBindings();
+  const resumeMembers = new ResumeMemberships(resumeBindings);
+  const resumeGate = new ResumeOperationGate(pool, resumeBindings);
+  const socketOwners = new WeakMap<Socket, ResumeSocketOwner>();
+  const legacyUploadAdmission = new LegacyUploadAdmission(resumeMembers, resumeGate);
+  const uploadAdmissions = new ResumeUploadAdmissions(resumeBindings);
+  const uploadGate = new ResumeUploadOperationGate(pool, uploadAdmissions);
+  const resumeHistory = new ResumeHistoryReader(resumeGate);
+  const resumeText = new ResumeMessageWriter(resumeGate);
+  const resumeImage = new ResumeImageWriter(resumeGate);
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -382,15 +397,13 @@ async function main() {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
       const roomId = normalizeRoomId(rawRoomId);
-      const users = onlineUsers.get(roomId);
       const activeSocket = io.sockets.sockets.get(socketId);
-      if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
+      const owner = activeSocket && socketOwners.get(activeSocket);
+      if (!activeSocket || !owner || !resumeMembers.bindingFor(activeSocket, owner, roomId)) {
         return res.status(401).json({ error: "Join the room before uploading" });
       }
-      res.locals.uploadIdentity = { roomId, username: users.get(socketId)! };
       try {
         await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
-        nxt();
       } catch (err) {
         if (typeof err === "object" && err && "msBeforeNext" in err) {
           res.setHeader(
@@ -400,28 +413,86 @@ async function main() {
         }
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
-    },
-    uploadMiddleware,
-    async (req, res) => {
-      if (!req.file) return res.status(400).json({ error: "No file" });
-      const token = (req as express.Request & { _uploadToken: string })._uploadToken;
-      const file = {
-        url: `/uploads/${token}/${req.file.filename}`,
-        name: req.file.originalname,
-        size: req.file.size,
-        mime: req.file.mimetype || "application/octet-stream",
-      };
       try {
-        // Authenticate before accepting bytes; then publish independently of
-        // the socket's lifetime (iOS may sleep while the HTTP upload finishes).
-        const { roomId, username } = res.locals.uploadIdentity;
-        const message = await saveMessage(roomId, username, "file", JSON.stringify(file));
-        io.to(roomId).emit("chat-file", message);
-        res.json({ ...file, message });
-      } catch (err) {
-        console.error("upload persistence error:", err);
-        fs.promises.unlink(req.file.path).catch(() => {});
-        res.status(500).json({ error: "Could not save the attachment. Please try again." });
+        // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
+        // A room projection or a physically connected revoked socket is not authority.
+        const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
+        if (!identity || req.destroyed || res.destroyed ||
+            resumeMembers.bindingFor(activeSocket, owner, roomId) !== identity) {
+          return res.status(401).json({ error: "Join the room before uploading" });
+        }
+        const grant = uploadAdmissions.admit(identity);
+        if (!grant) return res.status(429).json({ error: "Upload already in progress or capacity exhausted" });
+        res.locals.uploadGrant = grant;
+      } catch (error) {
+        console.error("upload admission error:", error);
+        return res.status(503).json({ error: "Could not authorize upload" });
+      }
+      nxt();
+    },
+    (req, res, nxt) => {
+      // Parser callback settles storage work. Close alone cannot release a lease.
+      uploadMiddleware(req, res, error => {
+        if (error) uploadAdmissions.release(res.locals.uploadGrant);
+        nxt(error);
+      });
+    },
+    async (req, res) => {
+      const grant: ResumeUploadGrant = res.locals.uploadGrant;
+      try {
+        if (!req.file) return res.status(400).json({ error: "No file" });
+        const token = (req as express.Request & { _uploadToken: string })._uploadToken;
+        const file = {
+          url: `/uploads/${token}/${req.file.filename}`,
+          name: req.file.originalname,
+          size: req.file.size,
+          mime: req.file.mimetype || "application/octet-stream",
+        };
+        const { roomId, username } = grant.binding;
+        let message: Awaited<ReturnType<typeof saveMessage>>;
+        try {
+          const outcome = await uploadGate.runWithOutcome(grant, async transaction => {
+            const saved = await transaction.query<MessageRow>(`INSERT INTO messages
+              (room_id, username, type, content, ts) VALUES ($1, $2, 'file', $3, clock_timestamp())
+              RETURNING id, room_id AS "roomId", username, type, content, ts`,
+            [roomId, username, JSON.stringify(file)]);
+            if (!saved.rows[0]) throw Error("Missing upload receipt");
+            return deserializeMessage(saved.rows[0]);
+          });
+          if (!outcome.completed) throw outcome.error;
+          if (!outcome.result.authorized) {
+            // Not 401: clients must not automatically re-upload. Preserve bytes.
+            return res.status(403).json({ error: "Upload authorization expired or changed" });
+          }
+          message = outcome.result.value;
+          // Outside the room SHARE lock to avoid lock upgrade deadlocks.
+          touchRoom(roomId).catch(() => {});
+        } catch (err) {
+          // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
+          // even when no row is visible: there is no safe retry/reclamation receipt.
+          console.error("upload persistence outcome unknown:", err);
+          return res.status(500).json({
+            code: "UPLOAD_OUTCOME_UNKNOWN",
+            error: "Attachment status is unknown. Check room history before uploading again.",
+          });
+        }
+        try {
+          // Publication failure cannot invalidate an acknowledged saved message.
+          resumeMembers.broadcast(roomId, "chat-file", message);
+        } catch (err) {
+          console.error("upload notification error after save:", err);
+        }
+        // A response failure/disconnected client must never trigger byte cleanup.
+        try {
+          res.json({ ...file, message });
+        } catch (err) {
+          console.error("upload response error after save:", err);
+          res.destroy();
+        }
+      } finally {
+        // Actual parser/persistence settlement, never timeout/disconnect alone.
+        // Capacity release does not authorize cleanup or retry.
+        uploadAdmissions.release(grant);
       }
     }
   );
@@ -505,7 +576,7 @@ async function main() {
         message,
         clientMessageId
       );
-      if (!result.deduplicated) io.to(roomId).emit("chat-message", result.message);
+      if (!result.deduplicated) resumeMembers.broadcast(roomId, "chat-message", result.message);
       res.json({ ok: true, ...result });
     } catch (err) {
       if (err instanceof IdempotencyConflictError) {
@@ -519,6 +590,34 @@ async function main() {
   // ── Socket.io ─────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
     let currentRoom: string | null = null;
+    let publishedBinding: ResumeBinding | null = null;
+    // Normal authenticated joins now use the real durable/session owner. Do not
+    // expose credentials or register resume until ALL protected paths migrate.
+    const owner = attachResumeSocket(socket, {
+      store: resumeStore, bindings: resumeBindings, memberships: resumeMembers,
+      issue: (roomId, username, authVersion) =>
+        resumeStore.issueAfterAuthenticatedJoin(roomId, username, authVersion),
+      prepare: async () => async () => {},
+      onCleanupError: error => console.error("Session cleanup error:", error),
+      publishJoin: async (binding, live) => {
+        const roomId = binding.roomId;
+        const current = () => live() && resumeMembers.isCurrent(binding, roomId);
+        const history = await resumeHistory.read(binding);
+        if (history === null || !current()) return false;
+        currentRoom = roomId;
+        if (!current()) return false;
+        const users = resumeMembers.presence(roomId).users.map(user => user.username);
+        if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
+        if (!resumeMembers.send(binding, roomId, "room-snapshot", { history, users }) || !current()) return false;
+        publishedBinding = binding;
+        resumeMembers.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
+        return current();
+      },
+    });
 
     socket.on(
       "join-room",
@@ -570,21 +669,12 @@ async function main() {
             }
 
             const passwordHash = password ? await hashPassword(password) : null;
-            const [claimed] = await db
-              .update(roomsTable)
-              .set({ passwordHash, creationTokenHash: null })
-              .where(
-                and(
-                  eq(roomsTable.id, roomId),
-                  eq(roomsTable.creationTokenHash, room.creationTokenHash)
-                )
-              )
-              .returning();
+            const claimed = await claimRoomPolicy(pool, roomId, room.creationTokenHash, passwordHash);
             if (!claimed) {
               socket.emit("join-error", "Room was already claimed");
               return;
             }
-            room = claimed;
+            room = { ...room, ...claimed };
           } else if (
             room.passwordHash &&
             !(await verifyPassword(room.passwordHash, password || ""))
@@ -595,18 +685,9 @@ async function main() {
           if (!socket.connected) return;
           // This client has one active room. Do not leave stale memberships.
           if (currentRoom && currentRoom !== roomId) return;
-          currentRoom = roomId;
-          const users = getOrCreateOnlineRoom(roomId);
-          users.set(socket.id, username);
-          await socket.join(roomId);
-          socket.emit("room-info", { hasPassword: !!room.passwordHash });
-          const history = await loadHistory(roomId);
-          if (!socket.connected) return;
-          socket.emit("chat-history", history); // v3.0.1 compatibility
-          socket.emit("room-snapshot", { history, users: Array.from(users.values()) });
-          socket.to(roomId).emit("system-message", `${username} joined`);
-          io.to(roomId).emit("user-count", users.size);
-          io.to(roomId).emit("user-list", Array.from(users.values()));
+          const joined = await owner.join({ roomId, username, authVersion: room.authVersion });
+          if (!joined || !resumeMembers.isCurrent(joined.binding, roomId)) return;
+          resumeMembers.send(joined.binding, roomId, "room-info", { hasPassword: !!room.passwordHash });
         } catch (err) {
           if (typeof err === "object" && err && "msBeforeNext" in err) {
             socket.emit("join-error", "Too many attempts. Try again later.", {
@@ -623,83 +704,83 @@ async function main() {
     socket.on("sync-room", async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack) => {
       if (typeof ack !== "function") return;
       const roomId = payload?.roomId;
-      if (typeof roomId !== "string" || roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
+      const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+      if (!binding) {
         return ack({ error: "Rejoin the room" });
       }
       // Membership/transport liveness only, not database or history readiness.
       // Keep the existing event for rolling compatibility with older clients.
-      if (payload?.probeOnly === true) return ack({ ok: true });
       try {
-        const history = await loadHistory(roomId);
-        if (!socket.connected) return;
-        ack({ history, users: Array.from(onlineUsers.get(roomId)?.values() || []) });
+        const handedOff = await syncResumeSocket(socket, owner, binding, resumeMembers, resumeHistory, payload, ack);
+        if (!handedOff && resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       } catch (err) {
         console.error("sync-room error:", err);
-        ack({ error: "Could not sync the room" });
+        if (resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       }
     });
 
-    socket.on(
-      "send-message",
-      async ({ roomId, message }: { roomId: string; message: string }, ack) => {
+    // Existing normal-join clients use the same exact physical/session authority.
+    // Missing keys retain legacy one-attempt semantics; never auto-retry them.
+    // An explicit key permits a same-session receipt lookup, not replayed fanout.
+    for (const event of ["send-message", "send-image"] as const) {
+      socket.on(event, async (payload, ack) => {
         const reply = typeof ack === "function" ? ack : () => {};
-        if (!roomId || typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LENGTH) {
+        const roomId = payload?.roomId;
+        if (event === "send-message" && (!roomId || typeof payload?.message !== "string" ||
+            !payload.message.trim() || payload.message.length > MAX_MESSAGE_LENGTH)) {
           return reply({ error: "Invalid message" });
         }
-        const username = onlineUsers.get(roomId)?.get(socket.id);
-        if (!username || !socket.rooms.has(roomId)) return reply({ error: "Rejoin the room before sending" });
+        const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+        if (!binding) return reply({ error: "Rejoin the room before sending" });
+        const current = () => resumeMembers.isCurrent(binding, binding.roomId);
+        const request = { roomId, clientMessageId: payload?.clientMessageId === undefined
+          ? crypto.randomUUID() : payload.clientMessageId };
+        const handoff = (receipt: { clientMessageId: string; message: unknown }) => {
+          // Preserve legacy sender echo, including old image clients without ACK.
+          // Exact outbound lease rechecked independently from the ACK.
+          reply(receipt);
+          resumeMembers.send(binding, binding.roomId,
+            event === "send-message" ? "chat-message" : "chat-image", receipt.message);
+        };
         try {
-          const saved = await saveMessage(roomId, username, "message", message);
-          io.to(roomId).emit("chat-message", saved);
-          reply({ message: saved });
+          const result = event === "send-message"
+            ? await sendResumeText(socket, owner, binding, resumeMembers, resumeText,
+              { ...request, message: payload?.message }, handoff)
+            : await sendResumeImage(socket, owner, binding, resumeMembers, resumeImage,
+              { ...request, dataUrl: payload?.dataUrl }, handoff);
+          if (result.committed === true) {
+            // Best effort activity only, outside the gate's room SHARE lock.
+            if (result.inserted) touchRoom(binding.roomId).catch(() => {});
+            for (const failure of result.errors) console.error(event + " handoff " + failure.stage, failure.error);
+          } else if (current()) {
+            reply(result.committed === null
+              ? { error: "Write outcome unknown; sync before retrying", outcome: "unknown", clientMessageId: request.clientMessageId }
+              : { error: "Message denied or invalid" });
+          }
         } catch (err) {
-          console.error("send-message error:", err);
-          reply({ error: "Could not save the message" });
+          console.error(event + " error:", err);
+          // Even a COMMIT rejection can mean a committed row. Never claim rollback.
+          if (current()) reply({ error: "Write outcome unknown; sync before retrying",
+            outcome: "unknown", clientMessageId: request.clientMessageId });
         }
-      }
-    );
+      });
+    }
 
-    // Files are now saved and broadcast by POST /api/upload. The old
-    // v3.0.1 send-file notification is intentionally ignored to avoid doubles.
+    // Files are saved by POST /api/upload; old send-file remains ignored.
 
-    socket.on(
-      "send-image",
-      async ({ roomId, dataUrl }: { roomId: string; dataUrl: string }) => {
-        if (!roomId || !dataUrl) return;
-        if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return;
-        if (!/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(dataUrl)) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const username = users.get(socket.id);
-        if (!username) return;
-        try {
-          const content = JSON.stringify({ dataUrl });
-          const saved = await saveMessage(roomId, username, "image", content);
-          io.to(roomId).emit("chat-image", saved);
-        } catch (err) {
-          console.error("send-image error:", err);
-        }
-      }
-    );
-
-    registerPrivateMessages(io, socket, onlineUsers);
+    registerPrivateMessages(socket, owner, resumeMembers, resumeGate);
+    socketOwners.set(socket, owner);
 
     socket.on("disconnect", () => {
-      if (!currentRoom) return;
-      const users = onlineUsers.get(currentRoom);
-      if (!users) return;
-      const username = users.get(socket.id);
-      users.delete(socket.id);
-      if (users.size === 0) {
-        onlineUsers.delete(currentRoom);
-      } else {
-        io.to(currentRoom).emit("system-message", `${username} left`);
-        io.to(currentRoom).emit("user-count", users.size);
-        io.to(currentRoom).emit(
-          "user-list",
-          Array.from(users.values())
-        );
-      }
+      socketOwners.delete(socket);
+      // Authority is released synchronously at disconnecting. A displaced
+      // transport must not announce its live logical successor as departed.
+      if (!publishedBinding) return;
+      const { roomId, sessionId, username } = publishedBinding;
+      if (resumeMembers.presence(roomId).users.some(user => user.id === sessionId)) return;
+      resumeMembers.broadcast(roomId, "system-message", `${username} left`);
+      resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+      resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
     });
   });
 
