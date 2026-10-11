@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { createServer, createConnection, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
-import { createUploadLedgerProvider } from "../src/lib/upload-ledger-provider";
+import { createUploadLedgerProvider, createStrictUploadLedgerProvider } from "../src/lib/upload-ledger-provider";
 import { runUploadLedgerTransaction } from "../src/lib/upload-ledger-transaction";
 import { createUploadResourceSqlWork } from "../src/lib/upload-resource-sql";
 
@@ -49,6 +49,27 @@ async function main() {
       stableExclusiveNamespace: true, allAllocationCostsBounded: true, maxFileBytes: 6,
       allocationUnitBytes: 1, allocationCopies: 1, directoryAndParentBytes: 3,
       metadataBytes: 0, temporaryBytes: 0, additionalObjects: 0 };
+    // Separate strict transport/provenance evidence. No strict transaction or SQL
+    // composition is claimed here; those remain a separate implementation gate.
+    const strict = createStrictUploadLedgerProvider(config);
+    const strictPolicy = { ...policy, adapter: "resume-strict-writer-v1" };
+    try {
+      const strictPin = strict.pin(strictPolicy)!; check(strictPin !== null);
+      check(strict.pin(policy) === null && provider.pin(strictPolicy) === null);
+      const legacyPin = provider.pin(policy)!;
+      const strictCursor = log().length;
+      check((await strict.checkout(legacyPin as unknown as typeof strictPin)).status === "failed");
+      check((await provider.checkout(strictPin as unknown as typeof legacyPin)).status === "failed");
+      check(log().slice(strictCursor).length === 0);
+      const strictLease = await strict.checkout(strictPin);
+      check(strictLease.status === "acquired");
+      if (strictLease.status !== "acquired") throw Error("Strict fixture checkout denied");
+      try {
+        const strictSsl = (await strictLease.lease.query("SELECT ssl, version FROM pg_stat_ssl WHERE pid=pg_backend_pid()")).rows[0];
+        check(strictSsl.ssl === true && /^TLSv1\.[23]$/.test(strictSsl.version));
+        check(strictLease.pin === strictPin && strictLease.binding.database === provider.binding.database);
+      } finally { check(strictLease.lease.finalize(false) === "released"); }
+    } finally { await strict.close(); }
     let pin = provider.pin(policy)!; check(pin !== null);
     check(provider.pin({ ...policy, identity: { ...policy.identity, database: "wrong" } }) === null);
     for (const table of ["domains", "policies", "attempts"])

@@ -4,7 +4,7 @@
  */
 import { Pool } from "pg";
 import { checkoutUploadLedgerClient } from "./upload-ledger-lease";
-import { pinUploadResourcePolicy, type UploadResourcePolicyPin } from "./upload-resource-policy-pin";
+import { pinUploadResourcePolicy, pinStrictUploadResourcePolicy } from "./upload-resource-policy-pin";
 
 export type UploadLedgerConfiguration = Readonly<{
   host: string; port: number; user: string; password: string;
@@ -27,6 +27,21 @@ function text(value: unknown): value is string {
  * Construction is inert: pg opens connections only when checkout is requested.
  */
 export function createUploadLedgerProvider(config: UploadLedgerConfiguration) {
+  return createProvider(config, pinUploadResourcePolicy);
+}
+
+/** Explicit strict-writer provider. No adapter dispatch from policy/row data.
+ * Its ownership registry is separate even from another strict provider.
+ * Checkout alone grants no admission or filesystem authority.
+ */
+export function createStrictUploadLedgerProvider(config: UploadLedgerConfiguration) {
+  return createProvider(config, pinStrictUploadResourcePolicy);
+}
+
+function createProvider<Pin extends object>(
+  config: UploadLedgerConfiguration,
+  pinPolicy: (policy: unknown, expected: unknown) => Pin | null,
+) {
   // Snapshot every retained primitive before any await; never retain config.
   const { host, port, user, password, database, clusterIdentity, systemIdentifier, ca } = config;
   if (!text(host) || host.includes("/") || !text(user) || !text(database) || !text(clusterIdentity) || typeof password !== "string" ||
@@ -53,14 +68,14 @@ export function createUploadLedgerProvider(config: UploadLedgerConfiguration) {
   // pg removes the failed idle client. Deny further checkouts; do not log secrets
   // or turn an unhandled EventEmitter error into process termination.
   pool.on("error", () => { poisoned = true; });
-  const ownedPins = new WeakSet<UploadResourcePolicyPin>();
+  const ownedPins = new WeakSet<Pin>();
 
   return Object.freeze({
     binding,
     /** Only trusted server policy. Namespace/domain/version/generation must be
      * provisioned by the future service, never selected by an upload request.
      */
-    pin(policy: unknown): UploadResourcePolicyPin | null {
+    pin(policy: unknown): Pin | null {
       if (closed || poisoned || !policy || typeof policy !== "object") return null;
       const descriptor = Object.getOwnPropertyDescriptor(policy, "identity");
       if (!descriptor || !("value" in descriptor) || !descriptor.value ||
@@ -71,11 +86,11 @@ export function createUploadLedgerProvider(config: UploadLedgerConfiguration) {
         if (!field || !("value" in field)) return null;
         expected[key] = field.value;
       }
-      const pin = pinUploadResourcePolicy(policy, expected);
+      const pin = pinPolicy(policy, expected);
       if (pin) ownedPins.add(pin);
       return pin;
     },
-    async checkout(pin: UploadResourcePolicyPin) {
+    async checkout(pin: Pin) {
       if (closed || poisoned || !pin || typeof pin !== "object" || !ownedPins.has(pin)) {
         return { status: "failed" as const };
       }

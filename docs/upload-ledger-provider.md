@@ -349,3 +349,20 @@ unchanged ledger rows/liabilities, no reconnect, backend disappearance before
 database/role removal and owned-cluster shutdown. The original UNKNOWN outcomes
 remain UNKNOWN without replay. All network-fault, managed-provider provenance,
 physical fencing and production-approval gates remain unchanged.
+
+### Explicit strict-writer provider (2026-10-11)
+
+`createStrictUploadLedgerProvider` selects the strict pin factory at construction;
+the existing `createUploadLedgerProvider` remains Multer-only. Both use the same
+TLS, configuration snapshot, identity probe, lease and shutdown implementation.
+Each instance owns its own pin registry. Wrong-adapter policies fail at pinning;
+foreign, standalone, copied and cross-adapter pins fail before pool checkout.
+There is no union pin API or row-driven adapter dispatch.
+
+The strict provider repeats the full provider failure/lifetime unit matrix. The
+isolated real TLS fixture also obtains a strict lease and checks cross-adapter
+rejection without any connection/probe. Existing real Multer transaction,
+SQL and COMMIT-fault regressions still run. This is NOT a strict transaction/SQL,
+physical-capacity, runtime-composition or release PASS. The transaction and SQL
+callback remain Multer-only until explicit strict entry points are implemented.
+No runtime consumer, provisioning, policy seed or live deployment is introduced.
