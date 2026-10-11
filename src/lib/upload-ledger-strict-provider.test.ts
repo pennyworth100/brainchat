@@ -100,7 +100,8 @@ test("strict: permission/probe error and disposal failure stay denied with one d
   assert.deepEqual(await provider.checkout(provider.pin(policy())!), { status: "failed" });
   assert.deepEqual(f.releases, [true]);
   assert.equal(f.queries.length, 1);
-  await provider.close();
+  await assert.rejects(provider.close(), /disposal unconfirmed/);
+  assert.equal(f.ends, 0);
 });
 
 test("strict: config mutation across await cannot redirect owned pool or rewrite canonical identity", async t => {
@@ -126,12 +127,14 @@ test("strict: closing during identity probe denies pending result and destroys o
   const pin = provider.pin(policy())!, checkout = provider.checkout(pin);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.queries.length, 1);
-  await provider.close();
+  const closing = provider.close();
+  assert.equal(f.ends, 0);
   complete({ rowCount: 1, rows: [{ database: "ledger", system_identifier: "123456789" }] });
   assert.deepEqual(await checkout, { status: "failed" });
   assert.deepEqual(f.releases, [true]);
   assert.equal(provider.pin(policy()), null);
   assert.deepEqual(await provider.checkout(pin), { status: "failed" });
+  await closing;
   await provider.close(); assert.equal(f.ends, 1);
 });
 

@@ -502,6 +502,66 @@ async function main() {
         await db.query("UPDATE public.upload_resource_domains SET active=true,capacity_bytes=120,capacity_objects=24");
       }
     } finally { await strictAccounting.close(); }
+    // Real blocked SQL + repeated close: neither caller may report settlement
+    // while a provider-owned backend still holds an open transaction.
+    const shutdownEvidence: Record<string, unknown>[] = [];
+    for (const strictMode of [false, true]) {
+      const owned = strictMode ? createStrictUploadLedgerProvider(config) : createUploadLedgerProvider(config);
+      const ownedPin = owned.pin(strictMode ? strictPolicy : policy)!;
+      const checked = await owned.checkout(ownedPin as never);
+      if (checked.status !== "acquired") throw Error("Shutdown fixture checkout denied");
+      let blocker = false;
+      let pendingSql: Promise<unknown> | undefined;
+      try {
+        const pid = (await checked.lease.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+        await db.query("BEGIN"); blocker = true;
+        await db.query("SELECT pg_advisory_xact_lock(325)");
+        await checked.lease.query("BEGIN");
+        const blockedSql = checked.lease.query("SELECT pg_advisory_xact_lock(325)");
+        pendingSql = blockedSql;
+        void blockedSql.catch(() => {}); // retain rejection until explicit await
+        let waiting = false;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const row = (await admin.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", [pid])).rows[0];
+          if (row?.wait_event_type === "Lock") { waiting = true; break; }
+          await delay(10);
+        }
+        check(waiting);
+        const first = owned.close(), second = owned.close();
+        check(first === second);
+        let settled = false; void second.then(() => { settled = true; });
+        await delay(20);
+        check(!settled && checked.lease.finalize(false) === "query-pending");
+        check(owned.pin(strictMode ? strictPolicy : policy) === null);
+        check((await owned.checkout(ownedPin as never)).status === "failed");
+        await db.query("COMMIT"); blocker = false;
+        await blockedSql;
+        check(!settled); // SQL completion is not lease/transaction completion.
+        await checked.lease.query("COMMIT");
+        check(!settled);
+        check(checked.lease.finalize(false) === "released");
+        await first; check(settled);
+        // pg end acknowledges local socket shutdown; independently observe the
+        // server backend leaving, without claiming instantaneous kernel fencing.
+        let gone = false;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await admin.query("SELECT 1 FROM pg_stat_activity WHERE pid=$1", [pid])).rowCount === 0) {
+            gone = true; break;
+          }
+          await delay(10);
+        }
+        check(gone);
+        shutdownEvidence.push({ adapter: strictMode ? "strict" : "legacy",
+          blockedSqlObserved: true, repeatedCloseSamePromise: true,
+          heldUntilCommitAndRelease: true, backendGone: true });
+      } finally {
+        if (blocker) await db.query("ROLLBACK");
+        await pendingSql?.catch(() => {});
+        // No forced finalization while SQL is pending.
+        checked.lease.finalize(true);
+        await owned.close();
+      }
+    }
     const finalState = await state();
     await provider.close(); check((await provider.checkout(pin)).status === "failed");
     resultReport = { status: "PASS", checks, version, tls: ssl.version,
@@ -515,6 +575,7 @@ async function main() {
         invalidAdaptersRejected: 10 },
       backendTermination: failures, terminationPreservedLedger: true,
       transportDisconnect: transport,
+      shutdownSettlement: shutdownEvidence,
       explicitReplacement: { pid: fresh.pid, outcome: fresh.result, sameLeaseProbeBeforeBegin: true,
         commitCount: 1, insertCount: 1, originalRowsUnchanged: true, retainedUnknown: [unknown.result, terminated],
         unknownReplay: false, poisonedProviderRevived: false, automaticRecovery: false },
