@@ -37,7 +37,11 @@ function setup(t: TestContext, options: {
     allAllocationCostsBounded: true, maxFileBytes: 6, allocationUnitBytes: 4, allocationCopies: 1,
     directoryAndParentBytes: 10, metadataBytes: 11, temporaryBytes: 12, additionalObjects: 3 })!;
   assert.ok(pin);
-  t.after(() => provider.close());
+  t.after(async () => {
+    if (options.releaseThrows && releases.length) {
+      await assert.rejects(provider.close(), /disposal unconfirmed/);
+    } else await provider.close();
+  });
   const work: Parameters<typeof runUploadLedgerTransaction>[2] = async c => {
     await c.query("INSERT fixture", [c.attemptId]); return "prepared";
   };

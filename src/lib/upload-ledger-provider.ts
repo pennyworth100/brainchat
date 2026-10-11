@@ -61,6 +61,25 @@ function createProvider<Pin extends object>(
     lock_timeout: 2000, idle_in_transaction_session_timeout: 10000,
     options: "-c search_path=pg_catalog" });
   let closed = false, poisoned = false;
+  let closing: Promise<void> | undefined;
+  // Retain raw driver acquisition AND the leased client, not the caller's
+  // timeout promise. A late connect is still ours until its disposal settles.
+  const pending = new Set<Promise<void>>();
+  let disposalFailed = false;
+  const connectOwned = () => {
+    let finish!: () => void;
+    const retained = new Promise<void>(resolve => { finish = resolve; });
+    pending.add(retained);
+    const settle = () => { pending.delete(retained); finish(); };
+    return Promise.resolve().then(() => pool.connect()).then(client => ({
+      query: client.query.bind(client),
+      release(broken?: boolean) {
+        try { client.release(broken); }
+        catch (error) { disposalFailed = true; poisoned = true; throw error; }
+        finally { settle(); }
+      },
+    }), error => { settle(); throw error; });
+  };
   // pg-pool removes its idle error listener while a client is checked out.
   // Keep a provider-owned lifetime listener so an active connection error also
   // fails closed instead of becoming an unhandled EventEmitter error.
@@ -94,7 +113,7 @@ function createProvider<Pin extends object>(
       if (closed || poisoned || !pin || typeof pin !== "object" || !ownedPins.has(pin)) {
         return { status: "failed" as const };
       }
-      const result = await checkoutUploadLedgerClient(() => pool.connect(), 5000);
+      const result = await checkoutUploadLedgerClient(connectOwned, 5000);
       if (result.status !== "acquired") return result;
       try {
         if (closed || poisoned) throw Error("Provider unavailable");
@@ -111,11 +130,21 @@ function createProvider<Pin extends object>(
         return { status: "failed" as const };
       }
     },
-    /** Shutdown only; pool.end waits for active leases. No forced query release. */
-    async close() {
-      if (closed) return;
+    /** Permanent synchronous fence; every caller awaits the SAME settlement.
+     * Pool shutdown starts only after raw connects and leases finish. Never
+     * force-release active SQL or treat checkout timeout as reclamation.
+     */
+    close(): Promise<void> {
+      if (closing) return closing;
       closed = true;
-      await pool.end();
+      closing = Promise.resolve().then(async () => {
+        await Promise.all([...pending]);
+        // A throwing release leaves driver ownership unconfirmed. Do not claim
+        // shutdown or retry disposal; retain the failure for every close caller.
+        if (disposalFailed) throw Error("Upload ledger disposal unconfirmed");
+        await pool.end();
+      });
+      return closing;
     },
   });
 }

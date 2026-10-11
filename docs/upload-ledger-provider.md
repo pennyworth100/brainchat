@@ -33,8 +33,13 @@ seed, live connection, storage switch, deployment or listener change is included
   unhandled EventEmitter error. A lifetime client listener is needed because
   pg-pool removes its idle listener during checkout. Probe completion rechecks
   poisoned state before returning a lease.
-  Shutdown denies new work and calls pool end once; it does not force-release
+  Shutdown synchronously denies new work and retains one promise for every
+  close caller, including after failure. It tracks raw driver acquisition past
+  caller timeout and every acquired lease until its one disposal attempt.
+  Only after those settle does it call pool end once; it never force-releases
   pending queries. An already returned lease remains its caller's responsibility.
+  A throwing release poisons the provider and permanently rejects close as
+  unconfirmed, without retrying release or pretending the pool is shut down.
 
 ## Trust and limits (not optional activation gates)
 
@@ -56,7 +61,19 @@ The five-second helper deadline covers checkout, not the subsequent probe. The
 probe uses PostgreSQL statement timeout, **not a wall-clock/network bound**; a
 network stall can remain pending and must never cause premature lease return.
 The owned pool's connect timeout and limits supplement, but do not prove,
-reclamation of late/hung connections. Pool shutdown may wait for active leases.
+reclamation of late/hung connections. Shutdown remains pending for raw driver
+connects and active leases, even when an earlier checkout returned timeout.
+
+### 3.0.25 shutdown evidence
+
+Ten deterministic regressions cover both strict and legacy providers: blocked
+SQL, repeated close, late successful/failed connect after timeout, pool-end
+failure, and throwing late disposal. The real TLS fixture also holds an advisory
+lock on an independent PostgreSQL backend, observes the provider query blocked,
+calls close twice, releases the blocker, commits and finalizes the lease, then
+observes pool completion and backend departure. CI runs that fixture on PG16
+and PG18. This is provider lifetime evidence, not wiring of production
+provisioning, physical byte/inode authority or whole-server shutdown proof.
 
 A registered policy pin can be checked out more than once. It is not a one-shot
 grant, policy freshness proof, durable attempt, admission or filesystem authority.
