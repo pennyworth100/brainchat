@@ -1,5 +1,9 @@
 # Public upload activation gate — draft 3.0.11
 
+Historical baseline below. Candidate 3.0.12 replaces the header-omission
+downgrade described here with [server-owned policy](upload-no-downgrade.md).
+The separate physical authority and public activation gates still apply.
+
 Audited runtime source: a622bac9b4c0d53863447f15731064e0fd75656f.
 Baseline main: 99d5f0bd3fae431bd5f0eb08ac49bc604685932b.
 This change adds only evidence/tests, not runtime activation or physical authority.

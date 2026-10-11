@@ -36,9 +36,25 @@ export type ResumeSocketOwner = Readonly<{
 // Key by the actual server Socket object, NEVER socket.id, handshake or client ID.
 // Keep closed owners until the socket is collected: reattachment cannot reopen it.
 const owners = new WeakMap<Socket, { options: Options; owner: ResumeSocketOwner;
+  legacyUpload: (binding: ResumeBinding) => boolean;
+  requireStrictUpload: (binding: ResumeBinding) => boolean;
   subscribe: (release: () => void) => (() => void) | null }>();
 const capacity = new ResumeCapacity(100);
 const issuanceCapacity = new ResumeCapacity(100);
+
+// Server-owned policy, never inferred from HTTP header presence. Only the exact
+// authenticated normal-join binding can retain transitional legacy authority.
+export function permitsLegacyUpload(socket: Socket, owner: ResumeSocketOwner, binding: ResumeBinding): boolean {
+  const record = owners.get(socket);
+  return record?.owner === owner && record.legacyUpload(binding);
+}
+
+// Call only AFTER durable bearer authentication and exact membership validation.
+// Invalid credentials cannot poison another member's legacy compatibility.
+export function requireStrictUpload(socket: Socket, owner: ResumeSocketOwner, binding: ResumeBinding): boolean {
+  const record = owners.get(socket);
+  return record?.owner === owner && record.requireStrictUpload(binding);
+}
 
 // Server-object identity check; never accept a copied owner or a different socket.
 export function ownsResumeSocket(socket: Socket, owner: ResumeSocketOwner): boolean {
@@ -68,6 +84,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
   const incarnation = randomUUID();
   let mode: "join" | "resume" | undefined;
   let closed = false;
+  let strictUpload = false;
   let closing: Promise<void> | undefined;
   // Client-visible timeout is not completion of issuance/publication work.
   let joinSettlement: Promise<unknown> | undefined;
@@ -202,11 +219,20 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     return joinFlight = Promise.race([settled, timeout]);
   };
   const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, join, close });
-  owners.set(socket, { options, owner, subscribe: release => {
-    if (closed) return null;
-    releases.add(release);
-    return () => { releases.delete(release); };
-  } });
+  owners.set(socket, { options, owner,
+    legacyUpload: binding => !closed && !strictUpload && mode === "join" &&
+      joined === binding && socket.connected && bindings.isCurrent(binding),
+    requireStrictUpload: binding => {
+      if (closed || !socket.connected || binding.transportId !== incarnation ||
+          !bindings.isCurrent(binding)) return false;
+      strictUpload = true;
+      return true;
+    },
+    subscribe: release => {
+      if (closed) return null;
+      releases.add(release);
+      return () => { releases.delete(release); };
+    } });
   // Fence before Socket.IO removes rooms and emits its later disconnect event.
   socket.once("disconnecting", onDisconnect);
   if (!socket.connected) onDisconnect();

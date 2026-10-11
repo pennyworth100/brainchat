@@ -408,7 +408,7 @@ export async function main() {
 
   expressApp.post(
     "/api/upload",
-    trackedHttp(lifecycle, jsonBody, handlerStage(async (req, res, nxt) => {
+    trackedHttp(lifecycle, handlerStage(async (req, res, nxt) => {
       const rawRoomId = req.headers["x-room-id"];
       const socketId = req.headers["x-socket-id"];
       if (
@@ -436,11 +436,12 @@ export async function main() {
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
       try {
-        // Supplying either credential header selects strict authentication.
+        // Header omission cannot restore legacy authority to a strict/resumed owner.
         // Invalid/partial credentials MUST NOT fall back to socket-id authority.
         const sessionId = req.headers["x-resume-session-id"];
         const token = req.headers["x-resume-token"];
-        if (sessionId !== undefined || token !== undefined) {
+        if (sessionId !== undefined || token !== undefined ||
+            !resumeMembers.legacyUploadBindingFor(activeSocket, owner, roomId)) {
           const grant = await preflightResumeUpload(activeSocket, owner,
             resumeMembers, resumeStore, uploadAdmissions, { roomId, sessionId, token });
           if (!grant) return res.status(403).json({ error: "Upload credential rejected" });
@@ -463,7 +464,7 @@ export async function main() {
         // A room projection or a physically connected revoked socket is not authority.
         const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
         if (!identity || req.destroyed || res.destroyed ||
-            resumeMembers.bindingFor(activeSocket, owner, roomId) !== identity) {
+            resumeMembers.legacyUploadBindingFor(activeSocket, owner, roomId) !== identity) {
           return res.status(401).json({ error: "Join the room before uploading" });
         }
         const grant = uploadAdmissions.admit(identity);

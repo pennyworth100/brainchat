@@ -1,4 +1,45 @@
 import assert from "node:assert/strict";
+
+import { LegacyUploadAdmission } from "./legacy-upload-admission";
+import type { ResumeOperationGate } from "./resume-operation";
+
+test("resumed server-owned membership cannot acquire legacy upload authority", async t => {
+  const f = await syncFixture(t);
+  const gate = { run: async () => assert.fail("resumed owner reached legacy DB gate") } as unknown as ResumeOperationGate;
+  const admission = new LegacyUploadAdmission(f.members, gate);
+  assert.equal(await admission.authorize(f.socket, f.owner, "candy986"), null);
+  assert.equal(f.members.legacyUploadBindingFor(f.socket, { ...f.owner }, "candy986"), null);
+});
+
+test("normal join preserves legacy until authenticated strict transition; pending legacy is fenced", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members, issue: async () => issuedJoin() });
+  t.after(() => owner.close());
+  const joined = await owner.join(authenticatedJoin); assert.ok(joined);
+  const gate = deferred<void>();
+  const admission = new LegacyUploadAdmission(members, {
+    run: async () => { await gate.promise; return { authorized: true, value: true }; },
+  } as unknown as ResumeOperationGate);
+  const uploads = new ResumeUploadAdmissions(opts.bindings);
+  const preflight = (lookup: Parameters<typeof preflightResumeUpload>[3]["lookup"]) =>
+    preflightResumeUpload(socket, owner, members, { lookup }, uploads, request().credential);
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), joined.binding);
+  assert.equal(await preflight(async () => null), null);
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), joined.binding,
+    "untrusted credentials must not poison compatibility");
+  const pending = admission.authorize(socket, owner, "candy986");
+  const grant = await preflight(async () => identity()); assert.ok(grant);
+  uploads.release(grant);
+  gate.resolve();
+  assert.equal(await pending, null, "policy is rechecked after legacy DB settlement");
+  assert.equal(await admission.authorize(socket, owner, "candy986"), null,
+    "new wrapper/header omission cannot restore legacy authority");
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+  assert.equal(await owner.join(authenticatedJoin), joined, "join ACK retry does not reset strict policy");
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+});
+
 import { preflightResumeUpload } from "./resume-upload-preflight";
 import { ResumeUploadAdmissions } from "./resume-upload-admission";
 

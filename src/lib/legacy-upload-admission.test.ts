@@ -15,7 +15,7 @@ for (const mode of ["deadline", "clock-backwards", "nonfinite", "denied", "throw
     const socket = {} as Socket, second = {} as Socket, owner = {} as ResumeSocketOwner;
     const binding = Object.freeze({ roomId: "files123", username: "Alice" }) as ResumeBinding;
     let current = binding, now = 100;
-    const members = { bindingFor: () => current } as unknown as ResumeMemberships;
+    const members = { legacyUploadBindingFor: () => current } as unknown as ResumeMemberships;
     let settle!: () => void;
     const waiting = new Promise<void>(resolve => { settle = resolve; });
     let calls = 0;
