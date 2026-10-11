@@ -11,7 +11,7 @@ export type SessionMaintenanceReport = {
   completedRuns: number; failedRuns: number; sessions: number; receipts: number;
 };
 
-/** One bounded transaction per tick, with a full 1s idle gap AFTER settlement.
+/** One bounded transaction per tick, with a nominal 1s timer AFTER settlement.
  * Failures back off to 60s. No interval, overlap, immediate backlog drain or
  * invented cancellation. Counts are rows, never a physical byte/WAL bound.
  */
