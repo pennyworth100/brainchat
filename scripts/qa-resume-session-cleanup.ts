@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeSessionCleanup } from "../src/lib/resume-session-cleanup";
+import { ResumeSessionScheduler } from "../src/lib/resume-session-scheduler";
 
 async function main() {
   const connectionString = process.env.RESUME_TEST_DATABASE_URL;
@@ -14,6 +15,7 @@ async function main() {
   const pool = new Pool({ connectionString, options: "-c search_path=" + schema, max: 1 });
   const lock = await admin.connect();
   const owner = new ResumeSessionCleanup(pool);
+  const schedulers: ResumeSessionScheduler[] = [];
   let created = false, locked = false;
   try {
     await admin.query('CREATE SCHEMA "' + schema + '"'); created = true;
@@ -66,8 +68,16 @@ async function main() {
     await pool.query("CREATE FUNCTION slow_receipt_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.02); RETURN OLD; END $$");
     await pool.query("CREATE TRIGGER slow_receipt BEFORE DELETE ON resume_message_receipts FOR EACH ROW EXECUTE FUNCTION slow_receipt_delete()");
     const stoppingOwner = new ResumeSessionCleanup(pool);
-    const execution = stoppingOwner.runOnce();
-    const rejected = assert.rejects(execution, (error: unknown) => (error as { code: string }).code === "57014");
+    let cancellationCode: string | undefined;
+    const stoppingScheduler = new ResumeSessionScheduler({
+      runOnce: async () => {
+        try { return await stoppingOwner.runOnce(); }
+        catch (error) { cancellationCode = (error as {code: string}).code; throw error; }
+      },
+      stopAndSettle: () => stoppingOwner.stopAndSettle(),
+    });
+    schedulers.push(stoppingScheduler);
+    stoppingScheduler.start();
     const deadline = Date.now() + 5000;
     for (;;) {
       const activity = await admin.query("SELECT 1 FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%WITH batch AS MATERIALIZED%'");
@@ -76,20 +86,62 @@ async function main() {
       await new Promise(resolve => setTimeout(resolve, 5));
     }
     let settled = false;
-    const stopping = assert.rejects(stoppingOwner.stopAndSettle(), (error: unknown) => (error as { code: string }).code === "57014").then(() => { settled = true; });
+    const stopping = stoppingScheduler.stopAndSettle().then(report => {
+      assert.equal(report.failedRuns, 1);
+      assert.equal(report.completedRuns, 0);
+      settled = true;
+    });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(settled, false);
-    await rejected; await stopping;
+    await stopping;
+    assert.equal(cancellationCode, "57014");
     assert.equal(await count(slow.sessionId), 100);
     await pool.query("DROP TRIGGER slow_receipt ON resume_message_receipts");
     assert.deepEqual(await owner.runOnce(), { sessions: 1, receipts: 100 });
+    const paced = await store.issueAfterAuthenticatedJoin("candy986", "paced", 1);
+    assert.ok(paced);
+    await pool.query("UPDATE room_resume_sessions SET expires_at=now()-interval '1 second' WHERE id=$1", [paced.sessionId]);
+    await pool.query("INSERT INTO resume_message_receipts(session_id,client_message_id,payload_hash) SELECT $1,n::text,repeat('c',64) FROM generate_series(1,257) n", [paced.sessionId]);
+    const pacedOwner = new ResumeSessionCleanup(pool);
+    const batches: {start: number; end: number; receipts: number}[] = [];
+    const measuredStart = performance.now();
+    const pacedScheduler = new ResumeSessionScheduler({
+      runOnce: async () => {
+        const start = performance.now();
+        const result = await pacedOwner.runOnce();
+        batches.push({start, end: performance.now(), receipts: result.receipts});
+        return result;
+      },
+      stopAndSettle: () => pacedOwner.stopAndSettle(),
+    });
+    schedulers.push(pacedScheduler);
+    pacedScheduler.start();
+    while (pacedScheduler.snapshot().sessions < 1) {
+      assert.ok(performance.now() - measuredStart < 12_000, "paced backlog did not settle");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const measuredMs = performance.now() - measuredStart;
+    const pacedReport = await pacedScheduler.stopAndSettle();
+    assert.deepEqual(pacedReport, {completedRuns: 3, failedRuns: 0, sessions: 1, receipts: 257});
+    assert.deepEqual(batches.map(b => b.receipts), [100,100,57]);
+    for (let i = 1; i < batches.length; i++) {
+      assert.ok(batches[i].start - batches[i-1].end >= 990, "missing post-settlement idle gap");
+    }
+    assert.equal(await count(live.sessionId), 257);
+    console.log(JSON.stringify({result: "SESSION_SCHEDULER_PG_PASS",
+      pacedReport, elapsedMs: Math.round(measuredMs),
+      observedReceiptsPerSecond: 257000 / measuredMs,
+      gapsMs: batches.slice(1).map((b,i) => b.start - batches[i].end),
+      cancellationCode, failedRunsRetained: stoppingScheduler.snapshot().failedRuns,
+      scope: "local 257-receipt sample, not a sustained-load capacity guarantee"}));
     await owner.stopAndSettle();
     console.log(JSON.stringify({ result: "SESSION_CLEANUP_PG_PASS", receiptBatches: [100,100,57],
       liveReceiptsRetained: 257, revokedUnexpiredRetained: true, lockedSessionSkipped: true,
       receiptLockTimeoutRolledBack: true, statementTimeoutRolledBack: true, stopWaitedForCancellation: true,
-      scope: "private primitive; no scheduler, physical WAL bound or public activation" }));
+      scope: "primitive and paced scheduler; no physical WAL bound or live deployment" }));
   } finally {
     if (locked) await lock.query("ROLLBACK");
+    await Promise.allSettled(schedulers.map(s => s.stopAndSettle()));
     await owner.stopAndSettle().catch(() => {});
     lock.release(); await pool.end();
     if (created) await admin.query('DROP SCHEMA "' + schema + '" CASCADE');
