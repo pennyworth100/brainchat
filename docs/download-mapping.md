@@ -34,9 +34,8 @@ Synthetic root-policy values are fixture-only, NOT production physical authority
 ## Remaining activation gates
 
 Install a trusted committed-message lookup and exact root binding paired with the
-upload writer; integrate reader request lifetime with the server shutdown owner
-when a source is provisioned. Establish the real cumulative byte+inode contract,
+upload writer. Strict reader lifetime is now retained by the server shutdown owner
+(see download-drain.md, 3.0.23). Establish the real cumulative byte+inode contract,
 dedicated accounting-pool ownership and browser credentials/stable retries.
 Then audit the exact image, take fresh paired backups at a proven old-writer
 fence, deploy within Max's existing authorization and verify readiness/rollback.
-

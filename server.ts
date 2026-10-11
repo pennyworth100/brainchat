@@ -377,7 +377,7 @@ export async function main() {
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
   // Strict publication/root provisioning is deliberately absent: no fallback.
-  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, null));
+  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, null, lifecycle));
 
   // ── File uploads ──────────────────────────────────────────────────────────
   const storageSettlement = new UploadStorageSettlement();
