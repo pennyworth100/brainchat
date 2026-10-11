@@ -680,7 +680,9 @@ export async function main() {
         if (!current()) return false;
         const users = resumeMembers.presence(roomId).users.map(user => user.username);
         if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
-        if (!resumeMembers.send(binding, roomId, "room-snapshot", { history, users }) || !current()) return false;
+        if (!resumeMembers.send(binding, roomId, "room-snapshot", {
+          history, users, capabilities: { textOperationKeys: true },
+        }) || !current()) return false;
         publishedBinding = binding;
         resumeMembers.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
         if (!current()) return false;

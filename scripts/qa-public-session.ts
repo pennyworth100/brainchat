@@ -8,6 +8,7 @@ import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { uploadRoomFile } from "../src/lib/upload-client";
 import { hashResumeToken } from "../src/lib/resume-store";
+import { createTextSender } from "../src/lib/text-message-client";
 
 // Actual server.ts, real Socket.IO and disposable PostgreSQL. No live services.
 async function main() {
@@ -52,7 +53,9 @@ async function main() {
     const joined = event(a, "room-snapshot");
     const join = { ...created, username: "Alice", password: "test-only-password" };
     a.emit("join-room", join);
-    assert.deepEqual((await joined).users, ["Alice"]);
+    const initialSnapshot = await joined;
+    assert.deepEqual(initialSnapshot.users, ["Alice"]);
+    assert.equal(initialSnapshot.capabilities.textOperationKeys, true);
     const sessions = await db.query("SELECT id, generation, token_hash, username FROM room_resume_sessions WHERE room_id=$1", [created.roomId]);
     assert.equal(sessions.rowCount, 1); assert.equal(sessions.rows[0].generation, 1);
     const first = sessions.rows[0];
@@ -88,6 +91,37 @@ async function main() {
     await new Promise(r => setTimeout(r, 100));
     assert.equal(fanouts, 1);
     assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='keyed'")).rows[0].n, 1);
+    // The actual browser sender loses its first receipt AFTER the real server
+    // committed. A manual same-transport retry must reuse that durable row.
+    let dropReceipt = true, browserFanouts = 0;
+    b.on("chat-message", m => { if (m.message === "browser-uncertain") browserFanouts++; });
+    const browserWire = {
+      get id() { return a.id; }, get connected() { return a.connected; },
+      get volatile() { return this; }, timeout() { return this; },
+      async emitWithAck(name: string, payload: unknown) {
+        const receipt = await a.volatile.timeout(3000).emitWithAck(name, payload);
+        if (dropReceipt) { dropReceipt = false; throw Error("simulated lost browser receipt"); }
+        return receipt;
+      },
+    } as unknown as Socket;
+    const browserSession = {
+      sync: async () => {
+        const result = await a.timeout(3000).emitWithAck("sync-room", { roomId: created.roomId });
+        assert.ok(!result.error); return a.id!;
+      },
+      isReady: () => a.connected,
+      canRetryText: () => initialSnapshot.capabilities.textOperationKeys === true,
+    };
+    const browserSender = createTextSender();
+    await assert.rejects(browserSender.send(browserWire, browserSession, created.roomId, "browser-uncertain"), /lost browser receipt/);
+    const reconciled = await browserSender.send(browserWire, browserSession, created.roomId, "browser-uncertain");
+    assert.ok(reconciled.id);
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(browserFanouts, 1);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='browser-uncertain'")).rows[0].n, 1);
+    const intentionalRepeat = await browserSender.send(browserWire, browserSession, created.roomId, "browser-uncertain");
+    assert.notEqual(intentionalRepeat.id, reconciled.id);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='browser-uncertain'")).rows[0].n, 2);
     const imagePayload = { roomId: created.roomId, dataUrl: "data:image/png;base64,YQ==", clientMessageId: "wire-image-1" };
     let imageFanouts = 0; b.on("chat-image", () => imageFanouts++);
     const image = event(b, "chat-image");

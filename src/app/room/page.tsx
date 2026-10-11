@@ -17,6 +17,7 @@ import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionStat
 import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
+import { createTextSender } from "@/lib/text-message-client";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -368,6 +369,8 @@ function RoomInner() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  const textSenderRef = useRef<ReturnType<typeof createTextSender> | null>(null);
+  if (!textSenderRef.current) textSenderRef.current = createTextSender();
 
   // Timeline: mixed messages and system messages
   const [timeline, setTimeline] = useState<
@@ -606,14 +609,12 @@ function RoomInner() {
     const msg = msgInput.trim();
     const session = sessionRef.current;
     const socket = socketRef.current;
-    if (!msg || !username || !session || !socket || sendingRef.current) return;
+    if (!msg || !username || !roomId || !session || !socket || sendingRef.current) return;
     sendingRef.current = true;
     setSending(true);
     try {
-      await session.sync();
-      const result = await socket.timeout(10_000).emitWithAck("send-message", { roomId, message: msg });
-      if (result.error) throw new Error(result.error);
-      receiveMessages([result.message]);
+      const message = await textSenderRef.current!.send(socket, session, roomId, msg);
+      receiveMessages([message]);
       setMsgInput((current) => current === msgInput ? "" : current);
     } catch (err) {
       setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
