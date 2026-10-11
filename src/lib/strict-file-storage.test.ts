@@ -376,11 +376,11 @@ test("multipart " + mode + " never authorizes message dispatch or refunds retain
       async next() { if (once) return { done: true as const, value: undefined }; once = true; return { done: false as const, value: data }; },
       async return() {
         if (mode === "return-fails") throw Error("closure failed");
-        if (mode === "deadline-after-finish") await new Promise(r => setTimeout(r, 40));
+        if (mode === "deadline-after-finish") await new Promise(r => setTimeout(r, 1100));
         return { done: true as const, value: undefined };
       },
     }; } }, abort: async () => { aborts++; },
-  }, { ...framing, contentLength: data.length }, mode === "deadline-after-finish" ? 20 : undefined);
+  }, { ...framing, contentLength: data.length }, mode === "deadline-after-finish" ? 1000 : undefined);
   assert.equal(outcome.completed, false);
   if (!outcome.completed) assert.equal(outcome.commit, "not-dispatched");
   assert.equal(dispatches, 0); assert.equal(aborts, 1);
@@ -413,7 +413,7 @@ test("multipart composition waits for message outcome and never hands out second
 });
 
 for (const operation of ["write", "close"] as const)
-test("multipart deadline during pending file " + operation + " retains admission and awaits IO", async t => {
+test("multipart deadline during pending file " + operation + " retains admission and awaits IO", { timeout: 10000 }, async t => {
   const f = await fixture(t), p = physicalFixture(), originalOpen = fs.open;
   const storage = new StrictFileStorage(f.admissions, f.bridge, p.provider);
   let release!: () => void, enter!: () => void, aborted!: () => void;
@@ -435,11 +435,12 @@ test("multipart deadline during pending file " + operation + " retains admission
   async function* chunks() { yield wire; }
   let settled = false;
   const task = storage.stageMultipart(f.grant, "msg_1",
-    { chunks: chunks(), abort: async () => { aborted(); } }, framing, 100)
+    { chunks: chunks(), abort: async () => { aborted(); } }, framing, 1000)
     .finally(() => { settled = true; });
   // Attach rejection handler before waiting for the deadline.
   const rejected = assert.rejects(task, /deadline/);
-  await entered; await abortSeen;
+  await Promise.race([entered, task.then(() => { throw Error("settled before IO"); })]);
+  await abortSeen;
   assert.equal(settled, false); assert.equal(f.admissions.admit(f.binding), null);
   release(); await rejected;
   assert.ok(handles.every(h => h.fd === -1));
