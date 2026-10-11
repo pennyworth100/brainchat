@@ -10,6 +10,8 @@ import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
+import { ResumeSessionCleanup } from "./src/lib/resume-session-cleanup";
+import { ResumeSessionScheduler } from "./src/lib/resume-session-scheduler";
 import { installProcessShutdown } from "./src/lib/process-shutdown";
 import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
 import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
@@ -287,7 +289,15 @@ export async function main() {
   // One owner for the shared table, replacing four dependency-owned timers.
   // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
   const rateLimitCleanup = new RateLimitCleanup(pool);
-  const lifecycle = new ServerLifecycle(rateLimitCleanup, roomActivity);
+  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(pool));
+  const lifecycle = new ServerLifecycle({
+    stopAndSettle: async () => {
+      const [rateLimits, sessions] = await Promise.allSettled([
+        rateLimitCleanup.stopAndSettle(), sessionCleanup.stopAndSettle(),
+      ]);
+      return { rateLimits, sessions };
+    },
+  }, roomActivity);
 
   // Security headers
   expressApp.disable("x-powered-by");
@@ -863,6 +873,7 @@ export async function main() {
     server.listen(PORT, () => { server.off("error", reject); resolve(); });
   });
   console.log(`Dimle running on http://localhost:${PORT}`);
+  sessionCleanup.start();
   return { lifecycle, server, io, app };
 }
 
