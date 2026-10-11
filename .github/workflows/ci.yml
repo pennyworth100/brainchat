@@ -45,6 +45,10 @@ jobs:
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py
+      - name: Strict admission accounting lifecycle (owned PostgreSQL cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py --accounting
       - name: Real operation-gate socket loss (owned PostgreSQL cluster)
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin

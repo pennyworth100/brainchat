@@ -30,3 +30,24 @@ or supported isolated quota, root revalidation at actual storage entry, and the
 complete parser/storage/operation-receipt integration. The in-memory root match
 does not inspect the path or replace `openStrictUploadRoot`'s inode checks.
 All arithmetic tests use synthetic policy; no live policy is enabled or seeded.
+
+## Owned PostgreSQL verification
+
+Run `PG_BIN=/path/to/postgresql/bin python3 scripts/qa-upload-ledger-tls-fixture.py --accounting`
+with Node 24 on PATH. The existing runner creates and stops its own loopback-only
+TLS cluster; no live credentials or database URL are consumed.
+CI runs this focused target on PostgreSQL 16 and 18.
+
+The test applies migrations 0009 and 0010 only inside that disposable cluster,
+then exercises the real provider, least-privilege SQL role, transaction and
+admission coordinator. It checks exact operation/attempt provenance, copied
+grants/receipts, expiry during preparation, a real committed transaction whose
+acknowledgement is held past admission expiry, a lost acknowledgement after real
+COMMIT, and a PostgreSQL-aborted transaction returning the ROLLBACK command tag.
+Durable counters/attempts are independently read back after each case. Admission
+remains occupied and duplicate attempts are denied without further SQL.
+
+The root and physical-cost policy are explicitly synthetic test fixtures.
+Filesystem open/mkdir/writeFile traps stay untouched. No body-source API exists
+at this boundary. This is accounting integration evidence, not a physical quota,
+storage-entry inode revalidation, HTTP acceptance or production-readiness proof.

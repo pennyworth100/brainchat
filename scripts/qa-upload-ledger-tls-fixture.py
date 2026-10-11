@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import sys
 
 
 def run(argv, **kwargs):
@@ -19,6 +20,9 @@ def run(argv, **kwargs):
 
 
 def main():
+    if sys.argv[1:] not in ([], ["--accounting"]):
+        raise ValueError("Expected no argument or --accounting")
+    target = "scripts/qa-strict-upload-accounting.ts" if sys.argv[1:] else "scripts/qa-upload-ledger-provider.ts"
     pg = Path(os.environ["PG_BIN"]).resolve(strict=True)
     for binary in ("initdb", "pg_ctl"):
         assert (pg / binary).is_file(), binary
@@ -52,7 +56,7 @@ def main():
         run([str(pg / "pg_ctl"), "-D", str(data), "-l", str(fixture / "server.log"), "-w", "-t", "15", "start"])
         env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
         env["LEDGER_TLS_FIXTURE"] = str(fixture)
-        result = run(["node", "--import", "tsx", "scripts/qa-upload-ledger-provider.ts"],
+        result = run(["node", "--import", "tsx", target],
                      cwd=Path(__file__).resolve().parent.parent, env=env)
         report.update(json.loads(result.stdout))
     except subprocess.CalledProcessError as error:
