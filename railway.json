@@ -1,6 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
+    "startCommand": "node --import tsx server.ts",
     "healthcheckPath": "/",
     "healthcheckTimeout": 300
   }

@@ -10,6 +10,7 @@ import fs from "fs";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
+import { installProcessShutdown } from "./src/lib/process-shutdown";
 import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
 import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
 import { consumeJoinLimits } from "./src/lib/join-rate-limits";
@@ -865,7 +866,20 @@ export async function main() {
   return { lifecycle, server, io, app };
 }
 
-if (require.main === module) main().catch((err) => {
+if (require.main === module) main().then(runtime => {
+  installProcessShutdown(process, async () => {
+    const report = await runtime.lifecycle.stopAndSettle();
+    await new Promise<void>((resolve, reject) => runtime.io.close(error => error ? reject(error) : resolve()));
+    await runtime.app.close();
+    await pool.end();
+    return report;
+  }, (event, detail) => {
+    if (event === "failed") {
+      process.exitCode = 1;
+      console.error("Dimle shutdown failed; settlement unconfirmed", detail);
+    } else console.log("Dimle shutdown " + event, detail ?? "");
+  });
+}).catch((err) => {
   console.error("Failed to start:", err);
   process.exit(1);
 });
