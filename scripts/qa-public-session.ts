@@ -72,6 +72,35 @@ async function main() {
     assert.equal(history.history.length, 1);
     assert.ok(!JSON.stringify(packets).includes(first.token_hash));
     assert.ok(!JSON.stringify(packets).includes(first.id), "no public credential/session envelope yet");
+    // Real writer idempotency: one row/fanout; conflicting payload is not replayed.
+    let fanouts = 0; b.on("chat-message", () => fanouts++);
+    const keyed = { roomId: created.roomId, message: "keyed", clientMessageId: "wire-text-1" };
+    const firstSend = await a.timeout(3000).emitWithAck("send-message", keyed);
+    const repeat = await a.timeout(3000).emitWithAck("send-message", keyed);
+    assert.equal(repeat.message.id, firstSend.message.id);
+    const conflict = await a.timeout(3000).emitWithAck("send-message", { ...keyed, message: "conflict" });
+    assert.ok(conflict.error);
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(fanouts, 1);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='keyed'")).rows[0].n, 1);
+    const imagePayload = { roomId: created.roomId, dataUrl: "data:image/png;base64,YQ==", clientMessageId: "wire-image-1" };
+    let imageFanouts = 0; b.on("chat-image", () => imageFanouts++);
+    const image = event(b, "chat-image");
+    const imageSend = await a.timeout(3000).emitWithAck("send-image", imagePayload);
+    assert.equal((await image).id, imageSend.message.id);
+    assert.equal((await a.timeout(3000).emitWithAck("send-image", imagePayload)).message.id, imageSend.message.id);
+    assert.ok((await a.timeout(3000).emitWithAck("send-image", { ...imagePayload, clientMessageId: "wire-text-1" })).error);
+    assert.ok((await a.timeout(3000).emitWithAck("send-message", { ...keyed, roomId: "wrong123" })).error);
+    assert.ok((await bad.timeout(3000).emitWithAck("send-image", imagePayload)).error);
+    assert.ok((await a.timeout(3000).emitWithAck("send-message", null)).error);
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(imageFanouts, 1, "image retry never repeats peer publication");
+    assert.ok((await a.timeout(3000).emitWithAck("send-image", {
+      ...imagePayload, clientMessageId: "malformed-image", dataUrl: "data:image/png;base64,!"
+    })).error);
+    const legacyEcho = event(a, "chat-image");
+    a.emit("send-image", { roomId: created.roomId, dataUrl: imagePayload.dataUrl });
+    assert.equal((await legacyEcho).dataUrl, imagePayload.dataUrl);
     const left = event(b, "user-list"); a.disconnect();
     assert.deepEqual(await left, ["Bob"]);
     // Hold the actual history SELECT in PostgreSQL, then lose the physical
@@ -97,10 +126,39 @@ async function main() {
     }
     const afterLoss = await b.timeout(3000).emitWithAck("sync-room", { roomId: created.roomId });
     assert.deepEqual(afterLoss.users, ["Bob"], "late history cannot resurrect disconnected membership");
+    // Hold a real INSERT after authorization, then disconnect the writer.
+    const writer = await connect(); const writerJoined = event(writer, "room-snapshot");
+    writer.emit("join-room", { roomId: created.roomId, username: "Writer", password: join.password });
+    await writerJoined;
+    const writeLock = await db.connect();
+    try {
+      await writeLock.query("BEGIN");
+      await writeLock.query("LOCK TABLE messages IN SHARE MODE");
+      writer.emit("send-message", { roomId: created.roomId, message: "must-rollback", clientMessageId: "lost-write" });
+      let blocked = false;
+      for (let i = 0; i < 100; i++) {
+        const waiting = await db.query("SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'INSERT INTO messages%'");
+        if (waiting.rowCount) { blocked = true; break; }
+        await new Promise(r => setTimeout(r, 20));
+      }
+      assert.ok(blocked, "actual writer INSERT blocked on database lock");
+      assert.ok((await writer.timeout(3000).emitWithAck("send-message", {
+        roomId: created.roomId, message: "overlapping", clientMessageId: "overlap-text"
+      })).error);
+      assert.ok((await writer.timeout(3000).emitWithAck("send-image", imagePayload)).error);
+      const writerLeft = event(b, "user-list"); writer.disconnect(); await writerLeft;
+    } finally { await writeLock.query("ROLLBACK"); writeLock.release(); }
+    // Acquiring the same session lock proves the pending write settled.
+    await db.query("SELECT id FROM room_resume_sessions WHERE room_id=$1 AND username='Writer' FOR UPDATE", [created.roomId]);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE content='must-rollback'")).rows[0].n, 0);
     await db.query("UPDATE rooms SET auth_version=auth_version+1 WHERE id=$1", [created.roomId]);
+    const countBefore = (await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n;
+    assert.ok((await b.timeout(3000).emitWithAck("send-message", { roomId: created.roomId, message: "revoked" })).error);
+    assert.ok((await b.timeout(3000).emitWithAck("send-image", imagePayload)).error);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n, countBefore);
     const revoked = await b.timeout(3000).emitWithAck("sync-room", { roomId: created.roomId });
     assert.ok(revoked.error); assert.equal(revoked.history, undefined);
-    console.log("PUBLIC_SESSION_PASS: real authenticated join, one issuance/generation/snapshot on retry, wrong-password denial, no credential leak, two-user presence, legacy send compatibility, authorized sync, disconnect cleanup, blocked-history disconnect fencing, policy-change history denial");
+    console.log("PUBLIC_SESSION_PASS: real authenticated join, one issuance/generation/snapshot on retry, wrong-password denial, no credential leak, two-user presence, legacy send compatibility, authorized sync, disconnect cleanup, blocked-history disconnect fencing, policy-change history/text/image denial, text/image same-key retry and conflict, legacy image echo, actual blocked INSERT disconnect rollback");
   } finally {
     clients.forEach(s => s.disconnect());
     child.kill("SIGTERM");

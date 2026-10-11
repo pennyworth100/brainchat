@@ -1,6 +1,6 @@
 # Private text-message retry receipts (3.0.11 draft)
 
-No public handler uses this API. This is database idempotency, not exactly-once
+The normal-join text/image handlers now use this API through guarded send composition. This is database idempotency, not exactly-once
 network publication. Plain save remains explicitly non-idempotent; retrying
 callers must use saveOnce with the same key and exact payload.
 

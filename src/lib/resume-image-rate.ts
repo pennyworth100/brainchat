@@ -1,6 +1,6 @@
 import { MAX_RESUME_IMAGE_DATA_URL_LENGTH } from "./resume-image";
 
-// PRIVATE admission primitive, not yet wired to a public handler. Session IDs
+// Shared admission used by the normal-join image handler. Session IDs
 // come from the exact server-owned binding, never a request field. Process-local
 // budgets do not provide distributed/account/IP abuse protection.
 export class ResumeImageRate {

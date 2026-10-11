@@ -27,8 +27,8 @@ export type ResumeSendResult<M extends SendMessage = ResumeTextMessage> = { comm
 };
 type SendLimits = { capacity?: ResumeCapacity; timeoutMs?: number; onLateError?: (error: unknown) => void };
 
-// PRIVATE composition only; server owns every authority argument and the
-// request-local synchronous ACK callback. Public registration remains OFF.
+// Registered for normal authenticated joins by server.ts. The server owns all
+// authority arguments and the synchronous ACK. Public resume remains OFF.
 // Pre-COMMIT failures propagate (COMMIT may be uncertain); never auto-retry.
 // Post-COMMIT handoff failures are data, NOT permission to repeat publication.
 // This is not an outbox: crash/stale owner after COMMIT can lose fanout.

@@ -21,8 +21,9 @@ that same emit. True means handed off, not received or acknowledged. Errors thro
 do not blindly replay a partial broadcast. This is process-local, not a
 transactional DB policy check or a distributed fanout protocol.
 
-Still PRIVATE and unused by server.ts. Migrate ordinary joins, history, presence,
-all message/image/file/integration broadcasts and both DM paths coherently before
-enabling resume. Existing public room broadcasts remain unfenced by this seam.
-Presence semantics, rate limits, UI, complete acceptance and physical QA remain
-open. Loopback tests use stubbed persistence, not PostgreSQL.
+server.ts uses this boundary for normal joins, history, presence and guarded
+text/image sends. Agent/file/disconnect broadcasts and both DM paths still need
+migration before enabling public resume. Those legacy room broadcasts remain
+unfenced by this seam. UI reconciliation, complete acceptance and physical QA
+remain open. Unit fixtures use stubbed persistence; qa-public-session.ts now
+checks real server/PostgreSQL normal-join and text/image integration.

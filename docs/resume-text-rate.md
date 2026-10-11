@@ -19,8 +19,8 @@ dispatch or consume budget. An over-limit `committed:false` means no write by
 **this invocation**, never proof about a prior attempt with the same request ID.
 Keep original ID/content and reconcile uncertain writes; never automatically retry.
 
-This protects this private single-process composition only. New durable sessions,
+This protects the normal-join text composition in this process only. New durable sessions,
 process restart and separate replicas have separate budgets. It is NOT an IP or
 account abuse defense, durable/distributed quota, DB cancellation, or a storage
-retention bound. Public handlers remain unmodified; coherent migration and UI
-rate-denial behavior still need implementation before staging acceptance.
+retention bound. The public text handler uses this budget; coherent remaining-path migration and
+UI rate-denial behavior still need acceptance before rollout.

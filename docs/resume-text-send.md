@@ -1,4 +1,4 @@
-# Private protected text adapter (3.0.11 draft)
+# Protected normal-join text adapter (3.0.11 draft)
 
 `sendResumeText` composes the committed retry writer with exact physical owner,
 binding and membership checks before dispatch and after the awaited write.
@@ -37,6 +37,16 @@ Early errors still propagate and a COMMIT error must also be treated as uncertai
 A synchronous handoff started before deadline preserves its committed outcome;
 the deadline is rechecked before subsequent fanout. This is NOT DB cancellation.
 
-This remains PRIVATE and unregistered. Send rate controls,
-image/upload/integration broadcasts, DM guards, UI reconciliation and the full
-acceptance matrix must precede coherent public-handler migration. No deployment.
+server.ts now registers this composition for ordinary authenticated joins, with
+the shared durable writer, rate budget and membership registry. Optional explicit
+clientMessageId enables same-session receipt lookup. Missing keys get a server UUID
+for legacy ONE-attempt compatibility, not retry safety across reconnects. The ACK
+wrapper also sends an exact-owner legacy sender echo (a response, not peer fanout).
+Denial and unknown-outcome responses stay distinct; no automatic retry occurs.
+Post-COMMIT handoff errors are logged, never used to repeat publication.
+
+The actual server/PostgreSQL fixture covers same-key retry, conflicting/cross-type
+keys, wrong-room/anonymous denial, policy revocation and blocked INSERT followed
+by physical disconnect and rollback. Remaining: upload/integration fanout, DM,
+public resume credentials, UI reconciliation, expiry/receipt budgets and physical
+acceptance. This bounded integration is not release-ready or deployed.

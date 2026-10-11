@@ -31,8 +31,8 @@ export function canonicalResumeImage(dataUrl: unknown): string {
 
 type ImageRow = { id: number; room_id: string; username: string; type: string; content: string; ts: Date };
 
-// PRIVATE until image admission, attempt/byte quotas, deadline/capacity and
-// outbound fencing are composed. A persisted receipt is NOT delivery authority.
+// Public normal-join handler composes admission, quotas, deadline/capacity and
+// exact outbound fencing. A persisted receipt is NOT delivery authority.
 export class ResumeImageWriter {
   constructor(private readonly gate: ResumeOperationGate) {}
 

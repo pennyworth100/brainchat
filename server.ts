@@ -26,6 +26,9 @@ import { attachResumeSocket } from "./src/lib/resume-socket";
 import { ResumeOperationGate } from "./src/lib/resume-operation";
 import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
+import { ResumeMessageWriter } from "./src/lib/resume-message";
+import { ResumeImageWriter } from "./src/lib/resume-image";
+import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -50,7 +53,6 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_PASSWORD_LENGTH = 256;
 const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
-const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 
 class IdempotencyConflictError extends Error {}
 
@@ -240,7 +242,10 @@ async function main() {
   const resumeStore = new ResumeStore(pool);
   const resumeBindings = new ResumeBindings();
   const resumeMembers = new ResumeMemberships(resumeBindings);
-  const resumeHistory = new ResumeHistoryReader(new ResumeOperationGate(pool, resumeBindings));
+  const resumeGate = new ResumeOperationGate(pool, resumeBindings);
+  const resumeHistory = new ResumeHistoryReader(resumeGate);
+  const resumeText = new ResumeMessageWriter(resumeGate);
+  const resumeImage = new ResumeImageWriter(resumeGate);
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -558,7 +563,7 @@ async function main() {
         const current = () => live() && resumeMembers.isCurrent(binding, roomId);
         const history = await resumeHistory.read(binding);
         if (history === null || !current()) return false;
-        // Temporary compatibility projection for legacy send/upload/DM paths.
+        // Temporary compatibility projection for legacy upload/DM paths.
         // Never use this map to authenticate join/sync or to enable resume.
         currentRoom = roomId;
         getOrCreateOnlineRoom(roomId).set(socket.id, binding.username);
@@ -676,48 +681,54 @@ async function main() {
       }
     });
 
-    socket.on(
-      "send-message",
-      async ({ roomId, message }: { roomId: string; message: string }, ack) => {
+    // Existing normal-join clients use the same exact physical/session authority.
+    // Missing keys retain legacy one-attempt semantics; never auto-retry them.
+    // An explicit key permits a same-session receipt lookup, not replayed fanout.
+    for (const event of ["send-message", "send-image"] as const) {
+      socket.on(event, async (payload, ack) => {
         const reply = typeof ack === "function" ? ack : () => {};
-        if (!roomId || typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LENGTH) {
+        const roomId = payload?.roomId;
+        if (event === "send-message" && (!roomId || typeof payload?.message !== "string" ||
+            !payload.message.trim() || payload.message.length > MAX_MESSAGE_LENGTH)) {
           return reply({ error: "Invalid message" });
         }
-        const username = onlineUsers.get(roomId)?.get(socket.id);
-        if (!username || !socket.rooms.has(roomId)) return reply({ error: "Rejoin the room before sending" });
+        const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+        if (!binding) return reply({ error: "Rejoin the room before sending" });
+        const current = () => resumeMembers.isCurrent(binding, binding.roomId);
+        const request = { roomId, clientMessageId: payload?.clientMessageId === undefined
+          ? crypto.randomUUID() : payload.clientMessageId };
+        const handoff = (receipt: { clientMessageId: string; message: unknown }) => {
+          // Preserve legacy sender echo, including old image clients without ACK.
+          // Exact outbound lease rechecked independently from the ACK.
+          reply(receipt);
+          resumeMembers.send(binding, binding.roomId,
+            event === "send-message" ? "chat-message" : "chat-image", receipt.message);
+        };
         try {
-          const saved = await saveMessage(roomId, username, "message", message);
-          io.to(roomId).emit("chat-message", saved);
-          reply({ message: saved });
+          const result = event === "send-message"
+            ? await sendResumeText(socket, owner, binding, resumeMembers, resumeText,
+              { ...request, message: payload?.message }, handoff)
+            : await sendResumeImage(socket, owner, binding, resumeMembers, resumeImage,
+              { ...request, dataUrl: payload?.dataUrl }, handoff);
+          if (result.committed === true) {
+            // Best effort activity only, outside the gate's room SHARE lock.
+            if (result.inserted) touchRoom(binding.roomId).catch(() => {});
+            for (const failure of result.errors) console.error(event + " handoff " + failure.stage, failure.error);
+          } else if (current()) {
+            reply(result.committed === null
+              ? { error: "Write outcome unknown; sync before retrying", outcome: "unknown", clientMessageId: request.clientMessageId }
+              : { error: "Message denied or invalid" });
+          }
         } catch (err) {
-          console.error("send-message error:", err);
-          reply({ error: "Could not save the message" });
+          console.error(event + " error:", err);
+          // Even a COMMIT rejection can mean a committed row. Never claim rollback.
+          if (current()) reply({ error: "Write outcome unknown; sync before retrying",
+            outcome: "unknown", clientMessageId: request.clientMessageId });
         }
-      }
-    );
+      });
+    }
 
-    // Files are now saved and broadcast by POST /api/upload. The old
-    // v3.0.1 send-file notification is intentionally ignored to avoid doubles.
-
-    socket.on(
-      "send-image",
-      async ({ roomId, dataUrl }: { roomId: string; dataUrl: string }) => {
-        if (!roomId || !dataUrl) return;
-        if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return;
-        if (!/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(dataUrl)) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const username = users.get(socket.id);
-        if (!username) return;
-        try {
-          const content = JSON.stringify({ dataUrl });
-          const saved = await saveMessage(roomId, username, "image", content);
-          io.to(roomId).emit("chat-image", saved);
-        } catch (err) {
-          console.error("send-image error:", err);
-        }
-      }
-    );
+    // Files are saved by POST /api/upload; old send-file remains ignored.
 
     registerPrivateMessages(io, socket, onlineUsers);
 

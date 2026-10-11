@@ -1,6 +1,6 @@
-# Private resumable image send composition (3.0.11)
+# Normal-join image send composition (3.0.11)
 
-`sendResumeImage` is private; no public server handler is enabled by this change.
+`sendResumeImage` is registered for normal authenticated joins in server.ts.
 Text keeps its existing API and both types now use one generic send core.
 
 - Validate bounded primitive fields and the exact current server-owned physical
@@ -27,5 +27,5 @@ these composition tests; independent image writer tests and real-PostgreSQL CI
 remain the persistence proof, not an end-to-end public resume acceptance claim.
 
 Remaining: upload lifecycle, integration broadcasts, both DM authority guards,
-public handler migration, sessionStorage UI, snapshot/delta gap recovery and the
+remaining public handler migration, sessionStorage UI, snapshot/delta gap recovery and the
 full accepted physical-device contract. PR remains draft; no deployment.

@@ -29,6 +29,6 @@ Probe returns only `{ok:true}` from current local membership, even during a full
 read. It is NOT DB readiness, durable generation or policy validation. Full sync
 is not an atomic history/delta snapshot: policy can change after read COMMIT and
 messages can arrive between snapshot and network handoff. Coherent public-handler
-migration of send/upload/DM, public resume, gap reconciliation, per-client rate
+migration of upload/DM and remaining broadcasts, public resume, gap reconciliation, per-client rate
 controls and complete E2E remain open. The actual-server fixture covers this
-bounded normal-join/sync integration only.
+bounded normal-join/sync and guarded text/image integration, not public resume.

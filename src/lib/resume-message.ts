@@ -30,7 +30,7 @@ export async function insertResumeTextMessage(transaction: Pick<PoolClient, "que
   return { id: row.id, type: "message", username: row.username, message: row.content, ts: row.ts.getTime() };
 }
 
-// Deliberately unused by public handlers until admission/outbound fencing exists.
+// Used by public normal-join sends through sendResumeText admission/fencing.
 // One attempt only: an exception from COMMIT MAY mean the row committed. Never
 // blindly retry. Session-scoped durable idempotency is a separate required step;
 // do not reuse the agent (room, username, clientMessageId) identity namespace.

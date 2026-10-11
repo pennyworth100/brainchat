@@ -1,6 +1,6 @@
 # Private image persistence (3.0.11 draft)
 
-`ResumeImageWriter` is not wired to public handlers. It stores bounded inline
+`ResumeImageWriter` is wired to the guarded normal-join image handler. It stores bounded inline
 PNG/JPEG/GIF/WebP data URLs in the existing message schema, with database-owned
 ID/timestamp and the exact admitted binding's room/name. MIME is normalized;
 base64 must roundtrip exactly (padding, whitespace and invalid bytes fail closed).
@@ -20,7 +20,8 @@ Receipt success is not network delivery or authority to broadcast. No outbox or
 exactly-once fanout claim. No upload paths, URL fetch, filesystem side effects or
 file cleanup happen in this transaction.
 
-Still required before activation: image attempt/byte budgets and transport caps,
-deadline/in-flight capacity, current-owner outbound adapter and UI acknowledgment,
-coherent file-upload lifecycle and DM migration, snapshot/delta reconciliation,
-full acceptance/physical QA. This does not change the legacy public image handler.
+The public normal-join handler now composes image attempt/byte quotas, deadline,
+in-flight capacity and exact-owner outbound fencing. Legacy no-ACK callers receive
+a sender echo; explicit-key retries never rebroadcast to peers. Still required:
+transport-wide caps, coherent upload/DM migration, public resume/UI reconciliation,
+expiry/receipt storage bounds and full physical acceptance. PR remains draft.
