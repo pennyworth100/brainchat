@@ -64,11 +64,10 @@ export function bindStrictUploadRoot(
 export async function openStrictUploadRoot(
   binding: StrictUploadRootBinding, pin: StrictUploadResourcePolicyPin, limit: number,
 ): Promise<FileHandle> {
-  const bound = bindings.get(binding);
-  if (!bound || bound.pin !== pin || bound.limit !== limit ||
-      process.geteuid?.() !== bound.root.uid || process.getegid?.() !== bound.root.gid) {
+  if (!matchesStrictUploadRoot(binding, pin, limit)) {
     throw Error("Strict upload root denied");
   }
+  const bound = bindings.get(binding)!;
   const handle = await open(bound.root.path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
     const st = await handle.stat({ bigint: true });
@@ -83,4 +82,13 @@ export async function openStrictUploadRoot(
     await handle.close();
     throw error;
   }
+}
+
+/** In-memory identity check ONLY; no path observation or physical authority. */
+export function matchesStrictUploadRoot(
+  binding: StrictUploadRootBinding, pin: StrictUploadResourcePolicyPin, limit: number,
+): boolean {
+  const bound = bindings.get(binding);
+  return !!bound && bound.pin === pin && bound.limit === limit &&
+    process.geteuid?.() === bound.root.uid && process.getegid?.() === bound.root.gid;
 }
