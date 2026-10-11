@@ -39,6 +39,21 @@ not consume capacity; only a future atomic UPDATE + attempt INSERT can do that.
 
 ## Verification and remaining boundary
 
+### 2026-10-11: explicit strict-writer evaluator (same unreleased 3.0.11)
+
+`evaluateStrictUploadResourceDomain` accepts only the separate strict pin registry
+and exact `resume-strict-writer-v1` policy. The existing evaluator remains
+Multer-only. Both share the same canonical-domain arithmetic and retain all
+prior liabilities; neither dispatches based on the row's adapter tag. Tests run
+the full domain matrix for both adapters and exercise the allocation-unit edge
+where strict L fits but Multer L+1 does not, plus equal-cost cross-adapter denial.
+
+This is an inert prerequisite, not completed provider/SQL integration. The
+provider, transaction context and fixed SQL callback still accept only Multer
+pins. No physical bound, seed, storage grant, runtime wiring or deployment is
+introduced. Next: explicit provider/transaction/SQL strict path, then real PG
+and uncertain-COMMIT verification before composing a parser or filesystem writer.
+
 Unit tests cover exact capacity edges, either-dimension exhaustion, every numeric
 field's invalid encoding, safe-integer arithmetic, domain/policy/audit mismatch,
 accessors, generation liability retention, shared namespaces and owned snapshots.

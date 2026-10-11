@@ -2,7 +2,7 @@
  * Caller must hold the canonical domain lock and supply exactly one current row.
  * See docs/upload-resource-domain.md. Not a hostile-JavaScript sandbox.
  */
-import { recheckUploadResourcePolicy } from "./upload-resource-policy-pin";
+import { recheckUploadResourcePolicy, recheckStrictUploadResourcePolicy } from "./upload-resource-policy-pin";
 import type { UploadResourceQuote } from "./upload-resource-quote";
 
 export type UploadResourceDomainEvaluation = Readonly<{
@@ -42,8 +42,23 @@ function exact(value: unknown): bigint | null {
 export function evaluateUploadResourceDomain(
   pin: unknown, lockedPolicy: unknown, lockedDomain: unknown, expectedAuditId: unknown,
 ): UploadResourceDomainEvaluation | null {
+  return evaluateRecheckedDomain(recheckUploadResourcePolicy(pin, lockedPolicy), lockedDomain, expectedAuditId);
+}
+
+/** Explicit strict-writer entry point. Never reinterpret a Multer pin or infer
+ * an adapter from untrusted row data. Same canonical lock/audit contract applies.
+ */
+export function evaluateStrictUploadResourceDomain(
+  pin: unknown, lockedPolicy: unknown, lockedDomain: unknown, expectedAuditId: unknown,
+): UploadResourceDomainEvaluation | null {
+  return evaluateRecheckedDomain(recheckStrictUploadResourcePolicy(pin, lockedPolicy), lockedDomain, expectedAuditId);
+}
+
+function evaluateRecheckedDomain(
+  policy: Readonly<{ quote: UploadResourceQuote }> | null,
+  lockedDomain: unknown, expectedAuditId: unknown,
+): UploadResourceDomainEvaluation | null {
   if (!text(expectedAuditId)) return null;
-  const policy = recheckUploadResourcePolicy(pin, lockedPolicy);
   const domain = row(lockedDomain);
   if (!policy || !domain || field(domain, "active") !== true ||
       field(domain, "audit_id") !== expectedAuditId) return null;

@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateUploadResourceDomain as evaluate } from "./upload-resource-domain";
-import { pinUploadResourcePolicy } from "./upload-resource-policy-pin";
+import { evaluateUploadResourceDomain, evaluateStrictUploadResourceDomain } from "./upload-resource-domain";
+import { pinUploadResourcePolicy as pinMulter, pinStrictUploadResourcePolicy as pinStrict } from "./upload-resource-policy-pin";
+
+for (const [adapter, evaluate, pinUploadResourcePolicy] of [
+  ["multer-crossing-byte-v1", evaluateUploadResourceDomain, pinMulter],
+  ["resume-strict-writer-v1", evaluateStrictUploadResourceDomain, pinStrict],
+] as const) {
 
 const identity = () => ({ database: '["owned-cluster","postgres"]', schema: "public",
   namespace: "a", quotaDomain: "shared-volume", policyVersion: "v1", writerGeneration: "g1" });
-const policy = () => ({ identity: identity(), adapter: "multer-crossing-byte-v1",
+const policy = () => ({ identity: identity(), adapter,
   layout: "provisioned-root-one-directory-one-file-v1", allocationModel: "audited-rounded-copies-v1",
   stableExclusiveNamespace: true, allAllocationCostsBounded: true, maxFileBytes: 6,
   allocationUnitBytes: 4, allocationCopies: 1, directoryAndParentBytes: 10,
@@ -148,3 +153,27 @@ test("result owns its snapshot, while repeated evaluation neither charges nor gr
   assert.equal(first.quote.identity.namespace, "a");
   assert.equal(first.quote.kind, "upload-resource-quote-only");
 });
+
+test(adapter + ": exact allocation boundary preserves L versus L+1", () => {
+  const p = policy(), d = domain(); p.maxFileBytes = 4;
+  const pin = pinUploadResourcePolicy(p, p.identity)!;
+  d.capacity_bytes = "96"; // 10 headroom + 9 baseline + 40 outstanding + 37 strict cost
+  const result = evaluate(pin, p, d, "cut-1");
+  if (adapter === "resume-strict-writer-v1") {
+    assert.equal(result!.quote.allocatedBytes, 37);
+    assert.equal(result!.outstandingBytesAfter, "77");
+    d.capacity_bytes = "95"; assert.equal(evaluate(pin, p, d, "cut-1"), null);
+  } else assert.equal(result, null); // Multer crossing byte requires the next allocation unit
+});
+
+test(adapter + ": cross-adapter pins and policy substitutions deny even with equal cost", () => {
+  const f = fixture(); // L=6: both adapters round to 8 file bytes
+  const other = adapter === "resume-strict-writer-v1"
+    ? evaluateUploadResourceDomain : evaluateStrictUploadResourceDomain;
+  assert.equal(other(f.pin, f.p, f.d, "cut-1"), null);
+  const swapped = { ...f.p, adapter: adapter === "resume-strict-writer-v1"
+    ? "multer-crossing-byte-v1" : "resume-strict-writer-v1" };
+  assert.equal(evaluate(f.pin, swapped, f.d, "cut-1"), null);
+  assert.equal(other(f.pin, swapped, f.d, "cut-1"), null);
+});
+}
