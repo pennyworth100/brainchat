@@ -13,7 +13,7 @@ import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
 import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
 import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
 import { consumeJoinLimits } from "./src/lib/join-rate-limits";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { migrateDatabase } from "./src/lib/db/startup-migrations";
 import { db, pool } from "./src/lib/db";
 import {
   authenticateAgent,
@@ -64,8 +64,6 @@ const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
 
 class IdempotencyConflictError extends Error {}
-
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 function getSocketClientIp(
   socket: Socket,
@@ -228,7 +226,9 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 export async function main() {
   // Run migrations
   console.log("Running database migrations...");
-  await migrate(db, { migrationsFolder: "./drizzle" });
+  await migrateDatabase(pool);
+  // No upload namespace mutation during module import or failed migrations.
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   console.log("Migrations complete.");
 
   const app = next({ dev });

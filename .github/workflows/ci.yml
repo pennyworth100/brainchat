@@ -123,6 +123,15 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-public-session-fixture.py
 
+      - name: Concurrent startup migrations and SIGKILL lock release (owned PostgreSQL)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 scripts/qa-public-session-fixture.py --startup
+          KILL_STARTUP_LEADER=1 python3 scripts/qa-public-session-fixture.py --startup
+          CLI_STARTUP_FOLLOWER=1 python3 scripts/qa-public-session-fixture.py --startup
+          READONLY_STARTUP=1 python3 scripts/qa-public-session-fixture.py --startup
+
       - name: Actual concurrent HTTP/upload/socket producer drain (owned PostgreSQL cluster)
         env:
           PG_BIN: /usr/lib/postgresql/16/bin

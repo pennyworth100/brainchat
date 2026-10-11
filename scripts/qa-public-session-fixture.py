@@ -41,7 +41,10 @@ try:
          "--auth-host=trust", "--encoding=UTF8", "--locale=C"]).check_returncode()
     run([pg / "pg_ctl", "-D", data, "-l", owned / "server.log", "-o",
          f"-h 127.0.0.1 -p {port} -k {sock}", "-w", "start"]).check_returncode()
-    test = run(["node", "--import", "tsx", "scripts/qa-server-lifecycle.ts" if "--lifecycle" in sys.argv else "scripts/qa-public-session.ts"], timeout=60)
+    script = ("scripts/qa-startup-migrations.ts" if "--startup" in sys.argv else
+              "scripts/qa-server-lifecycle.ts" if "--lifecycle" in sys.argv else
+              "scripts/qa-public-session.ts")
+    test = run(["node", "--import", "tsx", script], timeout=60)
     print(test.stdout, end="")
     print(test.stderr, end="")
     test.check_returncode()
