@@ -23,6 +23,11 @@ export interface StrictStoragePhysicalAuthority {
   authorize(request: StrictStorageRequest): Promise<object | null>;
   isCurrent(receipt: object, request: StrictStorageRequest): boolean;
 }
+export type StrictStorageSession = Readonly<{ kind: "strict-storage-session" }>;
+type SessionRecord = Readonly<{
+  grant: ResumeUploadGrant; accounting: StrictUploadAccountingReceipt;
+  request: StrictStorageRequest; physical: object;
+}>;
 const attempted = new WeakSet<ResumeUploadGrant>();
 
 /** PRIVATE strict sink. No runtime registration, parser, release, deletion,
@@ -31,6 +36,8 @@ const attempted = new WeakSet<ResumeUploadGrant>();
  */
 export class StrictFileStorage {
   private readonly physical;
+  private readonly sessions = new WeakMap<StrictStorageSession, SessionRecord>();
+  private readonly consumed = new WeakSet<StrictStorageSession>();
   private readonly receipts = new WeakMap<ResumeStagedFile, Readonly<{
     grant: ResumeUploadGrant; accounting: StrictUploadAccountingReceipt;
     request: StrictStorageRequest; physical: object;
@@ -50,14 +57,14 @@ export class StrictFileStorage {
       this.physical?.isCurrent(r.physical, r.request) ? result.file : null;
   }
 
-  async stage(grant: ResumeUploadGrant,
-    metadata: Readonly<{ name: string; mime: string; clientMessageId: string }>,
-    source: AsyncIterable<Uint8Array>): Promise<ResumeStagedFile> {
+  /** No metadata, body or filesystem access. Call BEFORE starting a parser.
+   * The receipt binds the exact grant, client key, operation/attempt, root, pin
+   * and limit. It is not a staged-file receipt and cannot authorize DB dispatch.
+   */
+  async authorize(grant: ResumeUploadGrant, clientMessageId: string): Promise<StrictStorageSession> {
     const physical = this.physical;
     if (!physical || !this.admissions.isCurrent(grant) || attempted.has(grant)) throw Error("Strict storage denied");
-    const initial = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
-      storageKey: "0".repeat(64), size: 0, sha256: "0".repeat(64) });
-    const key = metadata.clientMessageId;
+    const key = clientMessageId;
     if (typeof key !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(key)) throw Error("Invalid strict upload identity");
     attempted.add(grant); // synchronous, shared across storage coordinators
     const reserved = await this.accounting.reserve(grant, key);
@@ -73,8 +80,46 @@ export class StrictFileStorage {
     ])).digest("hex");
     const request: StrictStorageRequest = Object.freeze({ ...record, storageKey });
     const permit = await physical.authorize(request);
-    const current = () => !!permit && this.accounting.resolve(grant, accountingReceipt) === record &&
-      physical.isCurrent(permit, request);
+    if (!permit || this.accounting.resolve(grant, accountingReceipt) !== record ||
+        !physical.isCurrent(permit, request)) throw Error("Strict physical storage denied");
+    const session = Object.freeze({ kind: "strict-storage-session" as const });
+    this.sessions.set(session, Object.freeze({ grant, accounting: accountingReceipt, request, physical: permit }));
+    return session;
+  }
+
+  /** Recheck before parser entry; staging performs its own IO rechecks. No copied/cross-owner
+   * session, expired grant or consumed session is reusable authority.
+   */
+  isAuthorized(grant: ResumeUploadGrant, session: StrictStorageSession): boolean {
+    const r = this.sessions.get(session);
+    return !!r && r.grant === grant && !this.consumed.has(session) &&
+      !!this.accounting.resolve(grant, r.accounting) &&
+      !!this.physical?.isCurrent(r.physical, r.request);
+  }
+
+  async stage(grant: ResumeUploadGrant,
+    metadata: Readonly<{ name: string; mime: string; clientMessageId: string }>,
+    source: AsyncIterable<Uint8Array>): Promise<ResumeStagedFile> {
+    if (!this.physical || !this.admissions.isCurrent(grant) || attempted.has(grant)) throw Error("Strict storage denied");
+    // Keep legacy private callers' synchronous snapshot/validation semantics.
+    const captured = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
+      storageKey: "0".repeat(64), size: 0, sha256: "0".repeat(64) });
+    const session = await this.authorize(grant, metadata.clientMessageId);
+    return this.stageAuthorized(grant, session, captured, source);
+  }
+
+  async stageAuthorized(grant: ResumeUploadGrant, session: StrictStorageSession,
+    metadata: Readonly<{ name: string; mime: string }>,
+    source: AsyncIterable<Uint8Array>): Promise<ResumeStagedFile> {
+    if (!this.isAuthorized(grant, session)) throw Error("Strict storage session denied");
+    this.consumed.add(session); // synchronous single use, including invalid metadata
+    const r = this.sessions.get(session)!;
+    const { request: record, accounting: accountingReceipt, physical: permit } = r;
+    const request = record, storageKey = record.storageKey;
+    const initial = canonicalResumeFile({ name: metadata.name, mime: metadata.mime,
+      storageKey: "0".repeat(64), size: 0, sha256: "0".repeat(64) });
+    const current = () => !!this.accounting.resolve(grant, accountingReceipt) &&
+      !!this.physical?.isCurrent(permit, request);
     const check = () => { if (!current()) throw Error("Strict physical storage denied"); };
     check(); // No body/filesystem access before both distinct authorities.
     const rootPath = strictUploadRootPath(record.root, record.pin, record.limit);
