@@ -11,6 +11,98 @@ import { promisify } from "node:util";
 import { createUploadDownloadRouter, type StrictDownloadSource } from "./upload-download";
 import { bindStrictUploadRoot } from "./upload-storage-root";
 import { pinStrictUploadResourcePolicy } from "./upload-resource-policy-pin";
+import { ServerLifecycle } from "./server-lifecycle";
+
+test("shutdown retains a live descriptor stream until its final bytes settle", { timeout: 5000 }, async t => {
+  const f = await fixture(t), original = fs.open;
+  const reading = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const h = await original(...args);
+    const create = h.createReadStream.bind(h);
+    t.mock.method(h, "createReadStream", (...options: Parameters<typeof create>) => {
+      const stream = create(...options), read = stream._read.bind(stream);
+      stream._read = size => { reading.resolve(); void release.promise.then(() => read(size)); };
+      return stream;
+    });
+    return h;
+  });
+  const response = f.request("/" + key + "/blob");
+  await reading.promise;
+  let stopped = false;
+  const stop = f.lifecycle.stopAndSettle().then(() => { stopped = true; });
+  await new Promise<void>(r => setImmediate(r));
+  assert.equal(stopped, false);
+  assert.equal(f.lifecycle.activeHandlers, 1);
+  release.resolve();
+  assert.equal((await response).body, "abc");
+  await stop;
+  assert.equal(f.lifecycle.activeHandlers, 0);
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => { resolve = r; });
+  return { promise, resolve };
+}
+test("shutdown waits publication lookup and rejects new requests without lookup", { timeout: 5000 }, async t => {
+  const entered = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  const f = await fixture(t, true, source => ({ ...source,
+    async publishedFile(k) { entered.resolve(); await release.promise; return source.publishedFile(k); },
+  }));
+  const request = f.request("/" + key + "/blob");
+  await entered.promise;
+  let stopped = false;
+  const stop = f.lifecycle.stopAndSettle().then(() => { stopped = true; });
+  await new Promise<void>(r => setImmediate(r));
+  assert.equal(stopped, false);
+  assert.equal(f.lifecycle.activeHandlers, 1);
+  assert.equal((await f.request("/" + key + "/blob")).status, 503);
+  assert.equal(f.lookups(), 0);
+  release.resolve();
+  assert.equal((await request).body, "abc");
+  await stop;
+  assert.equal(f.lifecycle.activeHandlers, 0);
+});
+test("response completion cannot release pending descriptor closes during shutdown", { timeout: 5000 }, async t => {
+  const f = await fixture(t), original = fs.open;
+  const closeEntered = deferred(), releaseClose = deferred();
+  t.after(() => releaseClose.resolve());
+  let opened = 0;
+  const closed = new Set<Awaited<ReturnType<typeof fs.open>>>();
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const h = await original(...args), close = h.close.bind(h); opened++;
+    t.mock.method(h, "close", async () => {
+      // Delay the first root handle, which closes only in the finalizer.
+      if (h === firstRoot) { closeEntered.resolve(); await releaseClose.promise; }
+      await close(); closed.add(h);
+    });
+    if (!firstRoot) firstRoot = h;
+    return h;
+  });
+  let firstRoot: Awaited<ReturnType<typeof fs.open>> | undefined;
+  assert.equal((await f.request("/" + key + "/blob")).status, 200);
+  await closeEntered.promise;
+  let stopped = false;
+  const stop = f.lifecycle.stopAndSettle().then(() => { stopped = true; });
+  await new Promise<void>(r => setImmediate(r));
+  assert.equal(stopped, false);
+  assert.equal(f.lifecycle.activeHandlers, 1);
+  releaseClose.resolve();
+  await stop;
+  assert.equal(closed.size, opened);
+});
+test("failed publication settles after closing its root; stopped server denies legacy too", async t => {
+  const f = await fixture(t, true, source => ({ ...source,
+    async publishedFile() { throw Error("lost DB connection"); },
+  }));
+  assert.equal((await f.request("/" + key + "/blob")).status, 404);
+  const report = await f.lifecycle.stopAndSettle();
+  assert.equal(f.lifecycle.activeHandlers, 0);
+  assert.equal((await f.request("/" + old + "/report..pdf")).status, 503);
+  assert.equal((report as { handlerFailures: number }).handlerFailures, 0);
+});
 
 const key = "a".repeat(64), old = "b".repeat(16);
 async function fixture(t: TestContext, enabled = true,
@@ -43,7 +135,8 @@ async function fixture(t: TestContext, enabled = true,
   const source: StrictDownloadSource = { root, pin, limit: 10,
     async publishedFile() { lookups++; return visible ? metadata : null; } };
   const app = express();
-  app.use("/uploads", createUploadDownloadRouter(parent, enabled ? configure(source) : null));
+  const lifecycle = new ServerLifecycle({ async stopAndSettle() {} }, { async settle() {} });
+  app.use("/uploads", createUploadDownloadRouter(parent, enabled ? configure(source) : null, lifecycle));
   const server = http.createServer(app);
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   t.after(async () => {
@@ -60,7 +153,7 @@ async function fixture(t: TestContext, enabled = true,
       req.on("error", reject); req.end();
     });
   }
-  return { parent, rootPath, metadata, source, request, lookups: () => lookups,
+  return { parent, rootPath, metadata, source, request, lifecycle, lookups: () => lookups,
     hide: () => { visible = false; } };
 }
 test("strict GET and HEAD map only exact bound root, never legacy collision", async t => {
