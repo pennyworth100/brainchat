@@ -1,5 +1,10 @@
 # Shared server producer settlement (3.0.11 candidate)
 
+3.0.14 update: the CLI now connects initialized-process SIGTERM to this drain.
+See [process shutdown](process-shutdown.md). The historical composition and
+multi-producer proof below remain valid; the former absence of a signal hook
+is superseded only for a successfully initialized candidate CLI process.
+
 `main()` now returns the actual server's private `lifecycle`. This is not a
 public HTTP control endpoint and installs no SIGTERM hook. CLI startup remains
 unchanged; import does not automatically listen. The owned acceptance fixture
