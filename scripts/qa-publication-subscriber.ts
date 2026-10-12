@@ -131,6 +131,66 @@ async function snapshotCut() {
     await db.query("DELETE FROM rooms WHERE id='snap123'");
   }
 }
+async function durableCutSettlement() {
+  await db.query("INSERT INTO rooms(id) VALUES ('cut123'),('empty123')");
+  const full = await fixture("cut123"), emptyOwner = await fixture("empty123");
+  const empty = await journal.snapshot(full.binding); assert.ok(empty);
+  const ackOf = (cut: PublicationSnapshot) => ({deliveryTry:cut.deliveryTry,ids:cut.messages.map(row=>row.id)});
+  // A real message commits AFTER an empty cut, before its ACK. Settling that cut
+  // must not consume the later message or imply that reconciliation is drained.
+  const late = await writer.save(full.binding,"after empty cut"); assert.ok(late.authorized);
+  full.client.on("settlement-cut", (cut: PublicationSnapshot, ack: (reply:unknown)=>void) => ack(ackOf(cut)));
+  const emptyReply = await full.socket.timeout(4000).emitWithAck("settlement-cut",empty);
+  check(await journal.acknowledgeSnapshot(full.binding,empty,emptyReply));
+  check(await journal.acknowledgeSnapshot(full.binding,empty,emptyReply)); // lost confirmation retry
+  const pending = await journal.claim(full.binding); assert.ok(pending);
+  check(pending.messages.length === 1 && pending.messages[0].id === late.value.id);
+  check((await writer.save(full.binding,"second cut row")).authorized);
+  const cut = await journal.snapshot(full.binding); assert.ok(cut);
+  check(cut.messages.length === 2 && cut.deliveryTry !== empty.deliveryTry);
+  await assert.rejects(journal.acknowledgeSnapshot(full.binding,empty,emptyReply),/snapshot ACK lease lost/); checks++;
+  check(!await journal.acknowledgeSnapshot({...full.binding},cut,ackOf(cut)));
+  check(!await journal.acknowledgeSnapshot(emptyOwner.binding,cut,ackOf(cut)));
+  check(!await journal.acknowledgeSnapshot(full.binding,cut,{deliveryTry:cut.deliveryTry,ids:[]}));
+  // A caller forging BOTH batch and reply cannot redefine the persisted set.
+  const subset = {...cut,messages:cut.messages.slice(0,1)};
+  await assert.rejects(journal.acknowledgeSnapshot(full.binding,subset,ackOf(subset)),/snapshot ACK lease lost/); checks++;
+  check((await db.query("SELECT acked FROM publication_snapshot_attempts WHERE session_id=$1",[full.binding.sessionId])).rows[0].acked === false);
+  await db.query("UPDATE publication_deliveries SET lease_until=clock_timestamp()-interval '1 second' WHERE session_id=$1 AND message_id=$2",[full.binding.sessionId,cut.messages[1].id]);
+  await assert.rejects(journal.acknowledgeSnapshot(full.binding,cut,ackOf(cut)),/snapshot ACK receipt lost/); checks++;
+  // The attempted marker ACK must roll back when any row receipt cannot settle.
+  check((await db.query("SELECT acked FROM publication_snapshot_attempts WHERE session_id=$1",[full.binding.sessionId])).rows[0].acked === false);
+  check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND acked",[full.binding.sessionId])).rows[0].n === 0);
+  const refreshed = await journal.snapshot(full.binding); assert.ok(refreshed);
+  await db.query("UPDATE publication_snapshot_attempts SET lease_until=clock_timestamp()-interval '1 second' WHERE session_id=$1",[full.binding.sessionId]);
+  await assert.rejects(journal.acknowledgeSnapshot(full.binding,refreshed,ackOf(refreshed)),/snapshot ACK lease lost/); checks++;
+  check((await db.query("SELECT acked FROM publication_deliveries WHERE session_id=$1",[full.binding.sessionId])).rows[0].acked === false);
+  const finalCut = await journal.snapshot(full.binding); assert.ok(finalCut);
+  const reply = await full.socket.timeout(4000).emitWithAck("settlement-cut",finalCut);
+  await db.query("UPDATE rooms SET auth_version=2 WHERE id='cut123'");
+  check(!await journal.acknowledgeSnapshot(full.binding,finalCut,reply));
+  await db.query("UPDATE rooms SET auth_version=1 WHERE id='cut123'");
+  const mutable = {...finalCut};
+  const settling = journal.acknowledgeSnapshot(full.binding,mutable,reply);
+  mutable.deliveryTry = "00000000-0000-4000-8000-000000000000";
+  mutable.messages = []; // caller changes cannot retarget an in-flight settlement
+  check(await settling);
+  check(await journal.acknowledgeSnapshot(full.binding,finalCut,reply));
+  const finalEmpty = await journal.snapshot(emptyOwner.binding); assert.ok(finalEmpty);
+  emptyOwner.client.on("settlement-cut", (cut: PublicationSnapshot, ack: (reply:unknown)=>void) => ack(ackOf(cut)));
+  const finalEmptyReply = await emptyOwner.socket.timeout(4000).emitWithAck("settlement-cut",finalEmpty);
+  check(await journal.acknowledgeSnapshot(emptyOwner.binding,finalEmpty,finalEmptyReply));
+  await db.query("INSERT INTO fixture_snapshot_recovery VALUES ($1),($2)",[
+    JSON.stringify({sessionId:full.binding.sessionId,deliveryTry:finalCut.deliveryTry,ids:ackOf(finalCut).ids}),
+    JSON.stringify({sessionId:emptyOwner.binding.sessionId,deliveryTry:finalEmpty.deliveryTry,ids:[]})]);
+  await full.owner.close(); full.client.disconnect();
+  check(!await journal.acknowledgeSnapshot(full.binding,finalCut,reply));
+  await emptyOwner.owner.close(); emptyOwner.client.disconnect();
+  console.log(JSON.stringify({phase:"durable-cut-settlement",fullRows:2,emptyRows:0,
+    physicalACK:true,confirmationRetry:true,lateCommitRetained:true,subsetRejected:true,
+    receiptFailureRollsBackMarker:true,leaseAndAuthorityFenced:true,
+    scope:"private SQL settlement only; no request-bound confirmation, controller READY or public activation"}));
+}
 async function seed() {
   await admin.query("CREATE SCHEMA subscriber_qa");
   for (const name of ["0000_thin_stardust","0003_spotty_zombie","0004_long_nighthawk","0005_free_blazing_skull","0006_cold_zuras"]) {
@@ -141,7 +201,9 @@ async function seed() {
   await db.query(await readFile("scripts/fixtures/message-publication.sql","utf8"));
   await db.query(await readFile("scripts/fixtures/publication-subscribers.sql","utf8"));
   await db.query("CREATE TABLE fixture_recovery (credential jsonb NOT NULL, generation integer NOT NULL)");
+  await db.query("CREATE TABLE fixture_snapshot_recovery (attempt jsonb NOT NULL)");
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
+  await durableCutSettlement();
   await snapshotCut();
   const first=await fixture(), second=await fixture(), foreign=await fixture("other123");
   const write=await writer.saveOnce(first.binding,"first_message","committed with no fanout");
@@ -170,7 +232,7 @@ async function seed() {
   check(await reconcilePublication(first.socket,first.owner,members,journal));
   check(deliveries===2 && seen.size===1); // at least once, dedup not exactly once
   check((await journal.claim(first.binding))?.messages.length===0);
-  check((await db.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n===1);
+  check((await db.query("SELECT count(*)::int n FROM message_publication_pending WHERE room_id='candy986'")).rows[0].n===1);
 
   // Late lower ID commit across the first batch cannot be hidden by a watermark.
   const lowTx=await db.connect();
@@ -259,10 +321,20 @@ async function seed() {
     scope:"private real SocketIO and actual ResumeMessageWriter; not public browser acceptance"}));
 }
 async function recover() {
+  const retained = (await db.query("SELECT attempt FROM fixture_snapshot_recovery")).rows;
+  check(retained.length === 2);
+  for (const {attempt} of retained) {
+    const durable = (await db.query("SELECT delivery_try,message_ids,acked FROM publication_snapshot_attempts WHERE session_id=$1",[attempt.sessionId])).rows[0];
+    check(durable.delivery_try === attempt.deliveryTry && durable.acked === true);
+    check(JSON.stringify(durable.message_ids) === JSON.stringify(attempt.ids));
+    check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND acked",[attempt.sessionId])).rows[0].n === attempt.ids.length);
+  }
+  console.log(JSON.stringify({phase:"durable-cut-recovery",attempts:2,fullRows:2,emptyRows:0,
+    scope:"retained full/empty ACK rows after immediate PostgreSQL restart; not browser reload proof"}));
   check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE acked")).rows[0].n>=260);
   check((await db.query(`SELECT count(*)::int n FROM publication_deliveries d JOIN messages m ON m.id=d.message_id
     WHERE NOT d.acked AND m.content='crash pending'`)).rows[0].n===1);
-  check((await db.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n===264);
+  check((await db.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n===266);
   check((await db.query("SELECT id FROM messages EXCEPT SELECT message_id FROM message_publication_pending")).rowCount===0);
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
   const saved=(await db.query("SELECT credential,generation FROM fixture_recovery")).rows[0];

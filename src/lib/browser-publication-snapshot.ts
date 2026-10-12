@@ -10,7 +10,7 @@ const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(valu
 
 /** Private full-cut validator. Deliberately distinct from newest100.
  * Validated data may be staged and ACKed, but neither validation nor sending an
- * ACK is durable server settlement or READY. Empty cuts have no server ACK yet.
+ * ACK is durable server settlement or READY. Durable cut settlement is not wired here.
  * No live events are mixed into the cut's exact receipt set.
  */
 export function createBrowserPublicationSnapshot(request: SnapshotRequest, now = Date.now) {
@@ -62,4 +62,3 @@ export function createBrowserPublicationSnapshot(request: SnapshotRequest, now =
     },
   };
 }
-

@@ -28,7 +28,7 @@ export async function publishBrowserSnapshot(socket: Socket, owner: ResumeSocket
 // PRIVATE full-cut transport boundary. Uses the SAME physical-owner, membership,
 // expiry and in-flight capacity fences as history sync, but never the newest100
 // reader. true means synchronous handoff ONLY, not client ACK or browser READY.
-// Empty cuts can be handed off; the journal has no empty-snapshot ACK contract yet.
+// Empty cuts can be handed off; durable cut settlement is NOT wired here yet.
 // Caller must retain this physical request and reconcile the durable journal.
 export async function publishBrowserPublicationSnapshot(socket: Socket, owner: ResumeSocketOwner,
   binding: ResumeBinding, members: ResumeMemberships, store: Pick<ResumePublication, "snapshot">,

@@ -61,6 +61,15 @@ export class ResumePublication {
         transport_id=EXCLUDED.transport_id,delivery_try=EXCLUDED.delivery_try,
         lease_until=EXCLUDED.lease_until,acked=false`,
         [binding.sessionId,ids,binding.generation,binding.transportId,deliveryTry]);
+      // A cut is a durable SET, even when empty. Row receipts alone cannot prove
+      // completion of an empty cut, or the identity of the entire captured set.
+      await tx.query(`INSERT INTO publication_snapshot_attempts
+        (session_id,generation,transport_id,delivery_try,message_ids,lease_until)
+        VALUES ($1,$2,$3,$4,$5,clock_timestamp()+interval '5 seconds')
+        ON CONFLICT(session_id) DO UPDATE SET generation=EXCLUDED.generation,
+        transport_id=EXCLUDED.transport_id,delivery_try=EXCLUDED.delivery_try,
+        message_ids=EXCLUDED.message_ids,lease_until=EXCLUDED.lease_until,acked=false`,
+        [binding.sessionId,binding.generation,binding.transportId,deliveryTry,ids]);
       return { cut: "full-bounded-statement" as const, deliveryTry, roomId: binding.roomId,
         sessionId: binding.sessionId, generation: binding.generation, messages };
     });
@@ -103,6 +112,38 @@ export class ResumePublication {
         generation:binding.generation,messages:rows.rows};
     });
     return result.authorized ? result.value : null;
+  }
+
+  // PRIVATE persistence primitive, NOT browser READY. The caller still owns the
+  // exact physical request, confirmation transport and continuing reconciliation.
+  // Retry is idempotent only for this same retained, unexpired cut attempt.
+  async acknowledgeSnapshot(binding: ResumeBinding, batch: PublicationSnapshot, reply: unknown): Promise<boolean> {
+    if (!reply || typeof reply !== "object" || Array.isArray(reply)) return false;
+    const ack = reply as { deliveryTry?: unknown; ids?: unknown };
+    const ids = batch.messages.map(row => row.id);
+    const deliveryTry = batch.deliveryTry; // capture before any gate/lock await
+    if (batch.cut !== "full-bounded-statement" || batch.roomId !== binding.roomId ||
+        batch.sessionId !== binding.sessionId || batch.generation !== binding.generation ||
+        ack.deliveryTry !== deliveryTry || !Array.isArray(ack.ids) ||
+        ack.ids.length !== ids.length || !ack.ids.every((id, i) => id === ids[i])) return false;
+    const result = await this.gate.run(binding, async tx => {
+      // Compare against the durable set, not a caller-supplied subset. Mark and
+      // row settlement are one transaction; mismatch rolls everything back.
+      const attempt = await tx.query(`UPDATE publication_snapshot_attempts a SET acked=true
+        FROM publication_subscribers s WHERE a.session_id=s.session_id
+        AND s.expires_at>clock_timestamp() AND a.session_id=$1 AND a.generation=$2
+        AND a.transport_id=$3 AND a.delivery_try=$4 AND a.message_ids=$5::integer[]
+        AND a.lease_until>clock_timestamp() RETURNING a.session_id`,
+        [binding.sessionId,binding.generation,binding.transportId,deliveryTry,ids]);
+      if (attempt.rowCount !== 1) throw Error("Publication snapshot ACK lease lost");
+      const rows = await tx.query(`UPDATE publication_deliveries SET acked=true
+        WHERE session_id=$1 AND message_id=ANY($2::integer[]) AND generation=$3
+        AND transport_id=$4 AND delivery_try=$5 AND lease_until>clock_timestamp()
+        RETURNING message_id`, [binding.sessionId,ids,binding.generation,binding.transportId,deliveryTry]);
+      if (rows.rowCount !== ids.length) throw Error("Publication snapshot ACK receipt lost");
+      return true;
+    });
+    return result.authorized && result.value;
   }
 
   async acknowledge(binding: ResumeBinding, batch: PublicationBatch, reply: unknown): Promise<boolean> {
