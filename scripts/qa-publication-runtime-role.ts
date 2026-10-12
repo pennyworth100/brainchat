@@ -6,6 +6,8 @@ import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeOperationGate } from "../src/lib/resume-operation";
 import { ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumePublication } from "../src/lib/resume-publication";
+import { ResumeSessionCleanup } from "../src/lib/resume-session-cleanup";
+import { ResumeSessionScheduler } from "../src/lib/resume-session-scheduler";
 
 // Only the disposable cluster owner invokes this. No live grants/migrations.
 const url = new URL(process.env.RESUME_TEST_DATABASE_URL!);
@@ -161,10 +163,61 @@ async function main() {
     check((await admin.query("SELECT count(*)::int n FROM messages")).rows[0].n === 2);
     check((await admin.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n === 2);
     check(await cleaner.cleanupExpired(100) === 0);
+    // Real bounded maintenance, not the legacy parent-only cascade helper.
+    await admin.query(`GRANT SELECT,DELETE ON resume_message_receipts,publication_deliveries TO ${cleanupRole}`);
+    await admin.query(`GRANT UPDATE(client_message_id) ON resume_message_receipts TO ${cleanupRole}`);
+    await admin.query(`GRANT UPDATE(message_id) ON publication_deliveries TO ${cleanupRole}`);
+    await admin.query(`GRANT SELECT,UPDATE(session_id) ON publication_subscribers TO ${cleanupRole}`);
+    const backlogId = expiring[2];
+    await admin.query(`INSERT INTO publication_snapshot_attempts VALUES
+      ($1,1,'expired_transport','00000000-0000-4000-8000-000000000001',ARRAY[$2::integer],clock_timestamp(),true)`,
+      [backlogId,first.value.id]);
+    await admin.query(`INSERT INTO messages(room_id,username,content)
+      SELECT 'role123','Fixture','backlog-'||n FROM generate_series(1,205) n`);
+    await admin.query(`INSERT INTO publication_deliveries
+      SELECT $1,id,1,'expired_transport','00000000-0000-4000-8000-000000000001',clock_timestamp(),true
+      FROM messages WHERE content LIKE 'backlog-%'`, [backlogId]);
+    await admin.query(`INSERT INTO resume_message_receipts
+      SELECT $1,'bounded_key_'||n,repeat('b',64),$2 FROM generate_series(1,3) n`, [backlogId,first.value.id]);
+    await admin.query("UPDATE room_resume_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [backlogId]);
+    const bounded = new ResumeSessionCleanup(maintenance, true);
+    const childLock = await admin.connect();
+    try {
+      await childLock.query("BEGIN");
+      await childLock.query("SELECT message_id FROM publication_deliveries WHERE session_id=$1 ORDER BY message_id LIMIT 1 FOR UPDATE", [backlogId]);
+      await assert.rejects(bounded.runOnce(), e => (e as {code:string}).code === "55P03"); checks++;
+      check((await admin.query("SELECT count(*)::int n FROM resume_message_receipts WHERE session_id=$1", [backlogId])).rows[0].n === 3);
+      check((await admin.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1", [backlogId])).rows[0].n === 205);
+    } finally { await childLock.query("ROLLBACK"); childLock.release(); }
+    assert.deepEqual(await bounded.runOnce(), {sessions:0,receipts:3,deliveries:97}); checks++;
+    check((await admin.query("SELECT 1 FROM room_resume_sessions WHERE id=$1", [backlogId])).rowCount === 1);
+    assert.deepEqual(await bounded.runOnce(), {sessions:0,receipts:0,deliveries:100}); checks++;
+    // The existing settlement-paced scheduler owns the final bounded pass.
+    const scheduler = new ResumeSessionScheduler(bounded);
+    scheduler.start();
+    try {
+      const deadline = Date.now()+5000;
+      while (!scheduler.snapshot().completedRuns && Date.now()<deadline) {
+        await new Promise(resolve => setTimeout(resolve,25));
+      }
+    } finally {
+      const report = await scheduler.stopAndSettle();
+      check(report.completedRuns === 1 && report.failedRuns === 0 && report.sessions === 1 && report.deliveries === 8);
+    }
+    for (const table of ["room_resume_sessions","publication_subscribers","publication_deliveries","publication_snapshot_attempts","resume_message_receipts"]) {
+      check((await admin.query(`SELECT 1 FROM ${table} WHERE ${table === "room_resume_sessions" ? "id" : "session_id"}=$1`, [backlogId])).rowCount === 0);
+    }
+    check((await admin.query("SELECT count(*)::int n FROM messages")).rows[0].n === 207);
+    check((await admin.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n === 207);
+    check((await admin.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND acked", [issued.sessionId])).rows[0].n === 2);
+    const stillRetry = await writer.saveOnceWithOutcome(binding, "role_message_2", "later committed");
+    check(stillRetry.authorized && !stillRetry.value.inserted && stillRetry.value.message.id === second.value.id);
+    await assert.rejects(bounded.runOnce(), /stopped/); checks++;
     console.log(JSON.stringify({status:"PASS", checks, actualRestrictedLogin:true,
       insertSnapshotClaimACK:true, tempShadowResistant:true, appendOnlyRuntime:true,
       privilegedMutationNeedsTombstones:true, expiredSubscriberCapacityRecovered:true,
       separateCleanupLogin:true, boundedSkipLockedCleanup:true, liveACKAndRetryPreserved:true,
+      sharedChildBudget100:true, lockedChildRollsBack:true, realPacedCleanup:true,
       publicActivation:false,
       scope:"private role feasibility; not deployed grants, row-level tenant isolation or full server acceptance"}));
   } finally {
