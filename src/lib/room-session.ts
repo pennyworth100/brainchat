@@ -49,12 +49,22 @@ export function createRoomSession(
   let state: ConnectionState = "idle";
   let disposed = false;
   let epoch = 0;
+  // A transport reconnect retains its room owner; an explicit join never does,
+  // even when roomId/username happen to be identical.
+  let roomEpoch = 0;
   let joinTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let retries = 0;
   let textOperationKeys = false;
   let probe: Promise<string> | null = null;
   let healthProbe: Promise<string> | null = null;
+  const pendingProbes = new Map<object, (error: Error) => void>();
+  const cancelProbes = (message: string) => {
+    for (const reject of pendingProbes.values()) reject(new Error(message));
+    pendingProbes.clear();
+    probe = null;
+    healthProbe = null;
+  };
   const waiters = new Set<{ resolve: (id: string) => void; reject: (err: Error) => void }>();
   const setState = (next: ConnectionState) => {
     state = next;
@@ -127,6 +137,8 @@ export function createRoomSession(
       credentials = null;
     }
     setState("error");
+    ++roomEpoch;
+    cancelProbes(message);
     callbacks.onError(message, delay === null);
     rejectWaiters(message);
   };
@@ -161,11 +173,15 @@ export function createRoomSession(
     if (disposed || !credentials) return Promise.reject(new Error("Join the room before sending"));
     if (state !== "ready" || !socket.connected) return whenReady();
     const generation = epoch;
+    const owner = roomEpoch;
+    const token = {};
     setState("syncing");
-    probe = new Promise<string>((resolve, reject) => {
+    const current = new Promise<string>((resolve, reject) => {
+      pendingProbes.set(token, reject);
       socket.timeout(timeoutMs).emit("sync-room", { roomId: credentials!.roomId },
         (err: Error | null, result?: RoomSnapshot & { error?: string }) => {
           if (disposed) return reject(new Error("Room closed"));
+          if (owner !== roomEpoch) return reject(new Error("Room changed"));
           if (generation !== epoch) {
             whenReady().then(resolve, reject);
           } else if (err || !result || result.error) {
@@ -176,7 +192,11 @@ export function createRoomSession(
             resolve(socket.id!);
           }
         });
-    }).finally(() => { probe = null; });
+    }).finally(() => {
+      pendingProbes.delete(token);
+      if (probe === current) probe = null;
+    });
+    probe = current;
     return probe;
   };
 
@@ -187,10 +207,14 @@ export function createRoomSession(
     if (disposed || !credentials) return Promise.reject(new Error("Join the room before sending"));
     if (state !== "ready" || !socket.connected) return whenReady();
     const generation = epoch;
-    healthProbe = new Promise<string>((resolve, reject) => {
+    const owner = roomEpoch;
+    const token = {};
+    const current = new Promise<string>((resolve, reject) => {
+      pendingProbes.set(token, reject);
       socket.timeout(timeoutMs).emit("sync-room", { roomId: credentials!.roomId, probeOnly: true },
         (err: Error | null, result?: { ok?: boolean; error?: string; history?: unknown; users?: unknown }) => {
           if (disposed) return reject(new Error("Room closed"));
+          if (owner !== roomEpoch) return reject(new Error("Room changed"));
           if (generation !== epoch) return void whenReady().then(resolve, reject);
           // Older servers return a snapshot for this event. Accept that as a
           // liveness ACK, without presenting it as another join or sync.
@@ -200,7 +224,11 @@ export function createRoomSession(
           }
           whenReady().then(resolve, reject);
         });
-    }).finally(() => { healthProbe = null; });
+    }).finally(() => {
+      pendingProbes.delete(token);
+      if (healthProbe === current) healthProbe = null;
+    });
+    healthProbe = current;
     return healthProbe;
   };
 
@@ -208,6 +236,8 @@ export function createRoomSession(
     join(next: RoomCredentials) {
       if (disposed) return;
       ++epoch;
+      ++roomEpoch;
+      cancelProbes("Room changed");
       clearJoinTimer();
       clearRetryTimer();
       rejectWaiters("Room changed");
@@ -236,11 +266,13 @@ export function createRoomSession(
           state !== "ready" || !socket.connected || socket.id !== socketId) return null;
       return Object.freeze({ kind: "legacy", roomId, socketId });
     },
-    isReady: () => state === "ready" && socket.connected,
-    canRetryText: () => state === "ready" && socket.connected && textOperationKeys,
+    isReady: () => !disposed && !!credentials && state === "ready" && socket.connected,
+    canRetryText: () => !disposed && !!credentials && state === "ready" && socket.connected && textOperationKeys,
     dispose() {
       disposed = true;
       ++epoch;
+      ++roomEpoch;
+      cancelProbes("Room closed");
       credentials = null;
       clearJoinTimer();
       clearRetryTimer();
