@@ -7,6 +7,70 @@ import type { ResumeSocketOwner } from "./resume-socket";
 import { syncResumeSocket } from "./resume-sync";
 import { validateBrowserSnapshotRow } from "./browser-resume-snapshot";
 import type { ResumePublication } from "./resume-publication";
+import type { PublicationSnapshot } from "./resume-publication";
+
+// One retained request per physical socket. Supersession is permanent, including
+// while SQL is pending. No public event registration or browser READY authority.
+const exchanges = new WeakMap<Socket, object>();
+export function createBrowserPublicationExchange(socket: Socket, owner: ResumeSocketOwner,
+  binding: ResumeBinding, members: ResumeMemberships,
+  store: Pick<ResumePublication, "snapshot" | "acknowledgeSnapshot">,
+  request: SnapshotRequest, now = () => performance.now()) {
+  if (!request || request.roomId !== binding.roomId || request.sessionId !== binding.sessionId ||
+      request.generation !== binding.generation || typeof request.requestId !== "string" ||
+      !/^[A-Za-z0-9_-]{16,128}$/.test(request.requestId) ||
+      members.currentBindingFor(socket, owner) !== binding) return null;
+  const identity = Object.freeze({ roomId: binding.roomId, sessionId: binding.sessionId,
+    generation: binding.generation, requestId: request.requestId });
+  const token = {}, deadline = now() + 4000;
+  exchanges.set(socket, token);
+  let started = false, batch: PublicationSnapshot | undefined;
+  const live = () => exchanges.get(socket) === token && now() < deadline &&
+    members.currentBindingFor(socket, owner) === binding;
+  return Object.freeze({ request: identity,
+    async publish(handoff: (value: unknown) => void): Promise<boolean> {
+      if (started || !live()) return false;
+      started = true;
+      return publishBrowserPublicationSnapshot(socket, owner, binding, members, {
+        snapshot: async current => {
+          const cut = await store.snapshot(current);
+          if (!cut || !live()) return null;
+          // Own the DB cut across later awaits; caller mutation cannot change the
+          // exact retained ACK set. Projection below still validates every row.
+          batch = { ...cut, messages: cut.messages.map(row => ({ ...row, ts: new Date(row.ts) })) };
+          return batch;
+        },
+      }, identity, value => {
+        if (!live()) throw Error("Publication request superseded");
+        handoff(value);
+      }).then(sent => { if (!sent) batch = undefined; return sent; }, error => {
+        batch = undefined; throw error;
+      });
+    },
+    async acknowledge(reply: unknown, confirm: (value: unknown) => void): Promise<boolean> {
+      if (!live() || !batch || !reply || typeof reply !== "object" || Array.isArray(reply)) return false;
+      const ack = reply as Record<string, unknown>, retained = batch;
+      if (ack.roomId !== identity.roomId || ack.sessionId !== identity.sessionId ||
+          ack.generation !== identity.generation || ack.requestId !== identity.requestId ||
+          ack.deliveryTry !== retained.deliveryTry || !Array.isArray(ack.ids) ||
+          ack.ids.length !== retained.messages.length ||
+          !ack.ids.every((id, i) => id === retained.messages[i].id)) return false;
+      const captured = Object.freeze({ deliveryTry: retained.deliveryTry, ids: Object.freeze([...ack.ids]) });
+      // Reuse physical close/expiry, shared per-socket flight and global capacity
+      // fences. A timed-out SQL operation retains its slot until actual settlement.
+      // Retrying lost confirmation rechecks durable SQL; never cache a boolean.
+      return syncResumeSocket(socket, owner, binding, members, { read: async () => {
+        if (!live()) return null;
+        const committed = await store.acknowledgeSnapshot(binding, retained, captured);
+        return committed && live() ? [] : null;
+      } }, { roomId: identity.roomId }, () => {
+        if (!live()) throw Error("Publication confirmation expired");
+        confirm(Object.freeze({ ...identity, deliveryTry: retained.deliveryTry,
+          cut: "full-bounded-statement", settled: true }));
+      }, { timeoutMs: Math.max(1, Math.ceil(deadline - now())) });
+    },
+  });
+}
 
 // PRIVATE envelope over the existing exact-owner authorized full-window read.
 // Caller binds this request/ACK to its authenticated physical socket. No probe,

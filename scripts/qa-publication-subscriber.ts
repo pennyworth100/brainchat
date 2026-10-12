@@ -11,7 +11,7 @@ import { ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
 import { ResumePublication, reconcilePublication, type PublicationBatch, type PublicationSnapshot } from "../src/lib/resume-publication";
-import { publishBrowserPublicationSnapshot } from "../src/lib/resume-browser-snapshot";
+import { publishBrowserPublicationSnapshot, createBrowserPublicationExchange } from "../src/lib/resume-browser-snapshot";
 import { createBrowserResumeController } from "../src/lib/browser-resume-controller";
 
 // Owned loopback database only. Raw SQL authority manipulation is TEST INPUT,
@@ -131,6 +131,59 @@ async function snapshotCut() {
     await db.query("DELETE FROM rooms WHERE id='snap123'");
   }
 }
+
+async function requestBoundConfirmation() {
+  await db.query("INSERT INTO rooms(id) VALUES ('conf123')");
+  const physical = await fixture("conf123");
+  try {
+    for (const count of [0, 1]) {
+      if (count) check((await writer.save(physical.binding, "before confirmed cut")).authorized);
+      const request = { roomId: physical.binding.roomId, sessionId: physical.binding.sessionId,
+        generation: physical.binding.generation, requestId: "confirmed_request_" + count };
+      const exchange = createBrowserPublicationExchange(physical.socket, physical.owner,
+        physical.binding, members, journal, request); assert.ok(exchange);
+      physical.client.once("request-cut", (value, ack) => {
+        check(value.history.length === count);
+        ack({ ...request, deliveryTry: value.deliveryTry, ids: value.history.map((r: {id:number}) => r.id) });
+      });
+      let clientACK!: Promise<unknown>;
+      check(await exchange.publish(value => {
+        clientACK = physical.socket.timeout(4000).emitWithAck("request-cut", value);
+      }));
+      const reply = await clientACK;
+      let attempted = 0;
+      check(await exchange.acknowledge(reply, () => { attempted++; /* deliberately lose network confirmation */ }));
+      check(attempted === 1);
+      check((await db.query("SELECT acked FROM publication_snapshot_attempts WHERE session_id=$1",
+        [physical.binding.sessionId])).rows[0].acked === true);
+      check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND NOT acked",
+        [physical.binding.sessionId])).rows[0].n === 0);
+      let delivered!: Promise<unknown>;
+      physical.client.once("cut-confirmed", (value, ack) => {
+        check(value.settled === true && value.requestId === request.requestId &&
+          value.sessionId === request.sessionId && value.generation === request.generation &&
+          value.roomId === request.roomId && value.deliveryTry === (reply as any).deliveryTry);
+        ack({ received: true });
+      });
+      check(await exchange.acknowledge(reply, value => {
+        delivered = physical.socket.timeout(4000).emitWithAck("cut-confirmed", value);
+      }));
+      check((await delivered as {received:boolean}).received === true);
+    }
+    const later = await writer.save(physical.binding, "after confirmed cut"); assert.ok(later.authorized);
+    const pending = await journal.claim(physical.binding); assert.ok(pending);
+    check(pending.messages.length === 1 && pending.messages[0].id === later.value.id);
+    console.log(JSON.stringify({phase:"request-bound-confirmation",fullAndEmpty:true,
+      actualSocketDelivery:true,lostConfirmationRetry:true,durableBeforeConfirmation:true,
+      laterCommitRetained:true,scope:"private exchange; controller READY and continuing browser reconciliation NOT wired"}));
+  } finally {
+    await physical.owner.close(); physical.client.disconnect();
+    await db.query("DELETE FROM messages WHERE room_id='conf123'");
+    await db.query("DELETE FROM room_resume_sessions WHERE room_id='conf123'");
+    await db.query("DELETE FROM rooms WHERE id='conf123'");
+  }
+}
+
 async function durableCutSettlement() {
   await db.query("INSERT INTO rooms(id) VALUES ('cut123'),('empty123')");
   const full = await fixture("cut123"), emptyOwner = await fixture("empty123");
@@ -204,6 +257,7 @@ async function seed() {
   await db.query("CREATE TABLE fixture_snapshot_recovery (attempt jsonb NOT NULL)");
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
   await durableCutSettlement();
+  await requestBoundConfirmation();
   await snapshotCut();
   const first=await fixture(), second=await fixture(), foreign=await fixture("other123");
   const write=await writer.saveOnce(first.binding,"first_message","committed with no fanout");

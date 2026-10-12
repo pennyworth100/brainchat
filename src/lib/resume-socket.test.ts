@@ -1875,6 +1875,123 @@ import { publishBrowserSnapshot } from "./resume-browser-snapshot";
 import { publishBrowserPublicationSnapshot } from "./resume-browser-snapshot";
 import type { PublicationSnapshot } from "./resume-publication";
 
+import { createBrowserPublicationExchange } from "./resume-browser-snapshot";
+
+for (const empty of [false, true]) test("request-bound confirmation follows settlement, including empty cut; lost confirmation retries SQL " + empty, async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), req = publicationRequest(f.binding);
+  if (empty) cut.messages = [];
+  let commits = 0, wire: any;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut,
+    acknowledgeSnapshot: async (_binding, retained, reply: any) => {
+      commits++;
+      assert.deepEqual(retained.messages.map(r => r.id), empty ? [] : [1]);
+      assert.deepEqual(reply.ids, empty ? [] : [1]);
+      assert.ok(Object.isFrozen(reply.ids));
+      return true;
+    },
+  }, req)!;
+  req.requestId = "mutated_request_001";
+  assert.equal(await exchange.publish(value => { wire = value; }), true);
+  cut.messages = []; // retained cut is not caller-owned
+  const ack = { ...exchange.request, deliveryTry: wire.deliveryTry, ids: empty ? [] : [1] };
+  await assert.rejects(exchange.acknowledge(ack, () => { throw Error("confirmation lost"); }), /confirmation lost/);
+  let confirmed: any;
+  assert.equal(await exchange.acknowledge(ack, value => { confirmed = value; }), true);
+  assert.equal(commits, 2);
+  assert.deepEqual(confirmed, { ...exchange.request, deliveryTry: wire.deliveryTry,
+    cut: "full-bounded-statement", settled: true });
+  assert.ok(Object.isFrozen(confirmed));
+  assert.equal(await exchange.publish(() => assert.fail("second snapshot")), false);
+});
+
+test("exchange refuses forged physical authority and malformed requests before SQL", async t => {
+  const f = await syncFixture(t), other = await f.connect(), req = publicationRequest(f.binding);
+  const store = { snapshot: async () => { assert.fail("SQL"); },
+    acknowledgeSnapshot: async () => { assert.fail("SQL"); } };
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(createBrowserPublicationExchange(socket, owner, binding, f.members, store, req), null);
+  }
+  for (const change of [{ roomId: "apple123" }, { sessionId: "wrong" }, { generation: 2 }, { requestId: "bad" }]) {
+    assert.equal(createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, store, { ...req, ...change }), null);
+  }
+});
+
+test("exchange rejects stale request, forged subset, reordered or duplicate IDs before settlement", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding); let commits = 0;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut, acknowledgeSnapshot: async () => { commits++; return true; },
+  }, publicationRequest(f.binding))!;
+  const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+  assert.equal(await exchange.acknowledge(ack, () => assert.fail("before publish")), false);
+  await exchange.publish(() => {});
+  for (const change of [{ roomId: "apple123" }, { sessionId: "wrong" }, { generation: 2 },
+    { requestId: "other_request_001" }, { deliveryTry: "wrong" }, { ids: [] }, { ids: [1, 1] }, { ids: ["1"] }]) {
+    assert.equal(await exchange.acknowledge({ ...ack, ...change }, () => assert.fail("forged confirmation")), false);
+  }
+  assert.equal(commits, 0);
+});
+
+for (const fence of ["disconnect", "expiry", "deadline", "supersession"] as const) {
+  test("request-bound confirmation is fenced after pending COMMIT: " + fence, async t => {
+    const f = await syncFixture(t), cut = publicationCut(f.binding), gate = deferred<boolean>();
+    const entered = deferred<void>(); let time = 0, calls = 0;
+    const store = { snapshot: async () => cut, acknowledgeSnapshot: async () => {
+      calls++; entered.resolve(); return gate.promise;
+    } };
+    const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members,
+      store, publicationRequest(f.binding), () => time)!;
+    await exchange.publish(() => {});
+    const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+    const pending = exchange.acknowledge(ack, () => assert.fail("stale confirmation"));
+    await entered.promise;
+    assert.equal(await exchange.acknowledge(ack, () => assert.fail("concurrent confirmation")), false);
+    if (fence === "disconnect") f.socket.disconnect(true);
+    if (fence === "expiry") f.expire();
+    if (fence === "deadline") time = 4000;
+    if (fence === "supersession") assert.ok(createBrowserPublicationExchange(f.socket, f.owner,
+      f.binding, f.members, store, { ...exchange.request, requestId: "successor_request_001" }, () => time));
+    gate.resolve(true);
+    assert.equal(await pending, false);
+    assert.equal(await exchange.acknowledge(ack, () => assert.fail("retired request")), false);
+    assert.equal(calls, 1);
+  });
+}
+
+test("exchange cannot confirm denied settlement and captures ACK before await", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), gate = deferred<boolean>(), entered = deferred<void>();
+  let captured: any;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut, acknowledgeSnapshot: async (_b, _c, ack) => {
+      captured = ack; entered.resolve(); return gate.promise;
+    },
+  }, publicationRequest(f.binding))!;
+  await exchange.publish(() => {});
+  const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+  const pending = exchange.acknowledge(ack, () => assert.fail("denied"));
+  await entered.promise;
+  ack.ids[0] = 999; ack.deliveryTry = "mutated";
+  assert.deepEqual(captured, { deliveryTry: cut.deliveryTry, ids: [1] });
+  gate.resolve(false); assert.equal(await pending, false);
+});
+
+test("superseded snapshot read cannot hand off or create an ACK capability", async t => {
+  const f = await syncFixture(t), gate = deferred<PublicationSnapshot>(), entered = deferred<void>();
+  const store = { snapshot: async () => { entered.resolve(); return gate.promise; },
+    acknowledgeSnapshot: async () => { assert.fail("superseded SQL"); } };
+  const old = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members,
+    store, publicationRequest(f.binding))!;
+  const pending = old.publish(() => assert.fail("superseded handoff"));
+  await entered.promise;
+  createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, store,
+    { ...old.request, requestId: "successor_request_001" });
+  gate.resolve(publicationCut(f.binding)); assert.equal(await pending, false);
+  assert.equal(await old.acknowledge({ ...old.request, deliveryTry: publicationCut(f.binding).deliveryTry, ids: [1] },
+    () => assert.fail("superseded confirmation")), false);
+});
+
+
 const publicationCut = (binding: ResumeBinding): PublicationSnapshot => ({
   roomId: binding.roomId, sessionId: binding.sessionId, generation: binding.generation,
   cut: "full-bounded-statement", deliveryTry: "11111111-1111-4111-8111-111111111111",
