@@ -11,7 +11,7 @@ import { ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
 import { ResumePublication, reconcilePublication, type PublicationBatch, type PublicationSnapshot } from "../src/lib/resume-publication";
-import { publishBrowserPublicationSnapshot, createBrowserPublicationExchange } from "../src/lib/resume-browser-snapshot";
+import { publishBrowserPublicationSnapshot, createBrowserPublicationExchange, reconcileBrowserPublication } from "../src/lib/resume-browser-snapshot";
 import { createBrowserResumeController } from "../src/lib/browser-resume-controller";
 
 // Owned loopback database only. Raw SQL authority manipulation is TEST INPUT,
@@ -135,8 +135,14 @@ async function snapshotCut() {
 async function requestBoundConfirmation() {
   await db.query("INSERT INTO rooms(id) VALUES ('conf123')");
   const physical = await fixture("conf123");
+  const lowTx = await db.connect();
   try {
     for (const count of [0, 1]) {
+      let low = 0;
+      if (count) {
+        await lowTx.query("BEGIN");
+        low = (await lowTx.query("INSERT INTO messages(room_id,username,content) VALUES ('conf123','peer','late lower browser journal') RETURNING id")).rows[0].id;
+      }
       if (count) check((await writer.save(physical.binding, "before confirmed cut")).authorized);
       const controller = createBrowserResumeController(undefined, Date.now, 32, "publication-cut");
       const join = controller.beginJoin("conf123", "Reader", physical.client);
@@ -180,15 +186,45 @@ async function requestBoundConfirmation() {
         delivered = physical.socket.timeout(4000).emitWithAck("cut-confirmed", value);
       }));
       check((await delivered as {received:boolean}).received === true);
+      if (count) {
+        await lowTx.query("COMMIT");
+        const later = await writer.save(physical.binding, "after confirmed cut"); assert.ok(later.authorized);
+        check(low < later.value.id);
+        const media = await db.query("INSERT INTO messages(room_id,username,type,content) VALUES ('conf123','peer','image',$1),('conf123','peer','file',$2) RETURNING id", [
+          JSON.stringify({dataUrl:"data:image/png;base64,YQ=="}),
+          JSON.stringify({url:"/uploads/fixture/blob",name:"a.txt",size:1,mime:"text/plain",sha256:"a".repeat(64)})]);
+        let packets = 0, priorTry = "", retainedIDs: number[] = [];
+        physical.client.on("publication-batch", (value, ack) => {
+          const result = controller.receivePublication(physical.client, sync, value);
+          check(result.history.length === 5);
+          check(result.history[0].id === low);
+          check(result.history.find(row => row.id === media.rows[1].id)?.sha256 === "a".repeat(64));
+          assert.deepEqual(result.ack.ids, [low, later.value.id, ...media.rows.map(row => row.id)]); checks++;
+          if (++packets === 1) {
+            priorTry = value.deliveryTry; retainedIDs = result.history.map(row => row.id);
+            return; // Lose ACK AFTER browser retained all rows.
+          }
+          check(value.deliveryTry !== priorTry);
+          assert.deepEqual(result.history.map(row => row.id), retainedIDs); checks++;
+          ack(result.ack);
+        });
+        check(!await reconcileBrowserPublication(physical.socket, physical.owner, physical.binding, members, journal, request));
+        check(packets === 1 && controller.status().phase === "syncing");
+        // Owned test SQL expires only this fixture's delivery lease deterministically.
+        await db.query("UPDATE publication_deliveries SET lease_until=clock_timestamp()-interval '1 second' WHERE session_id=$1 AND NOT acked", [physical.binding.sessionId]);
+        check(await reconcileBrowserPublication(physical.socket, physical.owner, physical.binding, members, journal, request));
+        check(packets === 2 && controller.status().phase === "syncing");
+        check((await journal.claim(physical.binding))?.messages.length === 0);
+        physical.client.removeAllListeners("publication-batch");
+      }
     }
-    const later = await writer.save(physical.binding, "after confirmed cut"); assert.ok(later.authorized);
-    const pending = await journal.claim(physical.binding); assert.ok(pending);
-    check(pending.messages.length === 1 && pending.messages[0].id === later.value.id);
     console.log(JSON.stringify({phase:"request-bound-confirmation",fullAndEmpty:true,
       actualSocketDelivery:true,lostConfirmationRetry:true,durableBeforeConfirmation:true,
       laterCommitRetained:true,actualControllerConfirmation:true,controllerRemainsSyncing:true,
-      scope:"private exchange and browser controller; READY, reload and continuing reconciliation NOT wired"}));
+      continuingJournal:true,lateLowerCommit:true,lostBatchACKDeduplicated:true,allMediaProjection:true,
+      scope:"private request-bound journal/controller; no READY, browser reload or public file-byte proof"}));
   } finally {
+    await lowTx.query("ROLLBACK"); lowTx.release();
     await physical.owner.close(); physical.client.disconnect();
     await db.query("DELETE FROM messages WHERE room_id='conf123'");
     await db.query("DELETE FROM room_resume_sessions WHERE room_id='conf123'");

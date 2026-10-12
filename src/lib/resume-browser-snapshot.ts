@@ -8,6 +8,36 @@ import { syncResumeSocket } from "./resume-sync";
 import { validateBrowserSnapshotRow } from "./browser-resume-snapshot";
 import type { ResumePublication } from "./resume-publication";
 import type { PublicationSnapshot } from "./resume-publication";
+import { reconcilePublication } from "./resume-publication";
+
+// Private continuing poll. Request identity binds the browser's retained cut;
+// the existing poll owns physical membership, DB gate, one-flight and ACK lease.
+// true is SQL settlement (or an empty poll), NEVER a drained/READY guarantee.
+export async function reconcileBrowserPublication(socket: Socket, owner: ResumeSocketOwner,
+  binding: ResumeBinding, members: ResumeMemberships, store: ResumePublication,
+  request: SnapshotRequest): Promise<boolean> {
+  if (!request || request.roomId !== binding.roomId || request.sessionId !== binding.sessionId ||
+      request.generation !== binding.generation || typeof request.requestId !== "string" ||
+      !/^[A-Za-z0-9_-]{16,128}$/.test(request.requestId) ||
+      members.currentBindingFor(socket, owner) !== binding) return false;
+  const identity = Object.freeze({ ...request });
+  return reconcilePublication(socket, owner, members, store, batch => {
+    if (batch.roomId !== identity.roomId || batch.sessionId !== identity.sessionId ||
+        batch.generation !== identity.generation || batch.messages.length > 16) {
+      throw Error("Invalid browser journal batch");
+    }
+    const history = batch.messages.map(message => {
+      const content = message.type === "message" ? { message: message.content } : JSON.parse(message.content);
+      if (!content || typeof content !== "object" || Array.isArray(content) ||
+          !(message.ts instanceof Date)) throw Error("Invalid journal content");
+      return validateBrowserSnapshotRow({ ...content, id: message.id, type: message.type,
+        username: message.username, ts: message.ts.getTime() });
+    });
+    if (Buffer.byteLength(JSON.stringify(history)) > 1024 * 1024) throw Error("Journal byte capacity");
+    return Object.freeze({ ...identity, cut: "journal-batch", deliveryTry: batch.deliveryTry,
+      history: Object.freeze(history) });
+  });
+}
 
 // One retained request per physical socket. Supersession is permanent, including
 // while SQL is pending. No public event registration or browser READY authority.

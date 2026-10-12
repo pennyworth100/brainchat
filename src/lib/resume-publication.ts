@@ -172,7 +172,8 @@ const capacity = new ResumeCapacity(32);
 // Real Socket.IO client ACK, NOT emit success. The DB transaction settles before
 // network IO; after await, exact physical membership AND DB policy revalidate.
 export async function reconcilePublication(socket: Socket, owner: ResumeSocketOwner,
-  members: ResumeMemberships, store: ResumePublication): Promise<boolean> {
+  members: ResumeMemberships, store: ResumePublication,
+  project: (batch: PublicationBatch) => unknown = batch => batch): Promise<boolean> {
   const binding = members.currentBindingFor(socket,owner);
   if (!binding || busy.has(socket)) return false;
   const release = capacity.acquire();
@@ -184,7 +185,7 @@ export async function reconcilePublication(socket: Socket, owner: ResumeSocketOw
     if (!batch || !current()) return false;
     if (!batch.messages.length) return true;
     let reply: unknown;
-    try { reply = await socket.timeout(4000).emitWithAck("publication-batch",batch); }
+    try { reply = await socket.timeout(4000).emitWithAck("publication-batch",project(batch)); }
     catch { return false; } // lost ACK keeps receipts pending for lease retry
     if (!current()) return false;
     return await store.acknowledge(binding,batch,reply) && current();

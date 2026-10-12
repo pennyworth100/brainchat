@@ -1,4 +1,5 @@
 import { isValidRoomId } from "./room-id";
+import { createBrowserPublicationJournal } from "./browser-publication-journal";
 import type { UploadAuthority } from "./upload-authority";
 import { createBrowserSnapshotWindow, type SnapshotCompletion } from "./browser-resume-snapshot";
 import { createBrowserPublicationSnapshot, type PublicationCompletion } from "./browser-publication-snapshot";
@@ -36,6 +37,7 @@ export function createBrowserResumeController(
   let syncAttempt: SyncAttempt | null = null;
   let snapshot: ReturnType<typeof createBrowserSnapshotWindow> | null = null;
   let publication: ReturnType<typeof createBrowserPublicationSnapshot> | null = null;
+  let journal: ReturnType<typeof createBrowserPublicationJournal> | null = null;
   const pending = new Map<Operation, { sent: boolean }>();
   // Never recycle a key during this logical owner's lifetime, even after ACK.
   const usedKeys = new Set<string>();
@@ -98,6 +100,7 @@ export function createBrowserResumeController(
       snapshot?.cancel(); snapshot = null;
       publication?.cancel(); publication = null;
       lease = null; pending.clear(); usedKeys.clear(); phase = "joining";
+      journal?.cancel(); journal = null;
       syncAttempt = null; lostCas = null;
       attempt = Object.freeze({ kind: "join", operationId: freshKey(), expectedGeneration: 0 });
       return attempt;
@@ -106,6 +109,7 @@ export function createBrowserResumeController(
     disconnect(physical: object) {
       if (physical !== transport) return;
       transport = null;
+      journal?.cancel(); journal = null;
       snapshot?.cancel(); snapshot = null;
       publication?.cancel(); publication = null;
       syncAttempt = null;
@@ -185,6 +189,7 @@ export function createBrowserResumeController(
       try {
         if (!publication) throw Error("Missing publication snapshot");
         const result = publication.confirm(value);
+        journal = createBrowserPublicationJournal({ roomId, ...ticket }, result.history);
         publication = null;
         // A settled cut is NOT a continuing journal subscription. Never grant
         // READY here or discard pending payload/operation ownership.
@@ -197,6 +202,16 @@ export function createBrowserResumeController(
         throw Error("Stale history acknowledgement");
       }
       return snapshot.api;
+    },
+    receivePublication(physical: object, ticket: SyncAttempt, value: unknown) {
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
+        throw Error("Stale journal batch");
+      }
+      live();
+      try {
+        if (!journal) throw Error("Missing confirmed publication journal");
+        return journal.receive(value);
+      } catch (error) { phase = "blocked"; throw error; }
     },
     finishSync(physical: object, generation: number, ticket: SyncAttempt, completion: SnapshotCompletion) {
       const current = live();
