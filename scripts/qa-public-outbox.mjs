@@ -9,6 +9,7 @@ import { chromium, expect } from "@playwright/test";
 const app = next({ dev: false, hostname: "127.0.0.1", dir: process.cwd() });
 await app.prepare();
 let uploads = 0, sends = 0;
+let failPreflightFor = "";
 const server = createServer((req, res) => {
   if (req.url === "/api/upload") {
     uploads++;
@@ -23,10 +24,15 @@ io.on("connection", socket => {
   const snapshot = () => ({ history: [], users: [username] });
   socket.on("join-room", data => {
     username = data.username;
+    if (failPreflightFor === username) {
+      failPreflightFor = "";
+      return socket.emit("join-error", "Controlled predispatch join failure");
+    }
     if (data.password !== "fixture-only") return socket.emit("join-error", "Wrong password");
     socket.emit("room-snapshot", snapshot());
   });
-  socket.on("sync-room", (_data, ack) => ack(snapshot()));
+  socket.on("sync-room", (_data, ack) => ack(failPreflightFor === username
+    ? { error: "Controlled predispatch sync failure" } : snapshot()));
   socket.on("send-message", () => { sends++; }); // Deliberately lost ACK, no database write.
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -148,6 +154,33 @@ try {
   assert.equal(uploads, 1);
   checks.push("quota failure aborts reservation before upload without uncaught errors");
   await quotaContext.close();
+
+  // The real public UI must release ONLY reservations whose transport was never invoked.
+  // Sync rejects, then reauthentication fails before text emit or HTTP upload.
+  for (const kind of ["text", "file"]) {
+    await page.reload(); await join("Unsent-" + kind);
+    await page.getByLabel("Message", { exact: true }).fill("keep unsent " + kind);
+    const rowsBefore = await pending();
+    const uploadsBefore = uploads, sendsBefore = sends;
+    failPreflightFor = "Unsent-" + kind;
+    if (kind === "text") await page.getByRole("button", { name: "Send", exact: true }).click();
+    else await page.locator("input[type=file]").setInputFiles({ name: "unsent.png", mimeType: "image/png", buffer: bytes });
+    await expect(page.getByRole("status")).toContainText("Controlled predispatch join failure");
+    await expect.poll(pending).toEqual(rowsBefore);
+    assert.equal(uploads, uploadsBefore); assert.equal(sends, sendsBefore);
+    await page.reload(); await join("Unsent-" + kind);
+    await expect(page.getByLabel("Message", { exact: true })).toHaveValue("keep unsent " + kind);
+    await expect(page.getByRole("alert", { name: "Delivery status" })).toHaveCount(0);
+    if (kind === "text") {
+      await page.getByRole("button", { name: "Send", exact: true }).click();
+      await expect.poll(() => sends).toBe(sendsBefore + 1);
+    } else {
+      await page.locator("input[type=file]").setInputFiles({ name: "unsent.png", mimeType: "image/png", buffer: bytes });
+      await expect.poll(() => uploads).toBe(uploadsBefore + 1);
+    }
+    await expect.poll(async () => (await pending()).length).toBe(rowsBefore.length + 1);
+    checks.push(kind + " predispatch sync/rejoin failure releases exact reservation, preserves draft, and allows one explicit new attempt; dispatched UNKNOWN remains retained");
+  }
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ result: "PASS", checks, uploads, sends, pageErrors: errors, browser: browser.version(), scope: "Built public UI + loopback controlled protocol; not real database/candidate acceptance" }));
 } catch (error) {

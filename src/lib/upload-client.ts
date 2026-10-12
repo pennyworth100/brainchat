@@ -8,7 +8,8 @@ export async function uploadRoomFile(
   roomId: string,
   session: Pick<RoomSession, "sync" | "reconnect" | "uploadAuthority" | "operationGuard">,
   request: typeof fetch = fetch,
-  retainedClientMessageId?: string
+  retainedClientMessageId?: string,
+  beforeDispatch: () => void = () => {},
 ): Promise<{ message: ChatMessage }> {
   if (file.size > MAX_FILE_SIZE) throw new Error("File is too large (maximum 100 MB).");
   const checkOwner = session.operationGuard(roomId);
@@ -29,6 +30,7 @@ export async function uploadRoomFile(
     try {
       const form = new FormData();
       form.append("file", file);
+      beforeDispatch(); // Never classify a thrown fetch or unknown response as unsent.
       const response = await request("/api/upload", {
         method: "POST",
         redirect: "error", // Never forward bearer headers to a redirect target.

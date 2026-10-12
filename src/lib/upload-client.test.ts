@@ -107,3 +107,18 @@ test("explicit authentication rejection retries at most once and only at HTTP 40
     assert.equal(reconnects, status === 401 ? 1 : 0);
   }
 });
+
+test("public outbox dispatch marker stays false before request and true on synchronous network failure", async () => {
+  let dispatched = false, requests = 0;
+  const session = { operationGuard, uploadAuthority,
+    sync: async (): Promise<string> => { throw Error("preflight failed"); },
+    reconnect: async () => "unused" };
+  const send = () => uploadRoomFile(pdf(), "qa", session, () => {
+    requests++; assert.equal(dispatched, true); throw new TypeError("network failed");
+  }, "retained-key", () => { dispatched = true; });
+  await assert.rejects(send(), /preflight failed/);
+  assert.equal(dispatched, false); assert.equal(requests, 0);
+  session.sync = async () => "fresh";
+  await assert.rejects(send(), /Network interrupted/);
+  assert.equal(dispatched, true); assert.equal(requests, 1);
+});

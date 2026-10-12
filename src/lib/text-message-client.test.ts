@@ -144,3 +144,16 @@ test("concurrent sends cannot overlap the operation authority check", async () =
   await first;
   assert.equal(f.packets.length, 1);
 });
+
+test("public outbox dispatch marker distinguishes failed preflight from lost ACK", async () => {
+  const f = fixture();
+  let dispatched = false;
+  const send = () => f.sender.send(f.wire as unknown as Socket, f.session, "qa", "hello", () => { dispatched = true; });
+  f.session.sync = async () => { throw Error("preflight failed"); };
+  await assert.rejects(send(), /preflight failed/);
+  assert.equal(dispatched, false); assert.equal(f.packets.length, 0);
+  f.session.sync = async () => f.wire.id;
+  f.respond(async () => { assert.equal(dispatched, true); throw Error("lost ACK"); });
+  await assert.rejects(send(), /lost ACK/);
+  assert.equal(dispatched, true); assert.equal(f.packets.length, 1);
+});

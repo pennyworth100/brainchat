@@ -637,14 +637,17 @@ function RoomInner() {
     try { checkOwner = session.operationGuard(roomId); } catch { return; }
     sendingRef.current = true;
     setSending(true);
+    let unsentReservation: { scope: string; id: string } | undefined;
+    let dispatched = false;
     try {
       const scope = durableScopeRef.current;
       if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
       const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "text", payload: msg, outcome: "unknown" };
       await publicOutbox(scope, "reserve", operation);
+      unsentReservation = { scope, id: operation.clientMessageId };
       checkOwner();
       setPendingOperation(operation);
-      const message = await createTextSender(() => operation.clientMessageId).send(socket, session, roomId, msg);
+      const message = await createTextSender(() => operation.clientMessageId).send(socket, session, roomId, msg, () => { dispatched = true; });
       checkOwner();
       await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
       checkOwner();
@@ -654,6 +657,14 @@ function RoomInner() {
       receiveMessages([message]);
       setMsgInput((current) => current === msgInput ? "" : current);
     } catch (err) {
+      if (unsentReservation && !dispatched) {
+        try {
+          // Exact reservation only; no transport was invoked, even if its owner ended.
+          await publicOutbox(unsentReservation.scope, "settle", undefined, unsentReservation.id);
+          checkOwner();
+          setPendingOperation(undefined);
+        } catch { /* Failed deletion stays conservatively blocked; no replay. */ }
+      }
       // Stale success/error must not clear a draft, publish or resync a new join.
       try { checkOwner(); } catch { return; }
       setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
@@ -673,14 +684,17 @@ function RoomInner() {
       try { checkOwner = session.operationGuard(roomId); } catch { return; }
       const uploadId = getId();
       setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
+      let unsentReservation: { scope: string; id: string } | undefined;
+      let dispatched = false;
       try {
         const scope = durableScopeRef.current;
         if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
         const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "file", payload: file, outcome: "unknown" };
         await publicOutbox(scope, "reserve", operation);
+        unsentReservation = { scope, id: operation.clientMessageId };
         checkOwner();
         setPendingOperation(operation);
-        const data = await uploadRoomFile(file, roomId, session, fetch, operation.clientMessageId);
+        const data = await uploadRoomFile(file, roomId, session, fetch, operation.clientMessageId, () => { dispatched = true; });
         checkOwner();
         await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
         checkOwner();
@@ -691,6 +705,13 @@ function RoomInner() {
         setTimeline((prev) => prev.filter((item) => item.id !== uploadId));
         receiveMessages([data.message]);
       } catch (err) {
+        if (unsentReservation && !dispatched) {
+          try {
+            await publicOutbox(unsentReservation.scope, "settle", undefined, unsentReservation.id);
+            checkOwner();
+            setPendingOperation(undefined);
+          } catch { /* Failed deletion remains blocked; never discard uncertain work. */ }
+        }
         try { checkOwner(); } catch { return; }
         const reason = err instanceof Error ? err.message : "Please try again.";
         setTimeline((prev) => prev.map((item) => item.id === uploadId

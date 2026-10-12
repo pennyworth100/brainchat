@@ -26,7 +26,7 @@ export function createTextSender(
   const pending = new Map<string, PendingText>();
   let busy = false;
   return {
-    async send(socket: Socket, session: Session, roomId: string, message: string): Promise<ChatMessage> {
+    async send(socket: Socket, session: Session, roomId: string, message: string, beforeDispatch: () => void = () => {}): Promise<ChatMessage> {
       if (busy) throw new Error("A message is already being sent.");
       const identity = JSON.stringify([roomId, message]);
       let operation = pending.get(identity);
@@ -55,6 +55,7 @@ export function createTextSender(
         operation.transport = transport;
         operation.session = session;
         const keyedReceipt = session.canRetryText();
+        beforeDispatch(); // Conservative boundary: any subsequent failure may have dispatched.
         const result: unknown = await socket.volatile.timeout(timeoutMs).emitWithAck("send-message", {
           roomId: operation.roomId,
           message: operation.message,
