@@ -630,21 +630,28 @@ function RoomInner() {
     async (file: File) => {
       const session = sessionRef.current;
       if (!username || !file || !roomId || !session) return;
+      let checkOwner: () => void;
+      try { checkOwner = session.operationGuard(roomId); } catch { return; }
       const uploadId = getId();
       setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
       try {
         const data = await uploadRoomFile(file, roomId, session);
+        checkOwner();
         // The server persists + broadcasts before returning. No second socket
         // send is needed, so a disconnect cannot strand an uploaded attachment.
         setTimeline((prev) => prev.filter((item) => item.id !== uploadId));
         receiveMessages([data.message]);
       } catch (err) {
+        try { checkOwner(); } catch { return; }
         const reason = err instanceof Error ? err.message : "Please try again.";
         setTimeline((prev) => prev.map((item) => item.id === uploadId
           ? { kind: "sys" as const, text: `Upload failed: ${file.name} — ${reason}`, id: uploadId }
           : item));
       } finally {
-        session.sync().catch(() => {});
+        // Old work may remove its own spinner, never publish into or resync a
+        // replacement owner (including an explicit same-room rejoin).
+        setTimeline((prev) => prev.filter((item) => item.id !== uploadId || item.kind !== "uploading"));
+        try { checkOwner(); session.sync().catch(() => {}); } catch { /* owner ended */ }
       }
     },
     [username, roomId, receiveMessages]

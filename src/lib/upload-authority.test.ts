@@ -8,6 +8,7 @@ const file = () => new File(["hello"], "file.txt", { type: "text/plain" });
 const credential = () => ({ kind: "resume" as const, roomId: "files123", socketId: "socket-a",
   sessionId: "12345678-1234-4123-8123-123456789abc", token: "A".repeat(43) });
 const session = (auth: unknown = credential()) => ({
+  operationGuard: () => () => {},
   sync: async () => "socket-a",
   reconnect: async () => assert.fail("strict upload must not password-rejoin"),
   uploadAuthority: () => auth as UploadAuthority,
@@ -78,7 +79,7 @@ test("explicit legacy auth retry rechecks room ownership and cannot change crede
   for (const next of [null, credential(),
     { kind: "legacy", roomId: "other123", socketId: "socket-b" }]) {
     let calls = 0, authCalls = 0;
-    const s = { sync: async () => "socket-a", reconnect: async () => "socket-b",
+    const s = { operationGuard: () => () => {}, sync: async () => "socket-a", reconnect: async () => "socket-b",
       uploadAuthority: () => (++authCalls === 1
         ? { kind: "legacy", roomId: "files123", socketId: "socket-a" } : next) as UploadAuthority };
     await assert.rejects(uploadRoomFile(file(), "files123", s, async () => {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MAX_FILE_SIZE, uploadRoomFile } from "./upload-client";
 
+const operationGuard = () => () => {};
 const uploadAuthority = (roomId: string, socketId: string) => ({ kind: "legacy" as const, roomId, socketId });
 const pdf = () => new File(["%PDF-1.7\nQA\n%%EOF"], "report.pdf", { type: "application/pdf" });
 const response = () => Response.json({ message: { id: 42, type: "file" } });
@@ -9,7 +10,7 @@ const response = () => Response.json({ message: { id: 42, type: "file" } });
 test("PDF upload waits for resync and uses the fresh authenticated socket ID", async () => {
   let ready = false;
   await uploadRoomFile(pdf(), "qa", {
-    uploadAuthority,
+    operationGuard, uploadAuthority,
     sync: async () => { ready = true; return "fresh-id"; },
     reconnect: async () => assert.fail("unexpected reconnect"),
   }, async (_url, options) => {
@@ -22,7 +23,7 @@ test("PDF upload waits for resync and uses the fresh authenticated socket ID", a
 
 test("401 is safely retried once with a rejoined connection; HTTP errors are explicit", async () => {
   const ids: string[] = [];
-  const session = { uploadAuthority, sync: async () => "old-id", reconnect: async () => "new-id" };
+  const session = { operationGuard, uploadAuthority, sync: async () => "old-id", reconnect: async () => "new-id" };
   await uploadRoomFile(pdf(), "qa", session, async (_url, options) => {
     ids.push((options!.headers as Record<string, string>)["x-socket-id"]);
     return ids.length === 1 ? Response.json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room" }, { status: 401 }) : response();
@@ -34,7 +35,7 @@ test("401 is safely retried once with a rejoined connection; HTTP errors are exp
 
 test("oversized files are rejected before networking; failed PDF does not disconnect chat", async () => {
   let syncs = 0;
-  const session = { uploadAuthority, sync: async () => { syncs++; return "valid-id"; }, reconnect: async () => assert.fail("upload error must not disconnect chat") };
+  const session = { operationGuard, uploadAuthority, sync: async () => { syncs++; return "valid-id"; }, reconnect: async () => assert.fail("upload error must not disconnect chat") };
   await assert.rejects(uploadRoomFile({ size: MAX_FILE_SIZE + 1 } as File, "qa", session, async () => assert.fail("no HTTP for oversize")), /100 MB/);
   assert.equal(syncs, 0);
   let requests = 0;
@@ -47,7 +48,7 @@ test("unknown persistence outcome is displayed without an automatic upload retry
   let requests = 0;
   const message = "Attachment status is unknown. Check room history before uploading again.";
   await assert.rejects(uploadRoomFile(pdf(), "qa", {
-    uploadAuthority,
+    operationGuard, uploadAuthority,
     sync: async () => "valid-id",
     reconnect: async () => assert.fail("unknown outcome must not reconnect/retry"),
   }, async () => {
@@ -66,7 +67,7 @@ test("unclassified 401 responses never reconnect or repeat the body", async () =
   ]) {
     let requests = 0, reconnects = 0;
     await assert.rejects(uploadRoomFile(pdf(), "qa", {
-      uploadAuthority,
+      operationGuard, uploadAuthority,
       sync: async () => "valid-id",
       reconnect: async () => { reconnects++; return "must-not-retry"; },
     }, async () => { requests++; return rejected(); }));
@@ -79,7 +80,7 @@ test("unknown outcome dominates every HTTP status, including auth and success", 
   for (const status of [200, 401, 403, 500, 503]) {
     let requests = 0, reconnects = 0;
     await assert.rejects(uploadRoomFile(pdf(), "qa", {
-      uploadAuthority,
+      operationGuard, uploadAuthority,
       sync: async () => "valid-id",
       reconnect: async () => { reconnects++; return "must-not-retry"; },
     }, async () => {
@@ -95,7 +96,7 @@ test("explicit authentication rejection retries at most once and only at HTTP 40
   for (const status of [401, 403, 500]) {
     let requests = 0, reconnects = 0;
     await assert.rejects(uploadRoomFile(pdf(), "qa", {
-      uploadAuthority,
+      operationGuard, uploadAuthority,
       sync: async () => "old-id",
       reconnect: async () => { reconnects++; return "new-id"; },
     }, async () => {

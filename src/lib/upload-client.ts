@@ -6,11 +6,13 @@ export const MAX_FILE_SIZE = 100 * 1024 * 1024;
 export async function uploadRoomFile(
   file: File,
   roomId: string,
-  session: Pick<RoomSession, "sync" | "reconnect" | "uploadAuthority">,
+  session: Pick<RoomSession, "sync" | "reconnect" | "uploadAuthority" | "operationGuard">,
   request: typeof fetch = fetch
 ): Promise<{ message: ChatMessage }> {
   if (file.size > MAX_FILE_SIZE) throw new Error("File is too large (maximum 100 MB).");
+  const checkOwner = session.operationGuard(roomId);
   let socketId = await session.sync();
+  checkOwner();
   const clientMessageId = crypto.randomUUID();
   let authority = session.uploadAuthority(roomId, socketId);
   // Snapshot the mode before any request. A later legacy grant can never
@@ -19,6 +21,7 @@ export async function uploadRoomFile(
   // Retry only an explicit server pre-body authentication rejection.
   // Never retry ambiguous network failures, which might already be committed.
   for (let attempt = 0; attempt < 2; attempt++) {
+    checkOwner();
     const headers = uploadAuthorityHeaders(authority, roomId, socketId, clientMessageId);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
@@ -32,13 +35,16 @@ export async function uploadRoomFile(
         body: form,
         signal: controller.signal,
       });
+      checkOwner();
       const data = await response.json().catch(() => ({}));
+      checkOwner();
       const body = data && typeof data === "object" ? data : {};
       if (body.code === "UPLOAD_OUTCOME_UNKNOWN") {
         throw new Error("Attachment status is unknown. Check room history before uploading again.");
       }
       if (!strict && response.status === 401 && body.code === "UPLOAD_AUTH_REQUIRED" && attempt === 0) {
         socketId = await session.reconnect();
+        checkOwner();
         authority = session.uploadAuthority(roomId, socketId);
         // A mode change is a new operation, not an implicit credential upgrade.
         if (authority?.kind !== "legacy") throw Error("Upload authority changed. Please retry explicitly.");
@@ -69,6 +75,8 @@ export async function uploadRoomFile(
       if (err instanceof TypeError) throw new Error("Network interrupted. Check the chat before retrying.");
       throw err;
     } finally {
+      // Also settle an unread body when ownership changes after headers.
+      controller.abort();
       clearTimeout(timer);
     }
   }
