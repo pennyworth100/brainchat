@@ -5,7 +5,7 @@ import { MAX_FILE_SIZE, uploadRoomFile } from "./upload-client";
 const operationGuard = () => () => {};
 const uploadAuthority = (roomId: string, socketId: string) => ({ kind: "legacy" as const, roomId, socketId });
 const pdf = () => new File(["%PDF-1.7\nQA\n%%EOF"], "report.pdf", { type: "application/pdf" });
-const response = () => Response.json({ message: { id: 42, type: "file" } });
+const response = () => Response.json({ message: { id: 42, type: "file", name: pdf().name, size: pdf().size, username: "Owner", ts: 1, url: "/uploads/report.pdf" } });
 
 test("PDF upload waits for resync and uses the fresh authenticated socket ID", async () => {
   let ready = false;
@@ -106,4 +106,19 @@ test("explicit authentication rejection retries at most once and only at HTTP 40
     assert.equal(requests, status === 401 ? 2 : 1);
     assert.equal(reconnects, status === 401 ? 1 : 0);
   }
+});
+
+test("public outbox dispatch marker stays false before request and true on synchronous network failure", async () => {
+  let dispatched = false, requests = 0;
+  const session = { operationGuard, uploadAuthority,
+    sync: async (): Promise<string> => { throw Error("preflight failed"); },
+    reconnect: async () => "unused" };
+  const send = () => uploadRoomFile(pdf(), "qa", session, () => {
+    requests++; assert.equal(dispatched, true); throw new TypeError("network failed");
+  }, "retained-key", () => { dispatched = true; });
+  await assert.rejects(send(), /preflight failed/);
+  assert.equal(dispatched, false); assert.equal(requests, 0);
+  session.sync = async () => "fresh";
+  await assert.rejects(send(), /Network interrupted/);
+  assert.equal(dispatched, true); assert.equal(requests, 1);
 });

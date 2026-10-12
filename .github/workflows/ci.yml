@@ -197,6 +197,9 @@ jobs:
       - name: Install pinned Chromium for rendered browser acceptance
         run: npx playwright install --with-deps chromium
 
+      - name: Public outbox reload and fail-closed storage regression
+        run: node scripts/qa-public-outbox.mjs
+
       - name: Rendered mobile-viewport and desktop browser acceptance
         run: node scripts/qa-rendered-browser.mjs
 

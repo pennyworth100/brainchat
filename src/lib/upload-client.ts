@@ -7,13 +7,15 @@ export async function uploadRoomFile(
   file: File,
   roomId: string,
   session: Pick<RoomSession, "sync" | "reconnect" | "uploadAuthority" | "operationGuard">,
-  request: typeof fetch = fetch
+  request: typeof fetch = fetch,
+  retainedClientMessageId?: string,
+  beforeDispatch: () => void = () => {},
 ): Promise<{ message: ChatMessage }> {
   if (file.size > MAX_FILE_SIZE) throw new Error("File is too large (maximum 100 MB).");
   const checkOwner = session.operationGuard(roomId);
   let socketId = await session.sync();
   checkOwner();
-  const clientMessageId = crypto.randomUUID();
+  const clientMessageId = retainedClientMessageId ?? crypto.randomUUID();
   let authority = session.uploadAuthority(roomId, socketId);
   // Snapshot the mode before any request. A later legacy grant can never
   // downgrade an attempt that began with bearer authority.
@@ -28,6 +30,7 @@ export async function uploadRoomFile(
     try {
       const form = new FormData();
       form.append("file", file);
+      beforeDispatch(); // Never classify a thrown fetch or unknown response as unsent.
       const response = await request("/api/upload", {
         method: "POST",
         redirect: "error", // Never forward bearer headers to a redirect target.
@@ -55,6 +58,13 @@ export async function uploadRoomFile(
           : response.status === 429 ? "Too many uploads. Please try again later."
           : `Upload rejected (HTTP ${response.status}).`;
         throw new Error(typeof body.error === "string" ? body.error : fallback);
+      }
+      const savedMessage = body.message as ChatMessage | undefined;
+      if (!savedMessage || !Number.isSafeInteger(savedMessage.id) || savedMessage.id <= 0 ||
+          savedMessage.type !== "file" || savedMessage.name !== file.name || savedMessage.size !== file.size ||
+          typeof savedMessage.username !== "string" || !Number.isFinite(savedMessage.ts) ||
+          typeof savedMessage.url !== "string") {
+        throw Error("Upload receipt could not be verified. Check room history before uploading again.");
       }
       if (strict) {
         const saved = body.message as ChatMessage | undefined;

@@ -28,7 +28,7 @@ for (const status of [200, 401]) {
         const transport = sockets.sockets.sockets.get((options!.headers as Record<string, string>)["x-socket-id"]);
         requests.push(transport?.data.username ?? "missing");
         const respond = (code: number) => Response.json(code === 401 ? { code: "UPLOAD_AUTH_REQUIRED" } : {
-          message: { id: 1, type: "file", username: "original", name: "proof.txt", ts: 1 },
+          message: { id: 1, type: "file", username: "original", name: "proof.txt", ts: 1, size: 5, url: "/uploads/proof.txt" },
         }, { status: code });
         if (requests.length === 1) {
           if (phase === "headers") return new Promise(resolve => { release = () => resolve(respond(status)); });
