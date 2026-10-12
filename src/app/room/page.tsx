@@ -610,13 +610,18 @@ function RoomInner() {
     const session = sessionRef.current;
     const socket = socketRef.current;
     if (!msg || !username || !roomId || !session || !socket || sendingRef.current) return;
+    let checkOwner: () => void;
+    try { checkOwner = session.operationGuard(roomId); } catch { return; }
     sendingRef.current = true;
     setSending(true);
     try {
       const message = await textSenderRef.current!.send(socket, session, roomId, msg);
+      checkOwner();
       receiveMessages([message]);
       setMsgInput((current) => current === msgInput ? "" : current);
     } catch (err) {
+      // Stale success/error must not clear a draft, publish or resync a new join.
+      try { checkOwner(); } catch { return; }
       setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
         ? err.message : "Delivery not confirmed. Check the chat before retrying; your draft is kept.", id: getId() }]);
       session.sync().catch(() => {});

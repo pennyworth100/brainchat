@@ -111,6 +111,16 @@ async function main() {
       },
       isReady: () => a.connected,
       canRetryText: () => initialSnapshot.capabilities.textOperationKeys === true,
+      // This receipt-loss fixture has one fixed join. Controller revocation
+      // across explicit joins is covered independently by text-owner.test.ts.
+      operationGuard: (roomId: string) => {
+        const transport = a.id;
+        return () => {
+          assert.equal(roomId, created.roomId);
+          assert.equal(a.id, transport);
+          assert.ok(a.connected);
+        };
+      },
     };
     const browserSender = createTextSender();
     await assert.rejects(browserSender.send(browserWire, browserSession, created.roomId, "browser-uncertain"), /lost browser receipt/);

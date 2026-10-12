@@ -24,6 +24,7 @@ function fixture(maxPending = 32) {
     sync: async () => wire.id,
     isReady: () => ready,
     canRetryText: () => capable,
+    operationGuard: (_roomId: string) => () => {},
   };
   const sender = createTextSender(() => "key-" + ++next, 50, maxPending);
   return { wire, session, packets, sender,
@@ -143,4 +144,3 @@ test("concurrent sends cannot overlap the operation authority check", async () =
   await first;
   assert.equal(f.packets.length, 1);
 });
-
