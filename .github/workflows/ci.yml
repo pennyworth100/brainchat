@@ -146,6 +146,11 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py --server
 
+      - name: Private candidate CLI verifies TLS and role isolation before migration
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py --candidate
+
       - name: Actual public producers retain journal work through post-commit failure
         env:
           PG_BIN: /usr/lib/postgresql/16/bin

@@ -20,9 +20,10 @@ def run(argv, **kwargs):
 
 
 def main():
-    if sys.argv[1:] not in ([], ["--accounting"], ["--storage"], ["--server"]):
+    if sys.argv[1:] not in ([], ["--accounting"], ["--storage"], ["--server"], ["--candidate"]):
         raise ValueError("Expected no argument, --accounting, --storage or --server")
-    target = ("scripts/qa-owned-ledger-server.ts" if sys.argv[1:] == ["--server"] else
+    target = ("scripts/qa-candidate-server.ts" if sys.argv[1:] == ["--candidate"] else
+              "scripts/qa-owned-ledger-server.ts" if sys.argv[1:] == ["--server"] else
               "scripts/qa-strict-file-storage.ts" if sys.argv[1:] == ["--storage"] else
               "scripts/qa-strict-upload-accounting.ts" if sys.argv[1:] else "scripts/qa-upload-ledger-provider.ts")
     pg = Path(os.environ["PG_BIN"]).resolve(strict=True)
@@ -45,7 +46,9 @@ def main():
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         # These are generated runtime fixture files, never an existing cluster.
-        (data / "pg_hba.conf").write_text("hostssl all all 127.0.0.1/32 trust\nhost all all 0.0.0.0/0 reject\n")
+        hba = ("hostssl all dimle 127.0.0.1/32 trust\nhostssl all all 127.0.0.1/32 scram-sha-256\n"
+               if sys.argv[1:] == ["--candidate"] else "hostssl all all 127.0.0.1/32 trust\n")
+        (data / "pg_hba.conf").write_text(hba + "host all all 0.0.0.0/0 reject\n")
         with (data / "postgresql.conf").open("a") as config:
             config.write("\nlisten_addresses='127.0.0.1'\nunix_socket_directories=''\n"
                          f"port={port}\nssl=on\nssl_cert_file='{fixture}/server.crt'\n"
