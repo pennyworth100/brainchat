@@ -11,7 +11,9 @@ import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket } from "../src/lib/resume-socket";
 import { publishBrowserJoin } from "../src/lib/resume-browser-handshake";
 import { createBrowserResumeController, type BrowserLease } from "../src/lib/browser-resume-controller";
-import { ResumeOperationGate } from "../src/lib/resume-operation";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
+import { ResumeFileWriter } from "../src/lib/resume-file";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { publishBrowserSnapshot } from "../src/lib/resume-browser-snapshot";
 import { mergeMessages, type ChatMessage } from "../src/lib/room-session";
@@ -31,8 +33,8 @@ async function main() {
   let checks = 0; const check = (v: unknown) => { assert.ok(v); checks++; };
   try {
     await a.query('CREATE SCHEMA "' + schema + '"');
-    for (const name of ["0000_thin_stardust","0001_white_zarda","0003_spotty_zombie","0004_long_nighthawk","0005_free_blazing_skull"]) {
-      await a.query((await readFile("drizzle/" + name + ".sql", "utf8")).replaceAll('"public"."rooms"', '"' + schema + '"."rooms"'));
+    for (const name of ["0000_thin_stardust","0001_white_zarda","0003_spotty_zombie","0004_long_nighthawk","0005_free_blazing_skull","0006_cold_zuras"]) {
+      await a.query((await readFile("drizzle/" + name + ".sql", "utf8")).replaceAll('"public".', '"' + schema + '".'));
     }
     await a.query("INSERT INTO rooms (id) VALUES ('sync333')");
     const store = new ResumeStore(a), bindings = new ResumeBindings(), members = new ResumeMemberships(bindings);
@@ -52,6 +54,23 @@ async function main() {
     const syncTicket = controller.accept(ticket, client, await leaseWire);
     const binding = members.currentBindingFor(socket, owner); assert(binding);
     await a.query("INSERT INTO messages(room_id,username,type,content) VALUES ('sync333','peer','message','before snapshot')");
+    // Actual authenticated writer receipt must be identical to persisted history.
+    // Digest is trusted writer input here, not evidence of downloaded bytes.
+    const admissions = new ResumeUploadAdmissions(bindings);
+    const grant = admissions.admit(binding); assert(grant);
+    const fileWriter = new ResumeFileWriter(new ResumeUploadOperationGate(db, admissions));
+    const file = { storageKey: "a".repeat(64), name: "overlap.txt", size: 1,
+      mime: "text/plain", sha256: "b".repeat(64) };
+    const saved = await fileWriter.saveOnceWithOutcome(grant, "overlap_file_001", file);
+    if (!saved.completed) throw saved.error;
+    assert(saved.result.authorized);
+    const persistedFile = saved.result.value.message;
+    check(persistedFile.sha256 === file.sha256);
+    const retry = await fileWriter.saveOnceWithOutcome(grant, "overlap_file_001", { ...file, storageKey: "c".repeat(64) });
+    assert(retry.completed && retry.result.authorized);
+    check(!retry.result.value.inserted);
+    assert.deepEqual(retry.result.value.message, persistedFile); checks++;
+    admissions.release(grant);
     const readDone = latch();
     const snapshotWire = new Promise<{history:ChatMessage[],users:string[]}>(r => client!.once("fixture-snapshot", r));
     const adapter = controller.snapshot(client, syncTicket);
@@ -60,6 +79,9 @@ async function main() {
     }, adapter.request, reply => socket.emit("fixture-snapshot",reply));
     await readDone.promise;
     check(controller.status().phase === "syncing");
+    const overlapWire = new Promise<ChatMessage>(r => client!.once("fixture-live", r));
+    socket.emit("fixture-live", persistedFile);
+    adapter.receiveLive(await overlapWire);
     const live: ChatMessage[] = [];
     for (const type of ["message","image","file"] as const) {
       const content = type === "message" ? "after snapshot" : JSON.stringify(type === "image" ?
@@ -76,12 +98,14 @@ async function main() {
     const snapshot = await snapshotWire;
     const completed = controller.finishSync(client, 1, syncTicket, adapter.accept(snapshot));
     check(controller.status().phase === "ready");
-    check(completed.history.length === 4 && live.every(row => completed.history.some(saved => saved.id === row.id)));
-    check(snapshot.history.length === 1);
+    check(completed.history.length === 5 && live.every(row => completed.history.some(saved => saved.id === row.id)));
+    check(snapshot.history.length === 2);
+    assert.deepEqual(snapshot.history.find(row => row.id === persistedFile.id), persistedFile); checks++;
+    check(completed.history.filter(row => row.id === persistedFile.id).length === 1);
     check(live.every(row => !snapshot.history.some(saved => saved.id === row.id)));
     const merged = mergeMessages(live,snapshot.history);
-    check(merged.length === 4 && live.every(row=>merged.some(saved=>saved.id===row.id)));
-    check(mergeMessages(merged,live).length === 4); // existing merge helper does not lose/duplicate these events
+    check(merged.length === 5 && live.every(row=>merged.some(saved=>saved.id===row.id)));
+    check(mergeMessages(merged,live).length === 5); // existing merge helper does not lose/duplicate these events
     // IDs are allocated before commit. Two independent real SQL transactions:
     await b.query("BEGIN");
     const lower = (await b.query("INSERT INTO messages(room_id,username,content) VALUES ('sync333','peer','late lower id') RETURNING id")).rows[0].id;
@@ -99,6 +123,7 @@ async function main() {
       physicalSocket:true,realPostgres:true,historyHandoffExcludesConcurrentRows:3,
       existingMergePreservesDeliveredRows:true,privateControllerReadyBeforeSnapshot:false,validatedCompletionRetainsAllMedia:true,
       maxIdCursorMissesLateCommit:true,lower,higher,
+      actualFileWriterReceiptMatchesHistory:true,physicalOverlappingFileDeduplicated:true,
       limits:"PRIVATE validated window, not gap-free full-sync; direct SQL peer writers, not all-producer acceptance; file metadata only"}));
   } finally {
     releaseRead.resolve(); await pending;

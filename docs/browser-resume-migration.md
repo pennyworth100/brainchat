@@ -162,9 +162,22 @@ lower allocated ID can commit after a higher one. Two reads do not create an
 atomic cut. Need an evidenced ALL-writer publication/reconciliation boundary,
 including commit-success/fanout-failure/restart, before public wiring. This module
 does not automatically request subsequent reconciliation or retain payload bytes
-across reload. Current file history can include sha256 while live file replies
-omit it; overlapping contradictory projections fail closed until the authenticated
-file-byte contract is made coherent. No file metadata substitutes for stored bytes.
+across reload. The private ResumeFileWriter receipt now includes the canonical
+persisted sha256 on both insert and same-key retry, matching ResumeHistoryReader.
+The digest comes from the validated persisted record, not a client echo or the
+retry attempt's new storage path. Legacy files may still have no digest; missing
+versus present or changed digests for the same ID remain conflicting projections.
+No file metadata substitutes for stored bytes.
+
+The actual PostgreSQL/physical Socket.IO boundary fixture now runs the real file
+writer and receipt migration. It delivers the same file as a live event while
+the authorized snapshot containing it is withheld, then proves exact projection
+equality, single-row deduplication and READY only after validated completion.
+It also verifies a new-path same-key retry returns the original receipt. Twenty
+assertions cover this plus the existing concurrent-media/late-commit boundary.
+The supplied digest in this DB fixture is trusted test input, NOT an upload,
+download, rendered browser, retained payload or byte-integrity proof. Public
+file response wiring and byte validation remain open.
 
 No public activation, schema/dependency/version change, PR20 integration or
 production deployment. Same 3.0.33 draft, with physical capacity and recovery gates

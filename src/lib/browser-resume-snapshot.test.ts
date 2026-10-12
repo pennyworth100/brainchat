@@ -32,6 +32,20 @@ test("full reconciliation window accepts lower ID committed after a higher ID, n
   f.api.receiveLive(text(6));
   assert.deepEqual(f.consume(f.api.accept(reply([text(5), text(6)]))).history.map(row => row.id), [5, 6]);
 });
+test("file digest is preserved across overlap and divergent byte identities fail closed", () => {
+  const value = { ...file(1), sha256: "a".repeat(64) };
+  const f = createBrowserSnapshotWindow(request);
+  f.api.receiveLive(value);
+  const completion = f.consume(f.api.accept(reply([value])));
+  assert.equal(completion.history.length, 1);
+  assert.equal(completion.history[0].sha256, value.sha256);
+  for (const changed of [file(1), { ...value, sha256: "b".repeat(64) }]) {
+    const g = createBrowserSnapshotWindow(request);
+    g.api.receiveLive(value);
+    assert.throws(() => g.api.accept(reply([changed])), /Conflicting/);
+    assert.throws(() => g.api.accept(reply([value])), /closed/);
+  }
+});
 test("bounded window does not claim complete offline backlog", () => {
   const f = createBrowserSnapshotWindow(request);
   const result = f.consume(f.api.accept(reply(Array.from({ length: 100 }, (_, i) => text(i + 20)))));

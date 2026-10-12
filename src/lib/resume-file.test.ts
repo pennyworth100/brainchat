@@ -67,7 +67,7 @@ for (const mode of ["insert", "replay-new-path", "lost-ack", "tombstone", "wrong
     if (["insert", "replay-new-path"].includes(mode)) {
       assert.deepEqual(result, { completed: true, result: { authorized: true, value: {
         inserted: mode === "insert", message: { id: 9, type: "file", username: "Guest", ts: 1234,
-          url: stored.url, name: file.name, size: file.size, mime: file.mime },
+          url: stored.url, name: file.name, size: file.size, mime: file.mime, sha256: file.sha256 },
       } } });
       assert.equal(inserts, mode === "insert" ? 1 : 0); assert.equal(commits, 1);
     } else if (["copied-grant", "policy-denied"].includes(mode)) {
