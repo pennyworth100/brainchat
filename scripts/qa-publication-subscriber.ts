@@ -45,6 +45,58 @@ async function fixture(room="candy986") {
   const binding=await physical.owner.admit({credential,expectedGeneration:0,operationId:"admit_"+issued.sessionId});
   assert.ok(binding);return {...physical,binding,credential};
 }
+async function snapshotCut() {
+  await db.query("INSERT INTO rooms(id) VALUES ('snap123')");
+  const physical = await fixture("snap123");
+  const empty = await journal.snapshot(physical.binding);
+  check(empty?.cut === "full-bounded-statement" && empty.messages.length === 0);
+  check(await journal.snapshot({...physical.binding}) === null);
+  await db.query("INSERT INTO messages(room_id,username,content) SELECT 'snap123','peer','old '||i FROM generate_series(1,101) i");
+  const lowTx = await db.connect();
+  try {
+    await lowTx.query("BEGIN");
+    const low = (await lowTx.query("INSERT INTO messages(room_id,username,content) VALUES ('snap123','peer','late lower snapshot') RETURNING id")).rows[0].id;
+    const high = await writer.save(physical.binding,"higher snapshot"); assert.ok(high.authorized);
+    const cut = await journal.snapshot(physical.binding); assert.ok(cut);
+    check(cut.messages.length === 102 && cut.messages.some(row=>row.id===high.value.id));
+    check(!cut.messages.some(row=>row.id===low) && low < high.value.id);
+    // EMPTY claim while the snapshot is leased is NOT a drained/READY receipt.
+    check((await journal.claim(physical.binding))?.messages.length === 0);
+    check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND NOT acked",[physical.binding.sessionId])).rows[0].n === 102);
+    await lowTx.query("COMMIT");
+    const later = await journal.claim(physical.binding); assert.ok(later);
+    check(later.messages.length === 1 && later.messages[0].id === low);
+    const seen = new Set<number>();
+    physical.client.on("snapshot-cut",(batch:PublicationBatch,ack:(value:unknown)=>void)=>{
+      batch.messages.forEach(row=>seen.add(row.id));
+      ack({deliveryTry:batch.deliveryTry,ids:batch.messages.map(row=>row.id)});
+    });
+    const reply = await physical.socket.timeout(4000).emitWithAck("snapshot-cut",cut);
+    check(seen.size === 102);
+    check(await journal.acknowledge(physical.binding,cut,reply));
+    check(await journal.acknowledge(physical.binding,later,{deliveryTry:later.deliveryTry,ids:[low]}));
+    const refreshed = await journal.snapshot(physical.binding); assert.ok(refreshed);
+    check(refreshed.messages.length === 103 && refreshed.deliveryTry !== cut.deliveryTry);
+    await assert.rejects(journal.acknowledge(physical.binding,cut,reply),/lease lost/); checks++;
+    // Snapshot ACK loss is recoverable as ordinary leased journal batches.
+    await db.query("UPDATE publication_deliveries SET lease_until=clock_timestamp()-interval '1 second' WHERE session_id=$1",[physical.binding.sessionId]);
+    const retry = await journal.claim(physical.binding); assert.ok(retry);
+    check(retry.messages.length === 16 && retry.deliveryTry !== refreshed.deliveryTry);
+    // Corrupt TEST journal only: no silent truncated snapshot or receipt mutation.
+    await db.query("DELETE FROM message_publication_pending WHERE message_id=$1",[low]);
+    await assert.rejects(journal.snapshot(physical.binding),/journal gap/); checks++;
+    check((await db.query("SELECT delivery_try FROM publication_deliveries WHERE session_id=$1 AND message_id=$2",[physical.binding.sessionId,retry.messages[0].id])).rows[0].delivery_try === retry.deliveryTry);
+    console.log(JSON.stringify({phase:"subscriber-full-snapshot",rows:103,cutRows:102,
+      lateLowerCommit:true,emptyClaimNotReady:true,physicalClientACK:true,
+      snapshotACKLossRedelivers:true,scope:"private bounded SQL cut; no browser normalization/READY or public wiring"}));
+  } finally {
+    await lowTx.query("ROLLBACK"); lowTx.release();
+    await physical.owner.close(); physical.client.disconnect();
+    await db.query("DELETE FROM messages WHERE room_id='snap123'");
+    await db.query("DELETE FROM room_resume_sessions WHERE room_id='snap123'");
+    await db.query("DELETE FROM rooms WHERE id='snap123'");
+  }
+}
 async function seed() {
   await admin.query("CREATE SCHEMA subscriber_qa");
   for (const name of ["0000_thin_stardust","0003_spotty_zombie","0004_long_nighthawk","0005_free_blazing_skull","0006_cold_zuras"]) {
@@ -56,6 +108,7 @@ async function seed() {
   await db.query(await readFile("scripts/fixtures/publication-subscribers.sql","utf8"));
   await db.query("CREATE TABLE fixture_recovery (credential jsonb NOT NULL, generation integer NOT NULL)");
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
+  await snapshotCut();
   const first=await fixture(), second=await fixture(), foreign=await fixture("other123");
   const write=await writer.saveOnce(first.binding,"first_message","committed with no fanout");
   assert.ok(write.authorized);check(write.value.id>0);
@@ -132,6 +185,8 @@ async function seed() {
 
   const limited=await fixture("limit123");
   await db.query("INSERT INTO messages(room_id,username,content) SELECT 'limit123','peer','bounded '||i FROM generate_series(1,257) i");
+  await assert.rejects(journal.snapshot(limited.binding),/snapshot capacity/); checks++;
+  check((await db.query("SELECT session_id FROM publication_subscribers WHERE session_id=$1",[limited.binding.sessionId])).rowCount===0);
   for(let i=0;i<16;i++){
     const batch=await journal.claim(limited.binding);assert.ok(batch && batch.messages.length===16);
     check(await journal.acknowledge(limited.binding,batch,{deliveryTry:batch.deliveryTry,ids:batch.messages.map(m=>m.id)}));
@@ -140,6 +195,8 @@ async function seed() {
   check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1",[limited.binding.sessionId])).rows[0].n===256);
   const large=await fixture("large123");
   await db.query("INSERT INTO messages(room_id,username,content) VALUES ('large123','peer',repeat('x',1048576))");
+  await assert.rejects(journal.snapshot(large.binding),/snapshot byte capacity/); checks++;
+  check((await db.query("SELECT session_id FROM publication_subscribers WHERE session_id=$1",[large.binding.sessionId])).rowCount===0);
   await assert.rejects(journal.claim(large.binding),/byte capacity/);checks++;
   check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1",[large.binding.sessionId])).rows[0].n===0);
   // Test-only credential stays inside this disposable DB, never logs/artifacts.
