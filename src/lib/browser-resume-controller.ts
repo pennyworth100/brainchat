@@ -1,6 +1,7 @@
 import { isValidRoomId } from "./room-id";
 import type { UploadAuthority } from "./upload-authority";
 import { createBrowserSnapshotWindow, type SnapshotCompletion } from "./browser-resume-snapshot";
+import { createBrowserPublicationSnapshot, type PublicationCompletion } from "./browser-publication-snapshot";
 
 export type BrowserLease = Readonly<{
   roomId: string; username: string; sessionId: string; token: string;
@@ -22,8 +23,10 @@ const validKey = (key: string) => /^[A-Za-z0-9_-]{16,128}$/.test(key);
  */
 export function createBrowserResumeController(
   newKey = () => crypto.randomUUID(), now = Date.now, maxPending = 32,
+  syncProtocol: "legacy-window" | "publication-cut" = "legacy-window",
 ) {
   if (!Number.isSafeInteger(maxPending) || maxPending < 1) throw Error("Invalid pending limit");
+  if (!["legacy-window", "publication-cut"].includes(syncProtocol)) throw Error("Invalid synchronization protocol");
   let phase: Phase = "empty";
   let roomId = "", username = "";
   let lease: BrowserLease | null = null;
@@ -32,6 +35,7 @@ export function createBrowserResumeController(
   let lostCas: { ticket: CasAttempt; physical: object } | null = null;
   let syncAttempt: SyncAttempt | null = null;
   let snapshot: ReturnType<typeof createBrowserSnapshotWindow> | null = null;
+  let publication: ReturnType<typeof createBrowserPublicationSnapshot> | null = null;
   const pending = new Map<Operation, { sent: boolean }>();
   // Never recycle a key during this logical owner's lifetime, even after ACK.
   const usedKeys = new Set<string>();
@@ -81,7 +85,8 @@ export function createBrowserResumeController(
     lostCas = null;
     phase = "syncing";
     syncAttempt = Object.freeze({ sessionId: lease.sessionId, generation: lease.generation, requestId });
-    snapshot = createBrowserSnapshotWindow({ roomId, ...syncAttempt }, now);
+    if (syncProtocol === "publication-cut") publication = createBrowserPublicationSnapshot({ roomId, ...syncAttempt }, now);
+    else snapshot = createBrowserSnapshotWindow({ roomId, ...syncAttempt }, now);
     return syncAttempt;
   };
   return {
@@ -91,6 +96,7 @@ export function createBrowserResumeController(
       // must keep its unresolved drafts separately; they are not transferable.
       roomId = nextRoom; username = nextUser; transport = physical;
       snapshot?.cancel(); snapshot = null;
+      publication?.cancel(); publication = null;
       lease = null; pending.clear(); usedKeys.clear(); phase = "joining";
       syncAttempt = null; lostCas = null;
       attempt = Object.freeze({ kind: "join", operationId: freshKey(), expectedGeneration: 0 });
@@ -101,6 +107,7 @@ export function createBrowserResumeController(
       if (physical !== transport) return;
       transport = null;
       snapshot?.cancel(); snapshot = null;
+      publication?.cancel(); publication = null;
       syncAttempt = null;
       if (phase === "blocked" || phase === "uncertain") return;
       // Keep ORIGINAL CAS provenance, never a transfer receipt/provenance chain.
@@ -137,6 +144,27 @@ export function createBrowserResumeController(
     reject(ticket: Attempt, physical: object) {
       if (ticket !== attempt || physical !== transport) return;
       phase = "blocked"; attempt = null;
+    },
+    publicationSnapshot(physical: object, ticket: SyncAttempt) {
+      live();
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || !publication) {
+        throw Error("Stale publication acknowledgement");
+      }
+      return publication.api;
+    },
+    stagePublication(physical: object, ticket: SyncAttempt, completion: PublicationCompletion) {
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
+        throw Error("Stale publication acknowledgement");
+      }
+      live();
+      try {
+        if (!publication) throw Error("Missing publication snapshot");
+        const staged = publication.consume(completion);
+        publication = null;
+        // Remain syncing. No public READY path until durable ACK confirmation,
+        // empty-cut semantics and continued journal reconciliation are composed.
+        return staged;
+      } catch (error) { phase = "blocked"; throw error; }
     },
     snapshot(physical: object, ticket: SyncAttempt) {
       live();

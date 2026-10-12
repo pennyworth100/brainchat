@@ -12,6 +12,7 @@ import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
 import { ResumePublication, reconcilePublication, type PublicationBatch, type PublicationSnapshot } from "../src/lib/resume-publication";
 import { publishBrowserPublicationSnapshot } from "../src/lib/resume-browser-snapshot";
+import { createBrowserResumeController } from "../src/lib/browser-resume-controller";
 
 // Owned loopback database only. Raw SQL authority manipulation is TEST INPUT,
 // never a public authorization/transfer path.
@@ -80,13 +81,22 @@ async function snapshotCut() {
     // The actual SQL cut crosses the exact-owner request boundary, not newest100.
     // Withhold persistence of this client ACK to retain the lease-loss test below.
     let normalizedReply!: Promise<unknown>;
+    const controller = createBrowserResumeController(undefined, Date.now, 32, "publication-cut");
+    const join = controller.beginJoin("snap123", "Reader", physical.client);
+    const sync = controller.accept(join, physical.client, { ...physical.credential, username: "Reader",
+      generation: physical.binding.generation, expiresAt: physical.binding.expiresAt });
+    const adapter = controller.publicationSnapshot(physical.client, sync);
     physical.client.on("normalized-cut", (value, ack) => {
       check(value.cut === "full-bounded-statement" && value.window === undefined && value.ready === undefined);
       check(value.history.length === 103 && value.history.some((row: {id:number}) => row.id === low));
       check(value.history.every((row: {message:unknown;ts:unknown;content:unknown}) =>
         typeof row.message === "string" && typeof row.ts === "number" && row.content === undefined));
-      check(value.requestId === "normalized_request_001" && value.sessionId === physical.binding.sessionId);
-      ack({ deliveryTry: value.deliveryTry, ids: value.history.map((row: {id:number}) => row.id) });
+      check(value.requestId === adapter.request.requestId && value.sessionId === physical.binding.sessionId);
+      const staged = controller.stagePublication(physical.client, sync, adapter.accept(value));
+      check(staged.snapshot.history.length === 103 && staged.snapshot.history.some(row => row.id === low));
+      check(controller.status().phase === "syncing");
+      assert.throws(() => controller.beginOperation("message", "a".repeat(64)), /synchronized/); checks++;
+      ack(staged.ack);
     });
     check(await publishBrowserPublicationSnapshot(physical.socket, physical.owner, physical.binding, members,
       { snapshot: async binding => {
@@ -94,8 +104,7 @@ async function snapshotCut() {
         const snapshot = await journal.snapshot(binding); assert.ok(snapshot);
         refreshed = snapshot; return snapshot;
       } },
-      { roomId: "snap123", sessionId: physical.binding.sessionId, generation: physical.binding.generation,
-        requestId: "normalized_request_001" }, value => {
+      adapter.request, value => {
         normalizedReply = physical.socket.timeout(4000).emitWithAck("normalized-cut", value);
       }));
     const normalizedACK = await normalizedReply as {deliveryTry:string;ids:number[]};
@@ -112,7 +121,7 @@ async function snapshotCut() {
     check((await db.query("SELECT delivery_try FROM publication_deliveries WHERE session_id=$1 AND message_id=$2",[physical.binding.sessionId,retry.messages[0].id])).rows[0].delivery_try === retry.deliveryTry);
     console.log(JSON.stringify({phase:"subscriber-full-snapshot",rows:103,cutRows:102,
       lateLowerCommit:true,emptyClaimNotReady:true,physicalClientACK:true,
-      snapshotACKLossRedelivers:true,normalizedPhysicalHandoff:true,
+      snapshotACKLossRedelivers:true,normalizedPhysicalHandoff:true,actualControllerStagesFullCut:true,
       scope:"private normalized bounded SQL cut; no controller READY, retained browser dedup or public wiring"}));
   } finally {
     await lowTx.query("ROLLBACK"); lowTx.release();
