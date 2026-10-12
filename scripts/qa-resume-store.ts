@@ -54,6 +54,10 @@ try {
   await a.query("INSERT INTO resume_upload_budget VALUES (1, 10000000000, 0)");
   await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
     .replaceAll('"public".', '"' + schema + '".'));
+  const publicationPrototype = process.env.DIMLE_PUBLICATION_PROTOTYPE === "1";
+  if (publicationPrototype) {
+    await a.query(await readFile("scripts/fixtures/message-publication.sql", "utf8"));
+  }
   await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
   const first = new ResumeStore(a);
   const second = new ResumeStore(b);
@@ -1346,6 +1350,12 @@ try {
   console.log(JSON.stringify({ suite: "resume-upload-preflight-postgresql-loopback", checks: checks - beforePreflight,
     result: "PASS", scope: "real bearer lookup, physical owners, durable denials and observed DB lock races; no public HTTP parser" }));
   checks += await checkBrowserResumeCore(a, operationPool);
+  if (publicationPrototype) {
+    check((await a.query("SELECT id FROM messages EXCEPT SELECT message_id FROM message_publication_pending")).rowCount === 0);
+    check((await a.query("SELECT message_id FROM message_publication_pending EXCEPT SELECT id FROM messages")).rowCount === 0);
+    console.log(JSON.stringify({ suite: "private-publication-actual-writers", result: "PASS",
+      scope: "journal composed with actual text/image/file writer retries, rollback and private browser fixtures; NOT public all-producer acceptance" }));
+  }
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts, expiry cleanup and private preflight loopback; not full socket resume" }));
 } finally {
   await a.query("ROLLBACK");
