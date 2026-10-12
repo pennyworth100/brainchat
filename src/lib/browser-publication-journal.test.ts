@@ -98,4 +98,3 @@ test("disconnect and resumed generation cancel old journal until a new confirmed
   const physical = {}, ticket = f.c.accept(f.c.beginResume(physical),physical,{...f.lease,generation:2});
   assert.throws(() => f.c.receivePublication(physical,ticket,{...batch(),...ticket}),/Missing confirmed/);
 });
-

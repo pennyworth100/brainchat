@@ -50,4 +50,3 @@ export function createBrowserPublicationJournal(request: SnapshotRequest, seed: 
     } catch (error) { cancel(); throw error; }
   } };
 }
-
