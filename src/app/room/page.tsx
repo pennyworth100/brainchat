@@ -479,8 +479,10 @@ function RoomInner() {
         try {
           sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
           const scope = publicOwnerScope(sessionStorage, roomId, usernameRef.current!);
+          const initialRestore = durableScopeRef.current !== scope;
           durableScopeRef.current = scope;
-          setMsgInput(publicDraft(localStorage, scope));
+          // Transport sync must not overwrite a newer editor value after a storage failure.
+          if (initialRestore) setMsgInput(publicDraft(localStorage, scope));
           const checkOwner = session.operationGuard(roomId);
           void publicOutbox(scope, "read").then((pending) => {
             checkOwner();

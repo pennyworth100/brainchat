@@ -100,6 +100,21 @@ try {
   assert.equal(sends, 1);
   checks.push("lost text ACK survives reload with original payload/ID; explicit retry blocked");
 
+  await page.evaluate(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) {
+      if (this === localStorage) throw new DOMException("Full", "QuotaExceededError");
+      return original.call(this, key, value);
+    };
+  });
+  await page.getByLabel("Message", { exact: true }).fill("newer unsaved draft");
+  await expect(page.getByRole("alert", { name: "Delivery status" })).toContainText("Draft could not be saved");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("status")).toContainText("online");
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("newer unsaved draft");
+  checks.push("localStorage quota failure keeps the newer unsaved editor through actual transport sync");
+
+
   const deniedContext = await browser.newContext();
   await deniedContext.addInitScript(() => {
     IDBFactory.prototype.open = () => { throw new DOMException("Denied", "SecurityError"); };
