@@ -9,6 +9,7 @@ import multer from "multer";
 import { createUploadParser } from "./src/lib/upload-parser";
 import crypto from "crypto";
 import fs from "fs";
+import type { Pool } from "pg";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
@@ -229,10 +230,20 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-export async function main(options: Readonly<{ strictUploads?: OwnedStrictUploadConfiguration }> = {}) {
+export async function main(options: Readonly<{
+  strictUploads?: OwnedStrictUploadConfiguration;
+  // Private composition only. Caller owns these pools and closes them AFTER
+  // lifecycle settlement. No environment toggle or public activation.
+  databaseAuthorities?: Readonly<{ migrations: Pool; maintenance: Pool; publicationTables: boolean }>;
+}> = {}) {
+  const authorities = options.databaseAuthorities && { ...options.databaseAuthorities };
+  if (authorities && (authorities.migrations === pool || authorities.maintenance === pool ||
+      authorities.migrations === authorities.maintenance)) {
+    throw Error("Database authorities require three distinct pools");
+  }
   // Run migrations
   console.log("Running database migrations...");
-  await migrateDatabase(pool);
+  await migrateDatabase(authorities?.migrations ?? pool);
   // No upload namespace mutation during module import or failed migrations.
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   console.log("Migrations complete.");
@@ -299,8 +310,10 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
   });
   // One owner for the shared table, replacing four dependency-owned timers.
   // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
-  const rateLimitCleanup = new RateLimitCleanup(pool);
-  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(pool));
+  const maintenancePool = authorities?.maintenance ?? pool;
+  const rateLimitCleanup = new RateLimitCleanup(maintenancePool);
+  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(
+    maintenancePool, authorities?.publicationTables ?? false));
   const lifecycle = new ServerLifecycle({
     stopAndSettle: async () => {
       const [rateLimits, sessions] = await Promise.allSettled([

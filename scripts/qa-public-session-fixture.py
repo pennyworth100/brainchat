@@ -43,7 +43,8 @@ try:
          "--auth-host=trust", "--encoding=UTF8", "--locale=C"]).check_returncode()
     run([pg / "pg_ctl", "-D", data, "-l", owned / "server.log", "-o",
          f"-h 127.0.0.1 -p {port} -k {sock}", "-w", "start"]).check_returncode()
-    script = ("scripts/qa-public-upload-outcome.ts" if "--upload-outcome" in sys.argv else
+    script = ("scripts/qa-server-database-authorities.ts" if "--database-authorities" in sys.argv else
+              "scripts/qa-public-upload-outcome.ts" if "--upload-outcome" in sys.argv else
               "scripts/qa-process-shutdown.ts" if "--shutdown" in sys.argv else
               "scripts/qa-startup-migrations.ts" if "--startup" in sys.argv else
               "scripts/qa-server-lifecycle.ts" if "--lifecycle" in sys.argv else

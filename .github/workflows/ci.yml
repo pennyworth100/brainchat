@@ -136,6 +136,11 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-public-session-fixture.py
 
+      - name: Actual server with separate runtime and maintenance LOGINs
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py --database-authorities
+
       - name: Actual server owns verified-TLS ledger settlement (separate owned cluster)
         env:
           PG_BIN: /usr/lib/postgresql/16/bin
