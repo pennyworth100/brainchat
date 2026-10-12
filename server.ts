@@ -1,4 +1,5 @@
 import express from "express";
+import { isWriteCapacityError, writeCapacityReply } from "./src/lib/write-capacity-error";
 import { createUploadDownloadRouter } from "./src/lib/upload-download";
 import http from "http";
 import { Server, type Socket } from "socket.io";
@@ -542,6 +543,11 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
           // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
           // even when no row is visible: there is no safe retry/reclamation receipt.
           console.error("upload persistence outcome unknown:", err);
+          if (isWriteCapacityError(err)) return res.status(503).json({
+            ...writeCapacityReply(), code: "UPLOAD_OUTCOME_UNKNOWN",
+            reason: "WRITE_CAPACITY_EXHAUSTED",
+            error: "Attachment storage capacity is exhausted. Check room history before uploading again.",
+          });
           return res.status(500).json({
             code: "UPLOAD_OUTCOME_UNKNOWN",
             error: "Attachment status is unknown. Check room history before uploading again.",
@@ -653,6 +659,7 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
         return res.status(409).json({ error: err.message });
       }
       console.error("POST /api/send error:", err);
+      if (isWriteCapacityError(err)) return res.status(503).json(writeCapacityReply());
       res.status(500).json({ error: "Internal error" });
     }
   })));
@@ -836,6 +843,9 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
           }
         } catch (err) {
           console.error(event + " error:", err);
+          if (current() && isWriteCapacityError(err)) return reply({
+            ...writeCapacityReply(), clientMessageId: request.clientMessageId,
+          });
           // Even a COMMIT rejection can mean a committed row. Never claim rollback.
           if (current()) reply({ error: "Write outcome unknown; sync before retrying",
             outcome: "unknown", clientMessageId: request.clientMessageId });
