@@ -20,9 +20,10 @@ def run(argv, **kwargs):
 
 
 def main():
-    if sys.argv[1:] not in ([], ["--accounting"], ["--storage"]):
-        raise ValueError("Expected no argument, --accounting or --storage")
-    target = ("scripts/qa-strict-file-storage.ts" if sys.argv[1:] == ["--storage"] else
+    if sys.argv[1:] not in ([], ["--accounting"], ["--storage"], ["--server"]):
+        raise ValueError("Expected no argument, --accounting, --storage or --server")
+    target = ("scripts/qa-owned-ledger-server.ts" if sys.argv[1:] == ["--server"] else
+              "scripts/qa-strict-file-storage.ts" if sys.argv[1:] == ["--storage"] else
               "scripts/qa-strict-upload-accounting.ts" if sys.argv[1:] else "scripts/qa-upload-ledger-provider.ts")
     pg = Path(os.environ["PG_BIN"]).resolve(strict=True)
     for binary in ("initdb", "pg_ctl"):

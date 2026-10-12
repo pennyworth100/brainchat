@@ -131,6 +131,11 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-public-session-fixture.py
 
+      - name: Actual server owns verified-TLS ledger settlement (separate owned cluster)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py --server
+
       - name: Concurrent startup migrations and SIGKILL lock release (owned PostgreSQL)
         env:
           PG_BIN: /usr/lib/postgresql/16/bin
