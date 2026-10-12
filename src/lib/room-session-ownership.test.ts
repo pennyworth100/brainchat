@@ -97,6 +97,33 @@ for (const kind of ["sync", "checkHealth"] as const) {
   }
 }
 
+for (const change of ["same", "different", "terminal", "dispose"]) {
+  test(`captured upload owner rejects ${change} after successful sync`, async t => {
+    const f = delayedTransport();
+    t.after(() => f.session.dispose());
+    f.session.join({ roomId: "same", username: "first" });
+    const check = f.session.operationGuard("same");
+    const syncing = f.session.sync();
+    f.acks[0](null, { history: [], users: [] });
+    await syncing;
+    check();
+    if (change === "dispose") f.session.dispose();
+    else if (change === "terminal") f.events.emit("join-error", "Wrong password");
+    else f.session.join({ roomId: change, username: "second" });
+    assert.throws(check, /Room (changed|closed)/);
+  });
+}
+
+test("upload owner is room-bound and survives only transport recovery", async t => {
+  const f = delayedTransport();
+  t.after(() => f.session.dispose());
+  f.session.join({ roomId: "same", username: "first" });
+  assert.throws(() => f.session.operationGuard("other"), /Room changed/);
+  const check = f.session.operationGuard("same");
+  await f.session.reconnect();
+  check();
+});
+
 test("disposal revokes ready/text/upload authority without relying on socket disconnect", () => {
   const f = delayedTransport(true);
   f.session.join({ roomId: "same", username: "first" });

@@ -248,6 +248,19 @@ export function createRoomSession(
       setState("reconnecting");
       socket.connect();
     },
+    // Capture the logical owner before the first await. Transport recovery may
+    // retain it; an explicit same-room join, terminal failure or disposal cannot.
+    operationGuard(roomId: string) {
+      const owner = roomEpoch;
+      const check = () => {
+        if (disposed) throw new Error("Room closed. Check room history before retrying.");
+        if (!credentials || credentials.roomId !== roomId || owner !== roomEpoch) {
+          throw new Error("Room changed. Check room history before retrying.");
+        }
+      };
+      check();
+      return check;
+    },
     sync,
     checkHealth,
     async reconnect() {

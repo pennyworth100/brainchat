@@ -202,6 +202,7 @@ async function main() {
     // Real client retries exactly once only after the actual pre-body marker.
     let retryRequests = 0, retryReconnects = 0;
     const retryResult = await uploadRoomFile(new File(["retry-proof"], "retry.txt"), created.roomId, {
+      operationGuard: () => () => {},
       uploadAuthority: (roomId, socketId) => ({ kind: "legacy", roomId, socketId }),
       sync: async () => "stale-socket",
       reconnect: async () => { retryReconnects++; return a.id!; },
@@ -259,6 +260,7 @@ async function main() {
       created.roomId, {
         sync: async () => a.id!,
         reconnect: async () => assert.fail("strict browser must not password-rejoin"),
+        operationGuard: () => () => {},
         uploadAuthority: (roomId, socketId) => ({ kind: "resume", roomId, socketId,
           sessionId: first.id, token }),
       }, async (path, options) => {
