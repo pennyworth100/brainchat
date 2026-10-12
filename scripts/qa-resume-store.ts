@@ -1,0 +1,1145 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { readFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Pool } from "pg";
+import { ResumeStore } from "../src/lib/resume-store";
+import { ResumeBindings } from "../src/lib/resume-bindings";
+import { ResumeAdmission } from "../src/lib/resume-admission";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
+import { ResumeHistoryReader } from "../src/lib/resume-history";
+import { insertResumeTextMessage, ResumeMessageWriter } from "../src/lib/resume-message";
+import { ResumeImageWriter } from "../src/lib/resume-image";
+import { ResumeFileWriter } from "../src/lib/resume-file";
+import { ResumeFileStorage } from "../src/lib/resume-file-storage";
+import { ResumeFileUpload } from "../src/lib/resume-file-upload";
+import { ResumeUploadReservations } from "../src/lib/resume-upload-reservation";
+import { claimRoomPolicy } from "../src/lib/room-policy";
+import { createServer } from "node:http";
+import { Server, type Socket as ServerSocket } from "socket.io";
+import { io, type Socket as ClientSocket } from "socket.io-client";
+import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
+import { ResumeMemberships } from "../src/lib/resume-membership";
+import { preflightResumeUpload } from "../src/lib/resume-upload-preflight";
+
+// Explicit opt-in only. Never infer a live DATABASE_URL as permission to test.
+async function main() {
+if (!process.env.RESUME_TEST_DATABASE_URL) throw new Error("RESUME_TEST_DATABASE_URL required (isolated DB only)");
+const pool = new Pool({ connectionString: process.env.RESUME_TEST_DATABASE_URL });
+const schema = "resume_qa_" + randomBytes(8).toString("hex");
+const operationPool = new Pool({ connectionString: process.env.RESUME_TEST_DATABASE_URL,
+  options: "-c search_path=" + schema, max: 1 });
+const a = await pool.connect();
+const b = await pool.connect();
+let checks = 0;
+const check = (value: unknown) => { assert.ok(value); checks++; };
+try {
+  await a.query('CREATE SCHEMA "' + schema + '"');
+  for (const client of [a, b]) await client.query('SET search_path TO "' + schema + '"');
+  await a.query((await readFile("drizzle/0000_thin_stardust.sql", "utf8"))
+    .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"'));
+  await a.query("ALTER TABLE rooms ADD COLUMN creation_token_hash text");
+  await a.query(await readFile("drizzle/0003_spotty_zombie.sql", "utf8"));
+  // Apply the actual generated additive migration, scoped to our private fixture.
+  const sql = (await readFile("drizzle/0004_long_nighthawk.sql", "utf8"))
+    .replaceAll('"public"."rooms"', '"' + schema + '"."rooms"');
+  await a.query(sql);
+  await a.query(await readFile("drizzle/0005_free_blazing_skull.sql", "utf8"));
+  await a.query(await readFile("drizzle/0007_motionless_wolfpack.sql", "utf8"));
+  await a.query(await readFile("drizzle/0008_dark_grim_reaper.sql", "utf8"));
+  await a.query("INSERT INTO resume_upload_budget VALUES (1, 10000000000, 0)");
+  await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
+    .replaceAll('"public".', '"' + schema + '".'));
+  await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
+  const first = new ResumeStore(a);
+  const second = new ResumeStore(b);
+  const secondPid = (await b.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  const waitForBlockedSecond = async (pid = secondPid) => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const waiting = await a.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1", [pid]);
+      if (waiting.rows[0]?.wait_event_type === "Lock") return;
+      // Refresh statistics within the controlling transaction.
+      await a.query("SELECT pg_stat_clear_snapshot()");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error("Expected a real competing database lock wait");
+  };
+  const issued = await first.issueAfterAuthenticatedJoin("candy986", "Guest", 1);
+  assert.ok(issued);
+  const credential = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+  check(issued.expiresAt.getTime() - issued.issuedAt.getTime() === 86_400_000);
+  const persisted = await a.query("SELECT * FROM room_resume_sessions");
+  check(!JSON.stringify(persisted.rows).includes(issued.token));
+  check(persisted.rows[0].token_hash.length === 64);
+  const recovered = await second.lookup(credential);
+  check(recovered?.username === "Guest" && recovered.generation === 0);
+  check(recovered?.expiresAt.getTime() === issued.expiresAt.getTime());
+  check(!("tokenHash" in recovered!) && !("token" in recovered!));
+  check(await second.lookup({ ...credential, roomId: "spoon651" }) === null);
+  check(await second.lookup({ ...credential, token: randomBytes(32).toString("base64url") }) === null);
+  check(await second.revoke(credential, 1) === false);
+  check(await second.lookup(credential) !== null);
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'candy986'");
+  check(await second.lookup(credential) === null);
+  check(await first.issueAfterAuthenticatedJoin("candy986", "Guest", 1) === null);
+  const current = await first.issueAfterAuthenticatedJoin("candy986", "Guest", 2);
+  assert.ok(current);
+  const currentCredential = { roomId: current.roomId, sessionId: current.sessionId, token: current.token };
+  check(await second.lookup(currentCredential) !== null);
+  check(await second.revoke(currentCredential, 0) === true);
+  check(await first.lookup(currentCredential) === null);
+  check(await second.revoke(currentCredential, 0) === false);
+  const expired = await first.issueAfterAuthenticatedJoin("candy986", "Guest", 2);
+  assert.ok(expired);
+  await a.query("UPDATE room_resume_sessions SET expires_at = statement_timestamp() WHERE id = $1", [expired.sessionId]);
+  check(await second.lookup({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }) === null);
+  check(await first.issueAfterAuthenticatedJoin("other123", "Guest", 1) === null);
+  const cas = await first.issueAfterAuthenticatedJoin("candy986", "CAS Guest", 2);
+  assert.ok(cas);
+  const cc = { roomId: cas.roomId, sessionId: cas.sessionId, token: cas.token };
+  const opA = "operation_A_123456", opB = "operation_B_123456";
+  const socketA = "transport_A_123456", socketB = "transport_B_123456";
+  const race = await Promise.all([
+    first.advanceGeneration(cc, 0, opA, socketA),
+    second.advanceGeneration(cc, 0, opB, socketB),
+  ]);
+  check(race.filter(Boolean).length === 1);
+  const winner = race[0] ? { op: opA, socket: socketA } : { op: opB, socket: socketB };
+  check(race.find(Boolean)?.generation === 1);
+  check((await second.advanceGeneration(cc, 0, winner.op, winner.socket))?.generation === 1);
+  check(await second.advanceGeneration(cc, 0, winner.op, "different_socket_123") === null);
+  check(await second.advanceGeneration(cc, 1, winner.op, winner.socket) === null);
+  check((await first.lookup(cc))?.generation === 1);
+  check((await first.lookup(cc))?.expiresAt.getTime() === cas.expiresAt.getTime());
+  check(await first.revoke(cc, 0) === false);
+  check(await first.advanceGeneration({ ...cc, roomId: "spoon651" }, 1, "operation_C_123456", socketA) === null);
+  check(await first.advanceGeneration({ ...cc, token: randomBytes(32).toString("base64url") }, 1, "operation_C_123456", socketA) === null);
+  // New transport explicitly recovers generation through read-only lookup, then
+  // makes a new operation. The data layer never retries a losing CAS itself.
+  check((await second.advanceGeneration(cc, 1, "operation_C_123456", socketB))?.generation === 2);
+  check(await first.advanceGeneration(cc, 0, winner.op, winner.socket) === null);
+  const retries = await Promise.all([
+    first.advanceGeneration(cc, 2, "operation_D_123456", socketB),
+    second.advanceGeneration(cc, 2, "operation_D_123456", socketB),
+  ]);
+  check(retries.every(result => result?.generation === 3));
+  check((await first.lookup(cc))?.generation === 3);
+  check(await second.revoke(cc, 3) === true);
+  check(await first.advanceGeneration(cc, 2, "operation_D_123456", socketB) === null);
+  check(await first.advanceGeneration(cc, 3, "operation_E_123456", socketB) === null);
+  check(await first.advanceGeneration(credential, 0, opA, socketA) === null); // stale authVersion
+  check(await first.advanceGeneration({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }, 0, opA, socketA) === null);
+  const unchanged = (await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [cas.sessionId])).rows[0];
+  check(unchanged.generation === 3);
+  // Force a session-row lock wait, then revoke before the pending CAS can run.
+  const locked = await first.issueAfterAuthenticatedJoin("candy986", "Locked Guest", 2);
+  assert.ok(locked);
+  const lc = { roomId: locked.roomId, sessionId: locked.sessionId, token: locked.token };
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [locked.sessionId]);
+  const pending = second.advanceGeneration(lc, 0, opA, socketA);
+  await waitForBlockedSecond();
+  await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [locked.sessionId]);
+  await a.query("COMMIT");
+  check(await pending === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [locked.sessionId])).rows[0].generation === 0);
+  const policy = await first.issueAfterAuthenticatedJoin("candy986", "Policy Guest", 2);
+  assert.ok(policy);
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 3 WHERE id = 'candy986'");
+  const policyPending = second.advanceGeneration({ roomId: policy.roomId, sessionId: policy.sessionId, token: policy.token }, 0, opA, socketA);
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await policyPending === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [policy.sessionId])).rows[0].generation === 0);
+  // Durable operation gate: real competing clients, actual writes and rollback.
+  const probeClient = await operationPool.connect();
+  const operationPid = (await probeClient.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  probeClient.release();
+  const bindings = new ResumeBindings();
+  const gate = new ResumeOperationGate(operationPool, bindings);
+  const makeBinding = async () => {
+    const session = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 3);
+    assert.ok(session);
+    const credential = { roomId: session.roomId, sessionId: session.sessionId, token: session.token };
+    const transportId = "transport_" + session.sessionId;
+    const identity = await first.advanceGeneration(credential, 0, opA, transportId);
+    assert.ok(identity);
+    const binding = await bindings.activate(identity, transportId, async () => {}, () => true);
+    assert.ok(binding);
+    return { credential, binding };
+  };
+  const count = async () => Number((await a.query("SELECT count(*) FROM messages")).rows[0].count);
+  let calls = 0;
+  const write = async (tx: Pick<typeof a, "query">, binding = happy.binding) => {
+    calls++;
+    await insertResumeTextMessage(tx, binding, "committed");
+    return "receipt";
+  };
+  const happy = await makeBinding();
+  const result = await gate.run(happy.binding, write);
+  check(result.authorized && result.value === "receipt");
+  check(await count() === 1);
+  check(!(await gate.run({ ...happy.binding }, write)).authorized);
+  check(calls === 1); // copied object never reaches database work
+
+  // CAS commits first while operation is blocked: old local binding still looks
+  // current, but the durable generation wins and the callback is never invoked.
+  const superseded = await makeBinding();
+  await a.query("BEGIN");
+  await first.advanceGeneration(superseded.credential, 1, opB, socketB);
+  const oldWrite = gate.run(superseded.binding, write);
+  await waitForBlockedSecond(operationPid);
+  await a.query("COMMIT");
+  check(!(await oldWrite).authorized);
+  check(calls === 1 && await count() === 1);
+
+  // Conversely, an authorized write holds the session lock until commit; CAS
+  // must wait, so this write cannot be persisted after a successor wins.
+  const winnerWrite = await makeBinding();
+  let entered!: () => void, finish!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  const release = new Promise<void>(resolve => { finish = resolve; });
+  const heldWrite = gate.run(winnerWrite.binding, async tx => {
+    await write(tx, winnerWrite.binding); entered(); await release; return "serialized";
+  });
+  await ready;
+  const waitingCas = second.advanceGeneration(winnerWrite.credential, 1, opB, socketB);
+  await waitForBlockedSecond();
+  finish();
+  check((await heldWrite).authorized);
+  check((await waitingCas)?.generation === 2);
+  check(await count() === 2);
+  check(!(await gate.run(winnerWrite.binding, write)).authorized);
+
+  const revokedWrite = await makeBinding();
+  await a.query("BEGIN");
+  await first.revoke(revokedWrite.credential, 1);
+  const afterRevoke = gate.run(revokedWrite.binding, write);
+  await waitForBlockedSecond(operationPid);
+  await a.query("COMMIT");
+  check(!(await afterRevoke).authorized);
+  check(calls === 2);
+
+  const expiryWrite = await makeBinding();
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [expiryWrite.binding.sessionId]);
+  const afterExpiry = gate.run(expiryWrite.binding, write);
+  await waitForBlockedSecond(operationPid);
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [expiryWrite.binding.sessionId]);
+  await a.query("COMMIT");
+  check(!(await afterExpiry).authorized);
+  check(calls === 2); // DB expiry overrides still-unexpired local binding
+
+  const disconnected = await makeBinding();
+  check(!(await gate.run(disconnected.binding, async tx => {
+    await write(tx, disconnected.binding); bindings.detach(disconnected.binding);
+  })).authorized);
+  check(await count() === 2); // mutation rolled back after local disconnect
+  const failed = await makeBinding();
+  await assert.rejects(gate.run(failed.binding, async tx => {
+    await write(tx, failed.binding); throw new Error("controlled callback failure");
+  }));
+  checks++;
+  check(await count() === 2);
+  const failingSql = await makeBinding();
+  await assert.rejects(gate.run(failingSql.binding, async tx => {
+    await write(tx, failingSql.binding); await tx.query("SELECT 1 / 0");
+  }));
+  checks++;
+  check(await count() === 2);
+  const expiresDuringWork = await makeBinding();
+  check(!(await gate.run(expiresDuringWork.binding, async tx => {
+    await write(tx, expiresDuringWork.binding);
+    await tx.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1",
+      [expiresDuringWork.binding.sessionId]);
+  })).authorized);
+  check(await count() === 2);
+
+  const policyWrite = await makeBinding();
+  const currentOperationClient = await operationPool.connect();
+  const currentOperationPid = (await currentOperationClient.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  currentOperationClient.release();
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 4 WHERE id = 'candy986'");
+  const afterPolicy = gate.run(policyWrite.binding, write);
+  // Failed operations discard their checkouts; observe the replacement PID.
+  await waitForBlockedSecond(currentOperationPid);
+  await a.query("COMMIT");
+  check(!(await afterPolicy).authorized);
+  check(await count() === 2);
+  // Actual writer uses the same gate and exact binding identity, not caller room/name.
+  const currentSession = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
+  assert.ok(currentSession);
+  const currentIdentity = await first.advanceGeneration({ roomId: currentSession.roomId,
+    sessionId: currentSession.sessionId, token: currentSession.token }, 0, opA, "transport_" + currentSession.sessionId);
+  assert.ok(currentIdentity);
+  const currentBinding = await bindings.activate(currentIdentity, "transport_" + currentIdentity.sessionId, async () => {}, () => true);
+  assert.ok(currentBinding);
+  const writer = new ResumeMessageWriter(gate);
+  const saved = await writer.save(currentBinding, "  literal ' $1 text  ");
+  check(saved.authorized && saved.value.username === "Writer" &&
+    saved.value.message === "  literal ' $1 text  " && Number.isFinite(saved.value.ts));
+  check(await count() === 3);
+  const stored = (await a.query("SELECT * FROM messages ORDER BY id DESC LIMIT 1")).rows[0];
+  check(saved.authorized && stored.id === saved.value.id && stored.room_id === "candy986" &&
+    stored.username === "Writer" && stored.client_message_id === null);
+  check(!(await writer.save({ ...currentBinding }, "forged")).authorized);
+  await assert.rejects(writer.save(currentBinding, " ")); checks++;
+  await assert.rejects(writer.save(currentBinding, "x".repeat(10001))); checks++;
+  check(await count() === 3);
+  // Same-username sessions do not accidentally collide with the agent unique key.
+  const agent = await a.query("INSERT INTO messages (room_id, username, content, client_message_id) VALUES ('candy986', 'Writer', 'agent', 'key') RETURNING id");
+  const secondSaved = await writer.save(currentBinding, "agent");
+  check(secondSaved.authorized && secondSaved.value.id !== agent.rows[0].id);
+  check(await count() === 5); // no durable retry/deduplication claim
+  const sibling = await first.issueAfterAuthenticatedJoin("candy986", "Writer", 4);
+  assert.ok(sibling);
+  const siblingIdentity = await first.advanceGeneration({ roomId: sibling.roomId,
+    sessionId: sibling.sessionId, token: sibling.token }, 0, opA, "transport_" + sibling.sessionId);
+  assert.ok(siblingIdentity);
+  let conflictingPrepare = false;
+  check(await bindings.activate(siblingIdentity, currentBinding.transportId,
+    async () => { conflictingPrepare = true; }, () => true) === null);
+  check(!conflictingPrepare && bindings.isCurrent(currentBinding));
+  const siblingBinding = await bindings.activate(siblingIdentity, "transport_" + siblingIdentity.sessionId, async () => {}, () => true);
+  assert.ok(siblingBinding);
+  const siblingSaved = await writer.save(siblingBinding, "agent");
+  check(siblingSaved.authorized && secondSaved.authorized &&
+    siblingSaved.value.id !== secondSaved.value.id);
+  check(await count() === 6);
+  check((await writer.save(siblingBinding, "x".repeat(10000))).authorized);
+  check(await count() === 7);
+  // Write wins first: real room-policy mutation waits until message COMMIT.
+  let messageEntered!: () => void, messageFinish!: () => void;
+  const messageReady = new Promise<void>(r => { messageEntered = r; });
+  const messageRelease = new Promise<void>(r => { messageFinish = r; });
+  const beforePolicy = gate.run(currentBinding, async tx => {
+    const receipt = await insertResumeTextMessage(tx, currentBinding, "before policy");
+    messageEntered(); await messageRelease; return receipt;
+  });
+  await messageReady;
+  const pendingPolicy = b.query("UPDATE rooms SET auth_version = 5 WHERE id = 'candy986'");
+  await waitForBlockedSecond();
+  messageFinish();
+  check((await beforePolicy).authorized);
+  await pendingPolicy;
+  check(await count() === 8);
+  check(!(await writer.save(currentBinding, "after policy")).authorized);
+  check(!(await writer.save(siblingBinding, "after policy")).authorized);
+  check(await count() === 8);
+  await a.query("DELETE FROM messages WHERE room_id = 'candy986'");
+  await a.query("DELETE FROM rooms WHERE id = 'candy986'");
+  check(Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count) === 0);
+  // A claim consumes the token and increments policy in ONE write. A second
+  // claimant actually waits on the first updater, then loses without mutation.
+  await a.query("INSERT INTO rooms (id, creation_token_hash) VALUES ('claim123', 'claim-token')");
+  check(await first.issueAfterAuthenticatedJoin("claim123", "Guest", 1) === null);
+  check(await claimRoomPolicy(a, "claim123", "wrong-token", "wrong-password") === null);
+  await a.query("BEGIN");
+  const claim = await claimRoomPolicy(a, "claim123", "claim-token", "password-A");
+  check(claim?.authVersion === 2 && claim.passwordHash === "password-A" && claim.creationTokenHash === null);
+  const losingClaim = claimRoomPolicy(b, "claim123", "claim-token", "password-B");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await losingClaim === null);
+  const claimedRow = (await a.query("SELECT * FROM rooms WHERE id = 'claim123'")).rows[0];
+  check(claimedRow.auth_version === 2 && claimedRow.password_hash === "password-A" && claimedRow.creation_token_hash === null);
+  check(await second.issueAfterAuthenticatedJoin("claim123", "Guest", 1) === null);
+  check((await second.issueAfterAuthenticatedJoin("claim123", "x".repeat(64), 2))?.username.length === 64);
+  await assert.rejects(first.issueAfterAuthenticatedJoin("claim123", "x".repeat(65), 2)); checks++;
+
+  // Policy wins first: issuance blocks on the real row lock and rechecks the
+  // version after commit; its older statement snapshot cannot mint a token.
+  const beforePolicyIssue = Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count);
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'claim123'");
+  const pendingIssue = second.issueAfterAuthenticatedJoin("claim123", "Stale auth", 2);
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await pendingIssue === null);
+  check(Number((await a.query("SELECT count(*) FROM room_resume_sessions")).rows[0].count) === beforePolicyIssue);
+
+  // Issuance wins first: its SHARE lock holds the policy updater until commit.
+  await a.query("BEGIN");
+  const issuedBeforePolicy = await first.issueAfterAuthenticatedJoin("claim123", "Fresh auth", 3);
+  assert.ok(issuedBeforePolicy);
+  const waitingPolicy = b.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'claim123'");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  await waitingPolicy;
+  const oldCredential = { roomId: "claim123", sessionId: issuedBeforePolicy.sessionId, token: issuedBeforePolicy.token };
+  check(await first.lookup(oldCredential) === null);
+  check(await first.advanceGeneration(oldCredential, 0, opA, socketA) === null);
+  check((await first.issueAfterAuthenticatedJoin("claim123", "Current auth", 4))?.authVersion === 4);
+  // Retry receipts use a separate room so earlier exact row-count assertions stay useful.
+  await a.query("INSERT INTO rooms (id) VALUES ('retry123')");
+  const retrySession = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
+  assert.ok(retrySession);
+  const retryCredential = { roomId: "retry123", sessionId: retrySession.sessionId, token: retrySession.token };
+  const retryIdentity = await first.advanceGeneration(retryCredential, 0, opA, "transport_" + retrySession.sessionId);
+  assert.ok(retryIdentity);
+  const retryBinding = await bindings.activate(retryIdentity, "transport_" + retryIdentity.sessionId, async () => {}, () => true);
+  assert.ok(retryBinding);
+  const retryCount = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'retry123'")).rows[0].count);
+  const parallelPool = new Pool({ connectionString: process.env.RESUME_TEST_DATABASE_URL,
+    options: "-c search_path=" + schema, max: 1 });
+  try {
+    const parallelWriter = new ResumeMessageWriter(new ResumeOperationGate(parallelPool, bindings));
+    const sameKey = await Promise.all([writer.saveOnceWithOutcome(retryBinding, "same-key", "text"),
+      parallelWriter.saveOnceWithOutcome(retryBinding, "same-key", "text")]);
+    check(sameKey.every(r => r.authorized));
+    check(sameKey[0].authorized && sameKey[1].authorized && sameKey[0].value.message.id === sameKey[1].value.message.id);
+    check(sameKey.filter(r => r.authorized && r.value.inserted).length === 1);
+    check(sameKey.filter(r => r.authorized && !r.value.inserted).length === 1);
+    const compatibleReceipt = await writer.saveOnce(retryBinding, "same-key", "text");
+    check(compatibleReceipt.authorized && sameKey[0].authorized &&
+      compatibleReceipt.value.id === sameKey[0].value.message.id);
+    check(await retryCount() === 1);
+    await assert.rejects(writer.saveOnce(retryBinding, "same-key", "changed"), /identity conflict/); checks++;
+    check(await retryCount() === 1);
+    for (const invalid of ["", "x".repeat(129), "white space", "key\n"]) {
+      await assert.rejects(writer.saveOnce(retryBinding, invalid, "text")); checks++;
+    }
+    check(!(await writer.saveOnce({ ...retryBinding }, "same-key", "text")).authorized);
+    check((await writer.saveOnce(retryBinding, "other-key", "text")).authorized);
+    const peer = await first.issueAfterAuthenticatedJoin("retry123", "Writer", 1);
+    assert.ok(peer);
+    const peerIdentity = await first.advanceGeneration({ roomId: peer.roomId, sessionId: peer.sessionId, token: peer.token }, 0, opA, "transport_" + peer.sessionId);
+    assert.ok(peerIdentity);
+    const peerBinding = await bindings.activate(peerIdentity, "transport_" + peerIdentity.sessionId, async () => {}, () => true);
+    assert.ok(peerBinding);
+    check((await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    await a.query("INSERT INTO messages (room_id, username, content, client_message_id) VALUES ('retry123', 'Writer', 'text', 'same-key')");
+    check(await retryCount() === 4);
+    // Real database COMMIT succeeds; only its acknowledgment is lost.
+    let commitAttempts = 0;
+    const lostAckPool = { connect: async () => {
+      const real = await parallelPool.connect();
+      return { query: async (...args: unknown[]) => {
+        const result = await (real.query as Function).apply(real, args);
+        if (args[0] === "COMMIT") { commitAttempts++; throw new Error("lost COMMIT ack"); }
+        return result;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    } };
+    const lostAckWriter = new ResumeMessageWriter(new ResumeOperationGate(lostAckPool, bindings));
+    await assert.rejects(lostAckWriter.saveOnceWithOutcome(retryBinding, "lost-ack", "durable"), /lost COMMIT ack/); checks++;
+    check(commitAttempts === 1 && await retryCount() === 5);
+    const successorIdentity = await first.advanceGeneration(retryCredential, 1, opB, "transport_" + retrySession.sessionId + "_successor");
+    assert.ok(successorIdentity);
+    const successor = await bindings.activate(successorIdentity, "transport_" + successorIdentity.sessionId + "_successor", async () => {}, () => true);
+    assert.ok(successor);
+    check(!(await writer.saveOnce(retryBinding, "lost-ack", "durable")).authorized);
+    const resolved = await writer.saveOnceWithOutcome(successor, "lost-ack", "durable");
+    check(resolved.authorized && resolved.value.message.message === "durable");
+    check(resolved.authorized && resolved.value.inserted === false);
+    check(await retryCount() === 5);
+    // Receipt insertion failure rolls back its preceding message INSERT.
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_reject CHECK (client_message_id <> 'rollback-key')");
+    await assert.rejects(writer.saveOnce(successor, "rollback-key", "rollback")); checks++;
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_reject");
+    check(await retryCount() === 5);
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE client_message_id = 'rollback-key'")).rows[0].count) === 0);
+    assert.ok(resolved.authorized);
+    await a.query("DELETE FROM messages WHERE id = $1", [resolved.value.message.id]);
+    await assert.rejects(writer.saveOnce(successor, "lost-ack", "durable"), /no longer available/); checks++;
+    check(await retryCount() === 4);
+    check(await first.revoke(retryCredential, 2));
+    check(!(await writer.saveOnce(successor, "same-key", "text")).authorized);
+    await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [peer.sessionId]);
+    check(!(await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    // Policy denial must hold even when the requested receipt already exists.
+    await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '1 hour' WHERE id = $1", [peer.sessionId]);
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'retry123'");
+    check(!(await writer.saveOnce(peerBinding, "same-key", "text")).authorized);
+    await a.query("DELETE FROM room_resume_sessions WHERE room_id = 'retry123'");
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [[retrySession.sessionId, peer.sessionId]])).rows[0].count) === 0);
+    check(await retryCount() === 4); // session cleanup does not delete room history
+
+    // Private inline images: real transactions share text's durable keyspace.
+    await a.query("INSERT INTO rooms (id) VALUES ('image123')");
+    const imageSession = await first.issueAfterAuthenticatedJoin("image123", "Image writer", 1);
+    assert.ok(imageSession);
+    const imageCredential = { roomId: imageSession.roomId, sessionId: imageSession.sessionId, token: imageSession.token };
+    const imageIdentity = await first.advanceGeneration(imageCredential, 0, opA, "transport_image_initial");
+    assert.ok(imageIdentity);
+    const imageBinding = await bindings.activate(imageIdentity, "transport_image_initial", async () => {}, () => true);
+    assert.ok(imageBinding);
+    const images = new ResumeImageWriter(gate);
+    const parallelImages = new ResumeImageWriter(new ResumeOperationGate(parallelPool, bindings));
+    const imageData = "data:image/png;base64,aGVsbG8=";
+    const imageCount = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'image123'")).rows[0].count);
+    const imageRace = await Promise.all([images.saveOnceWithOutcome(imageBinding, "image-key", imageData),
+      parallelImages.saveOnceWithOutcome(imageBinding, "image-key", imageData)]);
+    check(imageRace.every(r => r.authorized));
+    check(imageRace.filter(r => r.authorized && r.value.inserted).length === 1);
+    check(imageRace[0].authorized && imageRace[1].authorized && imageRace[0].value.message.id === imageRace[1].value.message.id);
+    check(await imageCount() === 1);
+    const storedImage = (await a.query("SELECT * FROM messages WHERE room_id = 'image123'")).rows[0];
+    check(storedImage.username === "Image writer" && storedImage.type === "image" &&
+      storedImage.client_message_id === null && JSON.parse(storedImage.content).dataUrl === imageData);
+    const canonicalRetry = await images.saveOnceWithOutcome(imageBinding, "image-key", "DATA:IMAGE/PNG;BASE64,aGVsbG8=");
+    check(canonicalRetry.authorized && !canonicalRetry.value.inserted);
+    await assert.rejects(writer.saveOnce(imageBinding, "image-key", imageData), /identity conflict/); checks++;
+    await assert.rejects(images.saveOnceWithOutcome(imageBinding, "image-key", "data:image/png;base64,YQ=="), /identity conflict/); checks++;
+    const mixedRace = await Promise.allSettled([writer.saveOnce(imageBinding, "mixed-key", "text"),
+      parallelImages.saveOnceWithOutcome(imageBinding, "mixed-key", imageData)]);
+    check(mixedRace.filter(r => r.status === "fulfilled" && r.value.authorized).length === 1);
+    check(mixedRace.filter(r => r.status === "rejected" && /identity conflict/.test(String(r.reason))).length === 1);
+    check(await imageCount() === 2);
+    await writer.saveOnce(imageBinding, "text-key", "text");
+    await assert.rejects(images.saveOnceWithOutcome(imageBinding, "text-key", imageData), /identity conflict/); checks++;
+    check(await imageCount() === 3);
+    const lostImageAck = new ResumeImageWriter(new ResumeOperationGate(lostAckPool, bindings));
+    await assert.rejects(lostImageAck.saveOnceWithOutcome(imageBinding, "lost-image", imageData), /lost COMMIT ack/); checks++;
+    check(commitAttempts === 2 && await imageCount() === 4);
+    const imageNext = await first.advanceGeneration(imageCredential, 1, opB, "transport_image_successor");
+    assert.ok(imageNext);
+    const imageSuccessor = await bindings.activate(imageNext, "transport_image_successor", async () => {}, () => true);
+    assert.ok(imageSuccessor);
+    check(!(await images.saveOnceWithOutcome(imageBinding, "lost-image", imageData)).authorized);
+    const resolvedImage = await images.saveOnceWithOutcome(imageSuccessor, "lost-image", imageData);
+    check(resolvedImage.authorized && !resolvedImage.value.inserted && resolvedImage.value.message.dataUrl === imageData);
+    check(await imageCount() === 4);
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_image_reject CHECK (client_message_id <> 'image-rollback')");
+    await assert.rejects(images.saveOnceWithOutcome(imageSuccessor, "image-rollback", imageData)); checks++;
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_image_reject");
+    check(await imageCount() === 4);
+    check(Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE client_message_id = 'image-rollback'")).rows[0].count) === 0);
+    assert.ok(resolvedImage.authorized);
+    await a.query("DELETE FROM messages WHERE id = $1", [resolvedImage.value.message.id]);
+    await assert.rejects(images.saveOnceWithOutcome(imageSuccessor, "lost-image", imageData), /no longer available/); checks++;
+    check(await imageCount() === 3);
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'image123'");
+    check(!(await images.saveOnceWithOutcome(imageSuccessor, "image-key", imageData)).authorized);
+    check(!(await images.saveOnceWithOutcome(imageSuccessor, "new-denied", imageData)).authorized);
+    check(await imageCount() === 3);
+    await a.query("DELETE FROM messages WHERE room_id = 'image123'");
+    await a.query("DELETE FROM rooms WHERE id = 'image123'");
+  } finally { await parallelPool.end(); }
+  // History uses the same dedicated transaction gate, never the global DB.
+  await a.query("INSERT INTO rooms (id) VALUES ('histo123'), ('alien123')");
+  await a.query(`INSERT INTO messages (room_id, username, content)
+    SELECT 'histo123', 'History', n::text FROM generate_series(1, 105) n`);
+  await a.query("INSERT INTO messages (room_id, username, content) VALUES ('alien123', 'Foreign', 'must not leak')");
+  const historySession = await first.issueAfterAuthenticatedJoin("histo123", "History", 1);
+  assert.ok(historySession);
+  const historyCredential = { roomId: historySession.roomId, sessionId: historySession.sessionId, token: historySession.token };
+  const historyIdentity = await first.advanceGeneration(historyCredential, 0, opA, socketA);
+  assert.ok(historyIdentity);
+  const historyBindings = new ResumeBindings();
+  const historyBinding = await historyBindings.activate(historyIdentity, socketA, async () => {}, () => true);
+  assert.ok(historyBinding);
+  const reader = new ResumeHistoryReader(new ResumeOperationGate(operationPool, historyBindings));
+  const historyRows = await reader.read(historyBinding) as { id: number; message: string; username: string }[] | null;
+  check(historyRows?.length === 100);
+  check(historyRows?.[0].message === "6" && historyRows.at(-1)?.message === "105");
+  check(historyRows?.every((row, i) => row.username === "History" && (!i || row.id > historyRows[i - 1].id)));
+  check(!JSON.stringify(historyRows).includes(historySession.token));
+  check(await reader.read({ ...historyBinding, roomId: "alien123" }) === null);
+  // A remote generation change is denied even before local ownership catches up.
+  const nextHistory = await first.advanceGeneration(historyCredential, 1, opB, socketB);
+  assert.ok(nextHistory);
+  check(await reader.read(historyBinding) === null);
+  const nextHistoryBinding = await historyBindings.activate(nextHistory, socketB, async () => {}, () => true);
+  assert.ok(nextHistoryBinding);
+  check((await reader.read(nextHistoryBinding))?.length === 100);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [historySession.sessionId]);
+  check(await reader.read(nextHistoryBinding) === null);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = NULL, expires_at = clock_timestamp() WHERE id = $1", [historySession.sessionId]);
+  check(await reader.read(nextHistoryBinding) === null);
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '1 hour' WHERE id = $1", [historySession.sessionId]);
+  // Policy wins under a real lock wait; no history escapes the new version.
+  const historyPid = (await operationPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'histo123'");
+  const blockedHistory = reader.read(nextHistoryBinding);
+  await waitForBlockedSecond(historyPid);
+  await a.query("COMMIT");
+  check(await blockedHistory === null);
+  // Cleanup is opt-in and uses database time; fixtures never touch a live room.
+  while (await first.cleanupExpired(100)) { /* remove earlier expired fixtures */ }
+  await a.query("INSERT INTO rooms (id) VALUES ('clean123')");
+  const fixtures = [];
+  for (let i = 0; i < 5; i++) {
+    const session = await first.issueAfterAuthenticatedJoin("clean123", "Cleanup " + i, 1);
+    assert.ok(session); fixtures.push(session);
+  }
+  const ids = fixtures.map(s => s.sessionId);
+  const history = (await a.query("INSERT INTO messages (room_id, username, content) VALUES ('clean123', 'Cleanup', 'retained') RETURNING id")).rows[0].id;
+  for (const id of ids) {
+    await a.query("INSERT INTO resume_message_receipts (session_id, client_message_id, payload_hash, message_id) VALUES ($1, 'saved', $2, $3), ($1, 'tombstone', $2, NULL)", [id, "a".repeat(64), history]);
+  }
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() - interval '1 hour' WHERE id = ANY($1)", [ids.slice(0, 3)]);
+  await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [ids[4]]);
+  const remaining = async () => (await a.query("SELECT id FROM room_resume_sessions WHERE room_id = 'clean123'")).rowCount;
+  const receiptCount = async () => Number((await a.query("SELECT count(*) FROM resume_message_receipts WHERE session_id = ANY($1)", [ids])).rows[0].count);
+  check(await first.cleanupExpired(1) === 1);
+  check(await remaining() === 4 && await receiptCount() === 8);
+  // Hold every remaining expired row: SKIP LOCKED must return without waiting.
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE room_id = 'clean123' AND expires_at <= clock_timestamp() FOR UPDATE");
+  await b.query("SET statement_timeout = '2s'");
+  check(await second.cleanupExpired(100) === 0);
+  await a.query("COMMIT");
+  check(await second.cleanupExpired(100) === 2);
+  check(await remaining() === 2 && await receiptCount() === 4);
+  check(await first.cleanupExpired(100) === 0);
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // Expired-row deletion holds a lock: pending CAS rechecks after COMMIT and
+  // cannot resurrect the deleted session, even with a valid bearer.
+  const target = fixtures[3];
+  const targetCredential = { roomId: target.roomId, sessionId: target.sessionId, token: target.token };
+  const targetIdentity = await first.advanceGeneration(targetCredential, 0, opA, "transport_" + target.sessionId);
+  assert.ok(targetIdentity);
+  const targetBinding = await bindings.activate(targetIdentity, "transport_" + targetIdentity.sessionId, async () => {}, () => true);
+  assert.ok(targetBinding);
+  await a.query("BEGIN");
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [target.sessionId]);
+  check(await first.cleanupExpired(100) === 1);
+  const afterCleanupCas = second.advanceGeneration(targetCredential, 1, opB, socketB);
+  await waitForBlockedSecond();
+  const gatePid = (await operationPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  let ranAfterCleanup = false;
+  const afterCleanupGate = gate.run(targetBinding, async () => { ranAfterCleanup = true; });
+  await waitForBlockedSecond(gatePid);
+  await a.query("COMMIT");
+  check(await afterCleanupCas === null);
+  check(!(await afterCleanupGate).authorized);
+  check(!ranAfterCleanup);
+  check(await remaining() === 1 && await receiptCount() === 2); // unexpired revoked receipts retained too
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // Two independent workers partition the expired rows; no double deletion.
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [ids[4]]);
+  const cleaned = await Promise.all([first.cleanupExpired(1), second.cleanupExpired(1)]);
+  check(cleaned[0] + cleaned[1] === 1);
+  check(await remaining() === 0 && await receiptCount() === 0);
+  check((await a.query("SELECT id FROM messages WHERE id = $1", [history])).rowCount === 1);
+  // A gate that owns the row can cross its TTL while doing work. Cleanup skips
+  // it, then the gate itself rejects and rolls back before publication.
+  const busy = await first.issueAfterAuthenticatedJoin("clean123", "Busy", 1);
+  assert.ok(busy);
+  const busyIdentity = await first.advanceGeneration({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token }, 0, opA, "transport_" + busy.sessionId);
+  assert.ok(busyIdentity);
+  const busyBinding = await bindings.activate(busyIdentity, "transport_" + busyIdentity.sessionId, async () => {}, () => true);
+  assert.ok(busyBinding);
+  const busyResult = await gate.run(busyBinding, async transaction => {
+    // Change the fixture expiry within the owning transaction. Another worker
+    // still sees the old expiry, so also assert skip using a separate already-
+    // expired row lock above. This proves the pre-COMMIT fence and safe cleanup.
+    await transaction.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [busy.sessionId]);
+    await transaction.query("INSERT INTO messages (room_id, username, content) VALUES ('clean123', 'Busy', 'must rollback')");
+    check(await second.cleanupExpired(100) === 0);
+  });
+  check(!busyResult.authorized);
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'clean123'")).rowCount === 1);
+  check((await first.lookup({ roomId: busy.roomId, sessionId: busy.sessionId, token: busy.token })) !== null); // expiry mutation rolled back too
+  // Default cap is exercised on more than a full batch, not inferred from SQL.
+  await a.query(`INSERT INTO room_resume_sessions (id, token_hash, room_id, username, auth_version, expires_at)
+    SELECT 'cleanup-fixture-' || n, 'cleanup-hash-' || n, 'clean123', 'Batch', 1,
+      clock_timestamp() - interval '1 hour' FROM generate_series(1, 101) n`);
+  check(await first.cleanupExpired() === 100);
+  check(await first.cleanupExpired() === 1);
+  check(await first.cleanupExpired() === 0);
+  await b.query("RESET statement_timeout");
+  // Real CAS blocked inside PostgreSQL: conflicting admission must not reach DB,
+  // and disconnect must fence activation without pretending to cancel the CAS.
+  await a.query("INSERT INTO rooms (id) VALUES ('admit123')");
+  const admissionSession = await first.issueAfterAuthenticatedJoin("admit123", "Admission", 1);
+  const otherSession = await first.issueAfterAuthenticatedJoin("admit123", "Other", 1);
+  assert.ok(admissionSession && otherSession);
+  const admissionCredential = { roomId: admissionSession.roomId, sessionId: admissionSession.sessionId, token: admissionSession.token };
+  const otherCredential = { roomId: otherSession.roomId, sessionId: otherSession.sessionId, token: otherSession.token };
+  const request = { credential: admissionCredential, expectedGeneration: 0, operationId: opA };
+  const admissionBindings = new ResumeBindings();
+  let admissionCalls = 0, admissionPrepares = 0;
+  const admission = new ResumeAdmission({ advanceGeneration: async (...args) => {
+    admissionCalls++; return second.advanceGeneration(...args);
+  } }, admissionBindings, "admission_transport_1", () => true, async () => {
+    admissionPrepares++; return async () => {};
+  });
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [admissionSession.sessionId]);
+  const pendingAdmission = admission.admit(request);
+  await waitForBlockedSecond();
+  check(admission.admit(request) === pendingAdmission);
+  check(await admission.admit({ ...request, credential: otherCredential }) === null);
+  check(await admission.admit({ ...request, operationId: opB }) === null);
+  check((await first.lookup(otherCredential))?.generation === 0);
+  check(admissionCalls === 1);
+  const admissionClosing = admission.close();
+  await a.query("COMMIT");
+  check(await pendingAdmission === null);
+  await admissionClosing;
+  check(admissionPrepares === 0);
+  check((await first.lookup(admissionCredential))?.generation === 1);
+  check(await admission.admit(request) === null);
+  const replacement = new ResumeAdmission(second, admissionBindings, "admission_transport_2", () => true,
+    async () => async () => {});
+  const recoveredBinding = await replacement.admit({ ...request, expectedGeneration: 1, operationId: opB });
+  check(recoveredBinding?.generation === 2 && admissionBindings.isCurrent(recoveredBinding));
+  check(await replacement.admit({ ...request, expectedGeneration: 1, operationId: opB }) === recoveredBinding);
+  check((await first.lookup(admissionCredential))?.generation === 2);
+  await replacement.close();
+  check(!admissionBindings.isCurrent(recoveredBinding!));
+  // A real successful autocommit with a lost response remains terminal locally.
+  let uncertainCalls = 0;
+  const uncertainAdmission = new ResumeAdmission({ advanceGeneration: async (...args) => {
+    uncertainCalls++; assert.ok(await second.advanceGeneration(...args));
+    throw Error("simulated lost CAS acknowledgment");
+  } }, admissionBindings, "admission_transport_3", () => true, async () => {
+    throw Error("must not prepare after uncertain CAS");
+  });
+  const uncertainRequest = { ...request, credential: otherCredential };
+  await assert.rejects(uncertainAdmission.admit(uncertainRequest), /lost CAS/);
+  await assert.rejects(uncertainAdmission.admit(uncertainRequest), /lost CAS/);
+  check(uncertainCalls === 1);
+  check((await first.lookup(otherCredential))?.generation === 1);
+  await uncertainAdmission.close();
+  // Settled upload foundation: distinguish actual rollback from a real commit
+  // whose acknowledgement is lost. No filesystem cleanup is performed here.
+  // The replacement fixture above was deliberately closed. Recover a fresh
+  // generation; never weaken the gate to make a detached fixture authorize.
+  const outcomeAdmission = new ResumeAdmission(second, admissionBindings,
+    "admission_transport_4", () => true, async () => async () => {});
+  const outcomeBinding = await outcomeAdmission.admit({ ...request, expectedGeneration: 2,
+    operationId: "outcome_operation_123456" });
+  assert.ok(outcomeBinding);
+  check(outcomeBinding.generation === 3 && admissionBindings.isCurrent(outcomeBinding));
+  const outcomeGate = new ResumeOperationGate(operationPool, admissionBindings);
+  const noCommit = await outcomeGate.runWithOutcome(outcomeBinding, async tx => {
+    await insertResumeTextMessage(tx, outcomeBinding, "outcome-rollback");
+    throw new Error("after insert, before commit");
+  });
+  check(!noCommit.completed && noCommit.commit === "not-dispatched");
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'admit123'")).rowCount === 0);
+  let outcomeCommitAttempts = 0;
+  const outcomeLostAck = new ResumeOperationGate({ connect: async () => {
+    const real = await operationPool.connect();
+    return { query: async (...args: unknown[]) => {
+      const result = await (real.query as Function).apply(real, args);
+      if (args[0] === "COMMIT") { outcomeCommitAttempts++; throw new Error("lost outcome ack"); }
+      return result;
+    }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+  } }, admissionBindings);
+  const unknownCommit = await outcomeLostAck.runWithOutcome(outcomeBinding,
+    tx => insertResumeTextMessage(tx, outcomeBinding, "outcome-durable"));
+  check(!unknownCommit.completed && unknownCommit.commit === "unknown");
+  check(outcomeCommitAttempts === 1);
+  check((await a.query("SELECT id FROM messages WHERE room_id = 'admit123' AND content = 'outcome-durable'")).rowCount === 1);
+  const deniedOutcome = await outcomeGate.runWithOutcome({ ...outcomeBinding }, async () => {
+    assert.fail("copied authority must not run");
+  });
+  check(deniedOutcome.completed && !deniedOutcome.result.authorized);
+  await outcomeAdmission.close();
+  // Admitted HTTP lifetime: real DB checks, no public handler or file effects.
+  await a.query("INSERT INTO rooms (id) VALUES ('files123')");
+  const uploadBindings = new ResumeBindings();
+  let uploadClock = 0;
+  const uploads = new ResumeUploadAdmissions(uploadBindings, undefined, 1024, 100, () => uploadClock);
+  const uploadGate = new ResumeUploadOperationGate(operationPool, uploads);
+  const makeUpload = async () => {
+    const policy = (await a.query("SELECT auth_version FROM rooms WHERE id = 'files123'")).rows[0].auth_version;
+    const session = await first.issueAfterAuthenticatedJoin("files123", "Uploader", policy);
+    assert.ok(session);
+    const credential = { roomId: session.roomId, sessionId: session.sessionId, token: session.token };
+    const transport = "upload_" + session.sessionId;
+    const identity = await first.advanceGeneration(credential, 0, opA, transport);
+    assert.ok(identity);
+    const binding = await uploadBindings.activate(identity, transport, async () => {}, () => true);
+    assert.ok(binding);
+    const grant = uploads.admit(binding);
+    assert.ok(grant);
+    return { grant, binding, credential, identity };
+  };
+  for (const mode of ["disconnect", "copied", "released", "deadline", "deadline-work",
+    "local-successor", "pending-successor", "durable-successor", "revoke", "expiry", "policy", "work-fails", "lost-ack"]) {
+    const fixture = await makeUpload();
+    const { grant, binding } = fixture;
+    if (mode === "released") uploads.release(grant);
+    if (mode === "deadline") uploadClock += 100;
+    uploadBindings.detach(binding);
+    let writes = 0;
+    let commits = 0;
+    let finishSuccessor: (() => void) | undefined;
+    let successor: Promise<unknown> | undefined;
+    const selectedGate = mode === "lost-ack" ? new ResumeUploadOperationGate({ connect: async () => {
+      const real = await operationPool.connect();
+      return { query: async (...args: unknown[]) => {
+        const result = await (real.query as Function).apply(real, args);
+        if (args[0] === "COMMIT") { commits++; throw Error("lost upload ACK"); }
+        return result;
+      }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+    } }, uploads) : uploadGate;
+    // Mutations commit while the operation is demonstrably blocked on its lock.
+    const contention = ["durable-successor", "revoke", "expiry", "policy"].includes(mode);
+    // Earlier uncertain outcomes destroy checkouts; probe the CURRENT backend.
+    let uploadPid = 0;
+    if (contention) {
+      const probe = await operationPool.connect();
+      uploadPid = (await probe.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      probe.release();
+      await a.query("BEGIN");
+      if (mode === "policy") await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
+      else {
+        await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [binding.sessionId]);
+        if (mode === "durable-successor") await first.advanceGeneration(fixture.credential, 1, opB, socketB);
+        if (mode === "revoke") await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [binding.sessionId]);
+        if (mode === "expiry") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [binding.sessionId]);
+      }
+    }
+    const pending = selectedGate.runWithOutcome(mode === "copied" ? { ...grant } : grant, async tx => {
+      writes++;
+      await insertResumeTextMessage(tx, binding, "upload-" + mode);
+      if (mode === "deadline-work") uploadClock += 100;
+      if (mode === "pending-successor") {
+        const preparation = new Promise<void>(resolve => { finishSuccessor = resolve; });
+        successor = uploadBindings.activate({ ...fixture.identity, generation: 2 },
+          "pending_" + binding.sessionId, () => preparation, () => true);
+      }
+      if (mode === "local-successor") {
+        await assert.rejects(uploadBindings.activate({ ...fixture.identity, generation: 2 },
+          "successor_" + binding.sessionId, async () => { throw Error("prepare failure"); }, () => true));
+      }
+      if (mode === "work-fails") throw Error("upload work rollback");
+      return "upload receipt";
+    });
+    if (contention) { await waitForBlockedSecond(uploadPid); await a.query("COMMIT"); }
+    const result = await pending;
+    if (finishSuccessor) { finishSuccessor(); await successor; }
+    const rows = (await a.query("SELECT id FROM messages WHERE room_id = 'files123' AND content = $1", ["upload-" + mode])).rowCount;
+    if (mode === "disconnect") {
+      check(result.completed && result.result.authorized);
+      check(rows === 1 && writes === 1);
+    } else if (mode === "lost-ack") {
+      check(!result.completed && result.commit === "unknown");
+      check(rows === 1 && commits === 1);
+    } else if (mode === "work-fails") {
+      check(!result.completed && result.commit === "not-dispatched");
+      check(rows === 0 && writes === 1);
+    } else {
+      check(result.completed && !result.result.authorized);
+      check(rows === 0);
+      if (contention || ["copied", "released", "deadline"].includes(mode)) check(writes === 0);
+    }
+    check(uploads.release(grant) === (mode !== "released"));
+  }
+  // File receipt identity is independent of a new attempt's storage path.
+  // No actual filesystem or client-supplied digest is used by this DB fixture.
+  const fileFixture = await makeUpload();
+  const files = new ResumeFileWriter(uploadGate);
+  const file = { storageKey: "a".repeat(64), name: "proof.txt", size: 5,
+    mime: "text/plain", sha256: "c".repeat(64) };
+  const countFiles = async () => Number((await a.query("SELECT count(*) FROM messages WHERE room_id = 'files123' AND type = 'file'")).rows[0].count);
+  const savedFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", file);
+  check(savedFile.completed && savedFile.result.authorized && savedFile.result.value.inserted);
+  assert.ok(savedFile.completed && savedFile.result.authorized);
+  const firstFile = savedFile.result.value.message;
+  const retryFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", { ...file, storageKey: "b".repeat(64) });
+  check(retryFile.completed && retryFile.result.authorized && !retryFile.result.value.inserted &&
+    retryFile.result.value.message.id === firstFile.id && retryFile.result.value.message.url === firstFile.url);
+  for (const change of [{ name: "changed.txt" }, { size: 6 }, { mime: "application/pdf" }, { sha256: "d".repeat(64) }]) {
+    const conflict = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", { ...file, ...change });
+    check(!conflict.completed && conflict.commit === "not-dispatched");
+  }
+  const textWriter = new ResumeMessageWriter(new ResumeOperationGate(operationPool, uploadBindings));
+  await assert.rejects(textWriter.saveOnceWithOutcome(fileFixture.binding, "file-key", "collision"), /conflict/); checks++;
+  const imageWriter = new ResumeImageWriter(new ResumeOperationGate(operationPool, uploadBindings));
+  await assert.rejects(imageWriter.saveOnceWithOutcome(fileFixture.binding, "file-key", "data:image/png;base64,YQ=="), /conflict/); checks++;
+  check(await countFiles() === 1);
+  await textWriter.saveOnceWithOutcome(fileFixture.binding, "text-first", "text");
+  const reverseConflict = await files.saveOnceWithOutcome(fileFixture.grant, "text-first", file);
+  check(!reverseConflict.completed && reverseConflict.commit === "not-dispatched");
+  // Atomic receipt failure must roll back the inserted file message.
+  await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_file_reject CHECK (client_message_id <> 'file-rollback')");
+  const rolledBack = await files.saveOnceWithOutcome(fileFixture.grant, "file-rollback", file);
+  check(!rolledBack.completed && rolledBack.commit === "not-dispatched");
+  await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_file_reject");
+  check(await countFiles() === 1);
+  const uncertainFiles = new ResumeFileWriter(new ResumeUploadOperationGate({ connect: async () => {
+    const real = await operationPool.connect();
+    return { query: async (...args: unknown[]) => {
+      const result = await (real.query as Function).apply(real, args);
+      if (args[0] === "COMMIT") throw Error("lost file ACK");
+      return result;
+    }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+  } }, uploads));
+  const uncertainFile = await uncertainFiles.saveOnceWithOutcome(fileFixture.grant, "file-unknown", file);
+  check(!uncertainFile.completed && uncertainFile.commit === "unknown");
+  check(await countFiles() === 2);
+  uploadBindings.detach(fileFixture.binding);
+  const resolvedFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-unknown", { ...file, storageKey: "e".repeat(64) });
+  check(resolvedFile.completed && resolvedFile.result.authorized && !resolvedFile.result.value.inserted &&
+    resolvedFile.result.value.message.url === firstFile.url);
+  check(await countFiles() === 2);
+  await a.query("DELETE FROM messages WHERE id = $1", [firstFile.id]);
+  const tombstoneFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-key", file);
+  check(!tombstoneFile.completed && tombstoneFile.commit === "not-dispatched");
+  check(await countFiles() === 1);
+  // An authorized successor resolves the same durable receipt without fanout.
+  uploads.release(fileFixture.grant);
+  const nextFileIdentity = await first.advanceGeneration(fileFixture.credential, 1, opB, socketB);
+  assert.ok(nextFileIdentity);
+  const nextFileBinding = await uploadBindings.activate(nextFileIdentity, socketB, async () => {}, () => true);
+  assert.ok(nextFileBinding);
+  const nextFileGrant = uploads.admit(nextFileBinding); assert.ok(nextFileGrant);
+  const successorFile = await files.saveOnceWithOutcome(nextFileGrant, "file-unknown", { ...file, storageKey: "f".repeat(64) });
+  check(successorFile.completed && successorFile.result.authorized && !successorFile.result.value.inserted &&
+    successorFile.result.value.message.url === firstFile.url);
+  const oldFile = await files.saveOnceWithOutcome(fileFixture.grant, "file-unknown", file);
+  check(oldFile.completed && !oldFile.result.authorized);
+  await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
+  const deniedFile = await files.saveOnceWithOutcome(nextFileGrant, "file-unknown", file);
+  check(deniedFile.completed && !deniedFile.result.authorized);
+  check(uploads.release(nextFileGrant));
+  // Actual byte storage + exact capability + real PostgreSQL composition.
+  // Only this fixture's isolated temporary root is removed by its finalizer.
+  const byteRoot = await mkdtemp(join(tmpdir(), "dimle-pg-file-"));
+  try {
+    const byteStorage = new ResumeFileStorage(byteRoot, uploads, new ResumeUploadReservations(operationPool));
+    const byteUpload = new ResumeFileUpload(byteStorage, files);
+    const metadata = { name: "actual.txt", mime: "text/plain" };
+    async function* byteSource() { yield Buffer.from("actual bytes"); }
+    const fixture = await makeUpload();
+    const firstBytes = await byteUpload.saveWithOutcome(fixture.grant, "actual-key", metadata, byteSource());
+    check(firstBytes.completed && firstBytes.result.authorized && firstBytes.result.value.inserted);
+    assert.ok(firstBytes.completed && firstBytes.result.authorized);
+    const original = firstBytes.result.value.message;
+    check((await readFile(join(byteRoot, original.url.split("/")[2], "blob"))).toString() === "actual bytes");
+    const provenance = (await a.query("SELECT * FROM resume_upload_attempts WHERE storage_key=$1", [original.url.split("/")[2]])).rows[0];
+    check(provenance.session_id === fixture.binding.sessionId && provenance.room_id === fixture.binding.roomId);
+    check(provenance.client_message_id === "actual-key" && Number(provenance.reserved_bytes) >= 12);
+    const baseline = await countFiles();
+    const sameAttempt = await byteUpload.saveWithOutcome(fixture.grant, "different-key", metadata, byteSource());
+    check(sameAttempt.completed && !sameAttempt.result.authorized);
+    check(await countFiles() === baseline && (await readdir(byteRoot)).length === 1);
+    check(uploads.release(fixture.grant));
+    const retryGrant = uploads.admit(fixture.binding); assert.ok(retryGrant);
+    const retry = await byteUpload.saveWithOutcome(retryGrant, "actual-key", metadata, byteSource());
+    check(retry.completed && retry.result.authorized && !retry.result.value.inserted &&
+      retry.result.value.message.url === original.url && retry.result.value.message.id === original.id);
+    check((await readdir(byteRoot)).length === 2 && await countFiles() === baseline);
+    check(uploads.release(retryGrant));
+
+    // Real COMMIT succeeds, its ACK is lost; no automatic replay or deletion.
+    const uncertainUpload = new ResumeFileUpload(byteStorage, uncertainFiles);
+    const unknownGrant = uploads.admit(fixture.binding); assert.ok(unknownGrant);
+    const unknown = await uncertainUpload.saveWithOutcome(unknownGrant, "actual-unknown", metadata, byteSource());
+    check(!unknown.completed && unknown.commit === "unknown");
+    check(await countFiles() === baseline + 1);
+    const unknownPath = (await a.query(`SELECT m.content FROM resume_message_receipts r
+      JOIN messages m ON m.id = r.message_id WHERE r.session_id = $1 AND r.client_message_id = 'actual-unknown'`,
+      [fixture.binding.sessionId])).rows[0].content;
+    const duplicateUnknown = await uncertainUpload.saveWithOutcome(unknownGrant, "actual-unknown", metadata, byteSource());
+    check(duplicateUnknown.completed && !duplicateUnknown.result.authorized);
+    check((await readdir(byteRoot)).length === 3 && await countFiles() === baseline + 1);
+    check(uploads.release(unknownGrant));
+    const resolutionGrant = uploads.admit(fixture.binding); assert.ok(resolutionGrant);
+    const resolved = await byteUpload.saveWithOutcome(resolutionGrant, "actual-unknown", metadata, byteSource());
+    check(resolved.completed && resolved.result.authorized && !resolved.result.value.inserted &&
+      resolved.result.value.message.url === JSON.parse(unknownPath).url);
+    check((await readdir(byteRoot)).length === 4 && await countFiles() === baseline + 1);
+    check(uploads.release(resolutionGrant));
+
+    await a.query("ALTER TABLE resume_message_receipts ADD CONSTRAINT qa_bytes_reject CHECK (client_message_id <> 'actual-rollback')");
+    const rollbackGrant = uploads.admit(fixture.binding); assert.ok(rollbackGrant);
+    const rollback = await byteUpload.saveWithOutcome(rollbackGrant, "actual-rollback", metadata, byteSource());
+    check(!rollback.completed && rollback.commit === "not-dispatched");
+    check(await countFiles() === baseline + 1 && (await readdir(byteRoot)).length === 5);
+    check(uploads.release(rollbackGrant));
+    await a.query("ALTER TABLE resume_message_receipts DROP CONSTRAINT qa_bytes_reject");
+
+    await a.query("DELETE FROM messages WHERE id = $1", [original.id]);
+    const tombstoneGrant = uploads.admit(fixture.binding); assert.ok(tombstoneGrant);
+    const tombstone = await byteUpload.saveWithOutcome(tombstoneGrant, "actual-key", metadata, byteSource());
+    check(!tombstone.completed && tombstone.commit === "not-dispatched");
+    check(await countFiles() === baseline && (await readdir(byteRoot)).length === 6);
+    check((await readFile(join(byteRoot, original.url.split("/")[2], "blob"))).toString() === "actual bytes");
+    check(uploads.release(tombstoneGrant));
+
+    // A durable successor fences the old grant even if its local binding lags.
+    const staleGrant = uploads.admit(fixture.binding); assert.ok(staleGrant);
+    const byteTransport = "byte_" + fixture.binding.sessionId;
+    const next = await first.advanceGeneration(fixture.credential, 1, opB, byteTransport); assert.ok(next);
+    const stale = await byteUpload.saveWithOutcome(staleGrant, "actual-unknown", metadata, byteSource());
+    check(stale.completed && !stale.result.authorized);
+    check(await countFiles() === baseline);
+    check(uploads.release(staleGrant));
+    const nextBinding = await uploadBindings.activate(next, byteTransport, async () => {}, () => true); assert.ok(nextBinding);
+    const successorGrant = uploads.admit(nextBinding); assert.ok(successorGrant);
+    const successor = await byteUpload.saveWithOutcome(successorGrant, "actual-unknown", metadata, byteSource());
+    check(successor.completed && successor.result.authorized && !successor.result.value.inserted &&
+      successor.result.value.message.url === JSON.parse(unknownPath).url);
+    check(uploads.release(successorGrant));
+    const revokedGrant = uploads.admit(nextBinding); assert.ok(revokedGrant);
+    await a.query("UPDATE rooms SET auth_version = auth_version + 1 WHERE id = 'files123'");
+    const revoked = await byteUpload.saveWithOutcome(revokedGrant, "actual-unknown", metadata, byteSource());
+    check(revoked.completed && !revoked.result.authorized);
+    check(uploads.release(revokedGrant));
+    check((await readdir(byteRoot)).length === 9 && await countFiles() === baseline);
+    // Real reservation COMMIT followed by lost ACK / local owner fence, and
+    // real budget denial: none may open/create a path or pull a source byte.
+    for (const mode of ["lost-ack", "fenced", "denied"]) {
+      const f = await makeUpload();
+      const before = Number((await a.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes);
+      if (mode === "denied") await a.query("UPDATE resume_upload_budget SET capacity_bytes = reserved_bytes");
+      const realLedger = new ResumeUploadReservations({ connect: async () => {
+        const real = await operationPool.connect();
+        return { query: async (sql: string, values?: unknown[]) => {
+          const result = await real.query(sql, values);
+          if (sql === "COMMIT" && mode === "lost-ack") throw Error("controlled reservation ACK loss");
+          if (sql === "COMMIT" && mode === "fenced") {
+            await uploadBindings.activate({ ...f.binding, generation: f.binding.generation + 1,
+              issuedAt: new Date(0), expiresAt: new Date(f.binding.expiresAt) },
+              "reservation-successor-" + f.binding.sessionId, async () => {}, () => true);
+          }
+          return result;
+        }, on: real.on.bind(real), removeListener: real.removeListener.bind(real), release: real.release.bind(real) } as unknown as import("pg").PoolClient;
+      } });
+      let reads = 0;
+      async function* untouched() { reads++; yield Buffer.from("unused"); }
+      const reservedStorage = new ResumeFileStorage(byteRoot, uploads, realLedger);
+      await assert.rejects(reservedStorage.stage(f.grant, { ...metadata, clientMessageId: "reserved-" + mode }, untouched()));
+      check(reads === 0 && (await readdir(byteRoot)).length === 9);
+      const after = Number((await a.query("SELECT reserved_bytes FROM resume_upload_budget")).rows[0].reserved_bytes);
+      const rows = (await a.query("SELECT * FROM resume_upload_attempts WHERE session_id=$1 AND client_message_id=$2",
+        [f.binding.sessionId, "reserved-" + mode])).rows;
+      check(mode === "denied" ? after === before && rows.length === 0 :
+        rows.length === 1 && after - before === Number(rows[0].reserved_bytes));
+      check(uploads.release(f.grant));
+      if (mode === "denied") await a.query("UPDATE resume_upload_budget SET capacity_bytes = 10000000000");
+    }
+  } finally { await rm(byteRoot, { recursive: true, force: true }); }
+  // Real loopback owners + actual bearer lookup. No public route/parser wiring.
+  const beforePreflight = checks;
+  const http = createServer(), sockets = new Server(http);
+  const clients: ClientSocket[] = [], owners: ResumeSocketOwner[] = [];
+  const preflightBindings = new ResumeBindings();
+  const members = new ResumeMemberships(preflightBindings);
+  const preflightUploads = new ResumeUploadAdmissions(preflightBindings);
+  const cleanupErrors: unknown[] = [];
+  await new Promise<void>(resolve => http.listen(0, "127.0.0.1", resolve));
+  const address = http.address(); assert.ok(address && typeof address !== "string");
+  const connectOwner = async () => {
+    const connected = new Promise<ServerSocket>(resolve => sockets.once("connection", resolve));
+    const client = io(`http://127.0.0.1:${address.port}`, { transports: ["websocket"], reconnection: false });
+    clients.push(client);
+    const ready = new Promise<void>((resolve, reject) => {
+      client.once("connect", resolve); client.once("connect_error", reject);
+    });
+    const socket = await connected; await ready;
+    const owner = attachResumeSocket(socket, { store: first, bindings: preflightBindings,
+      memberships: members, prepare: async () => async () => {},
+      onCleanupError: error => cleanupErrors.push(error) });
+    owners.push(owner);
+    return { socket, owner };
+  };
+  let bodies = 0;
+  try {
+    await a.query("INSERT INTO rooms (id) VALUES ('prefl123'), ('other123')");
+    const fixture = async () => {
+      const issued = await first.issueAfterAuthenticatedJoin("prefl123", "Upload guest", 1);
+      assert.ok(issued);
+      const credential = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+      const physical = await connectOwner();
+      const binding = await physical.owner.admit({ credential, expectedGeneration: 0,
+        operationId: "preflight_" + issued.sessionId });
+      assert.ok(binding);
+      check(members.bindingFor(physical.socket, physical.owner, issued.roomId) === binding);
+      return { ...physical, credential, binding };
+    };
+    const run = async (f: Awaited<ReturnType<typeof fixture>>, credential = f.credential) => {
+      const grant = await preflightResumeUpload(f.socket, f.owner, members, second,
+        preflightUploads, credential);
+      // This counter represents the caller's source/file boundary, NOT an HTTP
+      // parser assertion. No source or filesystem object is created on denial.
+      if (grant) bodies++;
+      return grant;
+    };
+    const valid = await fixture();
+    const grant = await run(valid); assert.ok(grant);
+    check(grant.binding === valid.binding && preflightUploads.isCurrent(grant));
+    check(bodies === 1); check(preflightUploads.release(grant)); bodies = 0;
+    const forged = randomBytes(32).toString("base64url");
+    check(forged.length === valid.credential.token.length);
+    check(await run(valid, { ...valid.credential, token: forged }) === null);
+    check(await run(valid, { ...valid.credential, roomId: "other123" }) === null);
+    const revoked = await fixture();
+    check(await first.revoke(revoked.credential, 1));
+    check(await run(revoked) === null);
+    const expiredFixture = await fixture();
+    await a.query("UPDATE room_resume_sessions SET expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
+      [expiredFixture.binding.sessionId]);
+    check(await run(expiredFixture) === null);
+    const remote = await fixture();
+    assert.ok(await first.advanceGeneration(remote.credential, 1, "remote_preflight_123", "remote_transport_123"));
+    check(members.isCurrent(remote.binding, remote.binding.roomId)); // intentionally stale local state
+    check(await run(remote) === null);
+
+    for (const loss of ["close", "replace"] as const) {
+      const old = await fixture();
+      const next = loss === "replace" ? await connectOwner() : null;
+      // ACCESS EXCLUSIVE blocks the actual SELECT (row locks do not). The
+      // controller can still perform a CAS on its own connection/transaction.
+      await a.query("BEGIN");
+      let flight: ReturnType<typeof run> | undefined;
+      try {
+        await a.query("LOCK TABLE room_resume_sessions IN ACCESS EXCLUSIVE MODE");
+        flight = run(old);
+        await waitForBlockedSecond();
+        check(bodies === 0);
+        if (next) {
+          const successor = await next.owner.admit({ credential: old.credential,
+            expectedGeneration: 1, operationId: "replacement_" + old.binding.sessionId });
+          assert.ok(successor);
+          check(members.bindingFor(next.socket, next.owner, old.binding.roomId) === successor);
+          check(!old.socket.connected);
+        } else {
+          await old.owner.close();
+          check(old.socket.connected); // close fences even a physically connected socket
+        }
+        check(members.bindingFor(old.socket, old.owner, old.binding.roomId) === null);
+        await a.query("COMMIT");
+        check(await flight === null); check(bodies === 0);
+        if (next) {
+          const successorGrant = await preflightResumeUpload(next.socket, next.owner, members,
+            second, preflightUploads, old.credential);
+          assert.ok(successorGrant);
+          check(successorGrant.binding.generation === 2 && successorGrant.binding !== old.binding);
+          check(preflightUploads.release(successorGrant));
+        }
+      } finally {
+        await a.query("ROLLBACK");
+        await flight; // release the DB barrier before awaiting any pending read
+      }
+    }
+    // Policy invalidation comes last so each earlier fixture uses authVersion 1.
+    await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'prefl123'");
+    check(await run(valid) === null); check(bodies === 0);
+  } finally {
+    await Promise.all(owners.map(owner => owner.close()));
+    for (const client of clients) client.disconnect();
+    await new Promise<void>(resolve => sockets.close(() => resolve()));
+  }
+  check(cleanupErrors.length === 0);
+  console.log(JSON.stringify({ suite: "resume-upload-preflight-postgresql-loopback", checks: checks - beforePreflight,
+    result: "PASS", scope: "real bearer lookup, physical owners, durable denials and observed DB lock races; no public HTTP parser" }));
+  console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts, expiry cleanup and private preflight loopback; not full socket resume" }));
+} finally {
+  await a.query("ROLLBACK");
+  await a.query('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE');
+  a.release();
+  b.release();
+  await operationPool.end();
+  await pool.end();
+}
+}
+
+main().catch(() => {
+  // Do not dump database errors/parameters or bearer values into CI logs.
+  console.error("Resume persistence PostgreSQL checks FAILED");
+  process.exitCode = 1;
+});

@@ -17,6 +17,7 @@ import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionStat
 import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
+import { createTextSender } from "@/lib/text-message-client";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -368,6 +369,8 @@ function RoomInner() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  const textSenderRef = useRef<ReturnType<typeof createTextSender> | null>(null);
+  if (!textSenderRef.current) textSenderRef.current = createTextSender();
 
   // Timeline: mixed messages and system messages
   const [timeline, setTimeline] = useState<
@@ -606,16 +609,19 @@ function RoomInner() {
     const msg = msgInput.trim();
     const session = sessionRef.current;
     const socket = socketRef.current;
-    if (!msg || !username || !session || !socket || sendingRef.current) return;
+    if (!msg || !username || !roomId || !session || !socket || sendingRef.current) return;
+    let checkOwner: () => void;
+    try { checkOwner = session.operationGuard(roomId); } catch { return; }
     sendingRef.current = true;
     setSending(true);
     try {
-      await session.sync();
-      const result = await socket.timeout(10_000).emitWithAck("send-message", { roomId, message: msg });
-      if (result.error) throw new Error(result.error);
-      receiveMessages([result.message]);
+      const message = await textSenderRef.current!.send(socket, session, roomId, msg);
+      checkOwner();
+      receiveMessages([message]);
       setMsgInput((current) => current === msgInput ? "" : current);
     } catch (err) {
+      // Stale success/error must not clear a draft, publish or resync a new join.
+      try { checkOwner(); } catch { return; }
       setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
         ? err.message : "Delivery not confirmed. Check the chat before retrying; your draft is kept.", id: getId() }]);
       session.sync().catch(() => {});
@@ -629,21 +635,28 @@ function RoomInner() {
     async (file: File) => {
       const session = sessionRef.current;
       if (!username || !file || !roomId || !session) return;
+      let checkOwner: () => void;
+      try { checkOwner = session.operationGuard(roomId); } catch { return; }
       const uploadId = getId();
       setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
       try {
         const data = await uploadRoomFile(file, roomId, session);
+        checkOwner();
         // The server persists + broadcasts before returning. No second socket
         // send is needed, so a disconnect cannot strand an uploaded attachment.
         setTimeline((prev) => prev.filter((item) => item.id !== uploadId));
         receiveMessages([data.message]);
       } catch (err) {
+        try { checkOwner(); } catch { return; }
         const reason = err instanceof Error ? err.message : "Please try again.";
         setTimeline((prev) => prev.map((item) => item.id === uploadId
           ? { kind: "sys" as const, text: `Upload failed: ${file.name} — ${reason}`, id: uploadId }
           : item));
       } finally {
-        session.sync().catch(() => {});
+        // Old work may remove its own spinner, never publish into or resync a
+        // replacement owner (including an explicit same-room rejoin).
+        setTimeline((prev) => prev.filter((item) => item.id !== uploadId || item.kind !== "uploading"));
+        try { checkOwner(); session.sync().catch(() => {}); } catch { /* owner ended */ }
       }
     },
     [username, roomId, receiveMessages]

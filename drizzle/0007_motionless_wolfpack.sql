@@ -1,0 +1,1 @@
+CREATE INDEX "resume_sessions_expiry_idx" ON "room_resume_sessions" USING btree ("expires_at","id");

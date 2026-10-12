@@ -1,18 +1,28 @@
 import type { ChatMessage, RoomSession } from "./room-session";
+import { uploadAuthorityHeaders } from "./upload-authority";
 
 export const MAX_FILE_SIZE = 100 * 1024 * 1024;
 
 export async function uploadRoomFile(
   file: File,
   roomId: string,
-  session: Pick<RoomSession, "sync" | "reconnect">,
+  session: Pick<RoomSession, "sync" | "reconnect" | "uploadAuthority" | "operationGuard">,
   request: typeof fetch = fetch
 ): Promise<{ message: ChatMessage }> {
   if (file.size > MAX_FILE_SIZE) throw new Error("File is too large (maximum 100 MB).");
+  const checkOwner = session.operationGuard(roomId);
   let socketId = await session.sync();
-  // Only retry a rejected authentication request: it cannot have saved a file.
+  checkOwner();
+  const clientMessageId = crypto.randomUUID();
+  let authority = session.uploadAuthority(roomId, socketId);
+  // Snapshot the mode before any request. A later legacy grant can never
+  // downgrade an attempt that began with bearer authority.
+  const strict = authority?.kind === "resume";
+  // Retry only an explicit server pre-body authentication rejection.
   // Never retry ambiguous network failures, which might already be committed.
   for (let attempt = 0; attempt < 2; attempt++) {
+    checkOwner();
+    const headers = uploadAuthorityHeaders(authority, roomId, socketId, clientMessageId);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
     try {
@@ -20,20 +30,42 @@ export async function uploadRoomFile(
       form.append("file", file);
       const response = await request("/api/upload", {
         method: "POST",
-        headers: { "x-room-id": roomId, "x-socket-id": socketId },
+        redirect: "error", // Never forward bearer headers to a redirect target.
+        headers,
         body: form,
         signal: controller.signal,
       });
-      if (response.status === 401 && attempt === 0) {
+      checkOwner();
+      const data = await response.json().catch(() => ({}));
+      checkOwner();
+      const body = data && typeof data === "object" ? data : {};
+      if (body.code === "UPLOAD_OUTCOME_UNKNOWN") {
+        throw new Error("Attachment status is unknown. Check room history before uploading again.");
+      }
+      if (!strict && response.status === 401 && body.code === "UPLOAD_AUTH_REQUIRED" && attempt === 0) {
         socketId = await session.reconnect();
+        checkOwner();
+        authority = session.uploadAuthority(roomId, socketId);
+        // A mode change is a new operation, not an implicit credential upgrade.
+        if (authority?.kind !== "legacy") throw Error("Upload authority changed. Please retry explicitly.");
         continue;
       }
-      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         const fallback = response.status === 413 ? "File is too large (maximum 100 MB)."
           : response.status === 429 ? "Too many uploads. Please try again later."
           : `Upload rejected (HTTP ${response.status}).`;
-        throw new Error(typeof data.error === "string" ? data.error : fallback);
+        throw new Error(typeof body.error === "string" ? body.error : fallback);
+      }
+      if (strict) {
+        const saved = body.message as ChatMessage | undefined;
+        if (body.clientMessageId !== clientMessageId || !saved ||
+            !Number.isSafeInteger(saved.id) || saved.id <= 0 || saved.type !== "file" ||
+            typeof saved.username !== "string" || !Number.isFinite(saved.ts) ||
+            saved.name !== file.name || saved.size !== file.size ||
+            saved.mime !== (file.type || "application/octet-stream") ||
+            typeof saved.url !== "string" || !/^\/uploads\/[a-f0-9]{64}\/blob$/.test(saved.url)) {
+          throw Error("Upload receipt could not be verified. Check room history before uploading again.");
+        }
       }
       return data;
     } catch (err) {
@@ -43,6 +75,8 @@ export async function uploadRoomFile(
       if (err instanceof TypeError) throw new Error("Network interrupted. Check the chat before retrying.");
       throw err;
     } finally {
+      // Also settle an unread body when ownership changes after headers.
+      controller.abort();
       clearTimeout(timer);
     }
   }

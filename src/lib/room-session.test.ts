@@ -33,7 +33,8 @@ test("transport reconnect rejoins with credentials, restores missed history and 
       assert.equal(credentials.password, "qa-password");
       joins++;
       socket.join("qa");
-      socket.emit("room-snapshot", { history, users: ["mobile", `peer-${joins}`] });
+      socket.emit("room-snapshot", { history, users: ["mobile", `peer-${joins}`],
+        capabilities: joins === 1 ? { textOperationKeys: true } : undefined });
     });
     socket.on("sync-room", (_payload, ack) => {
       if (!ignoreSync) ack({ history, users: ["mobile", `peer-${joins}`] });
@@ -51,11 +52,20 @@ test("transport reconnect rejoins with credentials, restores missed history and 
   t.after(async () => { session.dispose(); socket.disconnect(); await new Promise<void>((resolve) => sockets.close(() => resolve())); });
   session.join({ roomId: "qa", username: "mobile", password: "qa-password" });
   await waitFor(() => session.isReady());
+  assert.equal(session.canRetryText(), true);
+  await session.sync();
+  assert.equal(session.canRetryText(), true, "ordinary sync retains this transport's capability");
   const oldId = socket.id;
+  assert.deepEqual(session.uploadAuthority("qa", oldId!), { kind: "legacy", roomId: "qa", socketId: oldId });
+  assert.equal(session.uploadAuthority("other", oldId!), null);
+  assert.equal(session.uploadAuthority("qa", "stale"), null);
   history = [message(1), message(2), message(3)];
   sockets.sockets.sockets.get(oldId!)!.conn.close();
   await waitFor(() => joins === 2 && session.isReady());
   assert.notEqual(socket.id, oldId);
+  assert.equal(session.uploadAuthority("qa", oldId!), null);
+  assert.equal(session.uploadAuthority("qa", socket.id!)?.kind, "legacy");
+  assert.equal(session.canRetryText(), false, "rejoining an old server cannot retain retry authority");
   assert.deepEqual(received.map((m) => m.id), [1, 2, 3]);
   assert.deepEqual(users, ["mobile", "peer-2"]);
   assert.ok(states.includes("reconnecting"));
@@ -111,4 +121,5 @@ test("wrong-password failure is not treated as a connected room", async (t) => {
   await assert.rejects(session.sync(), /Wrong password/);
   assert.equal(error, "Wrong password");
   assert.equal(session.isReady(), false);
+  assert.equal(session.uploadAuthority("qa", socket.id!), null);
 });
