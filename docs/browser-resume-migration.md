@@ -65,3 +65,28 @@ refuses files instead of inferring byte identity from name/size/MIME/path. A
 reviewed authenticated byte-identity response contract is still needed. No public
 imports, credential publication, join/resume handler, automatic replay, reload
 durability, or activation was added. Keep PR44 draft and unmerged.
+
+## Private actual-owner credential handoff
+
+The private `resume-browser-handshake` adapter now uses the real
+`ResumeSocketOwner.join/admit` results and exact `ResumeMemberships` binding.
+It rechecks physical ownership and membership after the awaited admission,
+switches that owner irreversibly to strict uploads BEFORE credential handoff,
+and serializes only the browser lease fields. A foreign/copied owner, stale
+binding, closed socket or foreign membership registry cannot publish a lease.
+A synchronous handoff exception propagates without restoring legacy authority.
+
+Five regressions exercise real loopback Socket.IO owners, credential snapshotting,
+close during CAS, denied CAS without retry, exact field projection and the
+browser remaining in syncing (not ready). The PostgreSQL fixture now hands
+actual owner-generated join/resume leases across private Socket.IO events:
+42 controller checks, 399 total DB checks. Same-session text/image/file DB retry
+identity survives withheld write receipts. File proof remains DB-only.
+The fixture uses a trusted authenticated-join input, NOT a public password-login
+handler; message/history reads and writes are still direct private calls.
+
+No production imports or public event registration. Lookup remains read-only
+generation evidence, never membership or permission to automatically steal a CAS
+winner. Public authentication/negotiation, snapshot-gap sync, all-producer wiring,
+file-byte response authority and reload durability are STILL pending.
+Keep this same 3.0.33 PR draft and unmerged.

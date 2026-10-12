@@ -1,5 +1,92 @@
 import assert from "node:assert/strict";
 
+import { publishBrowserJoin, publishBrowserResume } from "./resume-browser-handshake";
+import { createBrowserResumeController, type BrowserLease } from "./browser-resume-controller";
+
+test("private join projects actual owner lease, fences legacy before handoff, and leaves browser syncing", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings);
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+    issue: async () => ({ ...issuedJoin(), sessionId }),
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } });
+  t.after(() => owner.close());
+  const browser = createBrowserResumeController(() => "browser_operation_0001", () => 0);
+  const physical = {}, ticket = browser.beginJoin("candy986", "Alice", physical);
+  let received: BrowserLease | undefined;
+  assert.equal(await publishBrowserJoin(socket, owner, members, authenticatedJoin, lease => {
+    received = lease;
+    assert.ok(Object.isFrozen(lease));
+    assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+    browser.accept(ticket, physical, lease);
+  }), true);
+  assert.deepEqual(Object.keys(received!).sort(),
+    ["expiresAt", "generation", "roomId", "sessionId", "token", "username"].sort());
+  assert.equal(browser.status().phase, "syncing");
+  assert.throws(() => browser.beginOperation("message", "a".repeat(64)), /synchronized/);
+  assert.ok(await owner.join(authenticatedJoin));
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+});
+
+test("private handshake rejects copied owner and different socket before issuance", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let issues = 0;
+  const owner = attachResumeSocket(first.socket, { ...opts, memberships: members,
+    issue: async () => { issues++; return issuedJoin(); } });
+  t.after(() => owner.close());
+  const handoff = () => assert.fail("forged handoff");
+  assert.equal(await publishBrowserJoin(first.socket, { ...owner }, members, authenticatedJoin, handoff), false);
+  assert.equal(await publishBrowserJoin(second.socket, owner, members, authenticatedJoin, handoff), false);
+  assert.equal(issues, 0);
+});
+
+test("private resume snapshots credentials and never publishes after close during CAS", async t => {
+  for (const close of [false, true]) {
+    const f = await fixture(t), { socket } = await f.connect(), opts = options();
+    const members = new ResumeMemberships(opts.bindings), gate = deferred<void>(), entered = deferred<void>();
+    const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+      store: { advanceGeneration: async credential => {
+        assert.equal(credential.token, request().credential.token);
+        entered.resolve(); await gate.promise; return identity();
+      } } });
+    t.after(() => owner.close());
+    const input = request(); let handed = 0;
+    const flight = publishBrowserResume(socket, owner, members, input, lease => {
+      handed++; assert.equal(lease.token, request().credential.token);
+    });
+    await entered.promise;
+    input.credential.token = "mutated"; input.credential.roomId = "other123";
+    const closing = close ? owner.close() : undefined;
+    gate.resolve(); await closing;
+    assert.equal(await flight, !close); assert.equal(handed, close ? 0 : 1);
+  }
+});
+
+test("private handshake refuses a foreign membership registry and preserves errors", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), wrong = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members, issue: async () => issuedJoin() });
+  t.after(() => owner.close());
+  assert.equal(await publishBrowserJoin(socket, owner, wrong, authenticatedJoin,
+    () => assert.fail("foreign registry")), false);
+  await assert.rejects(publishBrowserJoin(socket, owner, members, authenticatedJoin,
+    () => { throw Error("handoff lost"); }), /handoff lost/);
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null,
+    "uncertain credential handoff must never downgrade");
+});
+
+test("private resume denial never looks up or steals a newer generation", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let calls = 0;
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+    store: { advanceGeneration: async () => { calls++; return null; } } });
+  t.after(() => owner.close());
+  const handoff = () => assert.fail("denied handoff");
+  assert.equal(await publishBrowserResume(socket, owner, members, request(), handoff), false);
+  assert.equal(await publishBrowserResume(socket, owner, members, request(1), handoff), false);
+  assert.equal(calls, 1);
+});
+
 import { LegacyUploadAdmission } from "./legacy-upload-admission";
 import type { ResumeOperationGate } from "./resume-operation";
 
