@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { checkBrowserResumeCore } from "./qa-browser-resume-core";
 import { randomBytes } from "node:crypto";
 import { readFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1127,6 +1128,7 @@ try {
   check(cleanupErrors.length === 0);
   console.log(JSON.stringify({ suite: "resume-upload-preflight-postgresql-loopback", checks: checks - beforePreflight,
     result: "PASS", scope: "real bearer lookup, physical owners, durable denials and observed DB lock races; no public HTTP parser" }));
+  checks += await checkBrowserResumeCore(a, operationPool);
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts, expiry cleanup and private preflight loopback; not full socket resume" }));
 } finally {
   await a.query("ROLLBACK");
