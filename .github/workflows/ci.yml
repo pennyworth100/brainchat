@@ -199,6 +199,8 @@ jobs:
 
       - name: Public outbox reload and fail-closed storage regression
         run: node scripts/qa-public-outbox.mjs
+      - name: Durable browser lease journal (real IndexedDB)
+        run: node scripts/qa-browser-lease-journal.mjs
 
       - name: Rendered mobile-viewport and desktop browser acceptance
         run: node scripts/qa-rendered-browser.mjs
