@@ -18,7 +18,7 @@ import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
 import { createTextSender } from "@/lib/text-message-client";
-import { publicOwnerScope, publicDraft, publicOutbox, type PendingPublicOperation } from "@/lib/public-outbox";
+import { publicOwnerScope, publicDraft, publicDraftSnapshot, publicOutbox, reconcilePublicConfirmation, type PendingPublicOperation } from "@/lib/public-outbox";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -371,6 +371,7 @@ function RoomInner() {
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const durableScopeRef = useRef<string | null>(null);
+  const editorRevisionRef = useRef(0);
   const [durableError, setDurableError] = useState("");
   const [pendingOperation, setPendingOperation] = useState<PendingPublicOperation>();
 
@@ -482,12 +483,21 @@ function RoomInner() {
           const initialRestore = durableScopeRef.current !== scope;
           durableScopeRef.current = scope;
           // Transport sync must not overwrite a newer editor value after a storage failure.
-          if (initialRestore) setMsgInput(publicDraft(localStorage, scope));
+          const restoredDraft = publicDraft(localStorage, scope);
+          const restoreRevision = editorRevisionRef.current;
+          if (initialRestore) setMsgInput(restoredDraft);
           const checkOwner = session.operationGuard(roomId);
-          void publicOutbox(scope, "read").then((pending) => {
+          void (initialRestore ? reconcilePublicConfirmation(scope, localStorage, checkOwner) : publicOutbox(scope, "read")).then((pending) => {
             checkOwner();
-            if (durableScopeRef.current === scope) setPendingOperation(pending);
+            if (durableScopeRef.current === scope) {
+              setPendingOperation(pending);
+              if (initialRestore) {
+                const savedDraft = publicDraft(localStorage, scope);
+                setMsgInput(current => editorRevisionRef.current === restoreRevision && current === restoredDraft ? savedDraft : current);
+              }
+            }
           }).catch(() => {
+            try { checkOwner(); } catch { return; }
             if (durableScopeRef.current === scope) setDurableError("Could not read saved delivery status. Sending is blocked.");
           });
         } catch {
@@ -638,24 +648,29 @@ function RoomInner() {
     sendingRef.current = true;
     setSending(true);
     let unsentReservation: { scope: string; id: string } | undefined;
+    const sentEditorRevision = editorRevisionRef.current;
     let dispatched = false;
     try {
       const scope = durableScopeRef.current;
       if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
-      const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "text", payload: msg, outcome: "unknown" };
+      const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "text", payload: msg, outcome: "unknown", draft: publicDraftSnapshot(localStorage, scope) };
       await publicOutbox(scope, "reserve", operation);
       unsentReservation = { scope, id: operation.clientMessageId };
       checkOwner();
       setPendingOperation(operation);
       const message = await createTextSender(() => operation.clientMessageId).send(socket, session, roomId, msg, () => { dispatched = true; });
       checkOwner();
-      await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
+      const confirmed = { ...operation, outcome: "confirmed" as const, confirmedMessageId: message.id };
+      await publicOutbox(scope, "confirm", confirmed, operation.clientMessageId);
+      checkOwner();
+      setPendingOperation(confirmed);
+      await reconcilePublicConfirmation(scope, localStorage, checkOwner);
       checkOwner();
       setPendingOperation(undefined);
-      if (publicDraft(localStorage, scope) === msgInput) publicDraft(localStorage, scope, "");
       checkOwner();
       receiveMessages([message]);
-      setMsgInput((current) => current === msgInput ? "" : current);
+      const savedDraft = publicDraft(localStorage, scope);
+      setMsgInput((current) => editorRevisionRef.current === sentEditorRevision && current === msgInput ? savedDraft : current);
     } catch (err) {
       if (unsentReservation && !dispatched) {
         try {
@@ -696,7 +711,11 @@ function RoomInner() {
         setPendingOperation(operation);
         const data = await uploadRoomFile(file, roomId, session, fetch, operation.clientMessageId, () => { dispatched = true; });
         checkOwner();
-        await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
+        const confirmed = { ...operation, outcome: "confirmed" as const, confirmedMessageId: data.message.id };
+        await publicOutbox(scope, "confirm", confirmed, operation.clientMessageId);
+        checkOwner();
+        setPendingOperation(confirmed);
+        await reconcilePublicConfirmation(scope, localStorage, checkOwner);
         checkOwner();
         setPendingOperation(undefined);
         checkOwner();
@@ -1014,7 +1033,9 @@ function RoomInner() {
 
       {(durableError || pendingOperation) && (
         <div role="alert" aria-label="Delivery status" className="px-5 py-2 text-sm text-dimle-text-primary">
-          {durableError || (pendingOperation?.kind === "file"
+          {durableError || (pendingOperation?.outcome === "confirmed"
+            ? "Delivery confirmed. Saved draft cleanup is pending; reload to finish. Nothing will be resent."
+            : pendingOperation?.kind === "file"
             ? "Attachment status is unknown. Saved attachment retained; check room history. Automatic retry is disabled."
             : "Delivery is not confirmed. Saved message retained; check room history. Automatic retry is disabled.")}
         </div>
@@ -1047,6 +1068,7 @@ function RoomInner() {
           value={msgInput}
           onChange={(e) => {
             const value = e.target.value;
+            editorRevisionRef.current++;
             setMsgInput(value);
             try {
               if (!durableScopeRef.current) throw Error();

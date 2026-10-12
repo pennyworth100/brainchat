@@ -2,7 +2,9 @@ export interface PendingPublicOperation {
   clientMessageId: string;
   kind: "text" | "file";
   payload: string | File;
-  outcome: "unknown";
+  outcome: "unknown" | "confirmed";
+  draft?: { value: string; revision: string };
+  confirmedMessageId?: number;
 }
 
 /** Tab-bound owner scope survives reload, never contains passwords or bearer grants. */
@@ -15,18 +17,54 @@ export function publicOwnerScope(storage: Storage, room: string, username: strin
 }
 
 export function publicDraft(storage: Storage, scope: string, value?: string): string {
-  const key = "dimle:draft:v1:" + scope;
+  const key = "dimle:draft:v2:" + scope;
   if (value !== undefined) {
     if (value.length > 32_768) throw Error("Draft is too long to save. Nothing was sent.");
-    storage.setItem(key, value);
-    if (storage.getItem(key) !== value) throw Error("Draft could not be saved. Nothing was sent.");
+    const encoded = JSON.stringify({ value, revision: crypto.randomUUID() });
+    storage.setItem(key, encoded);
+    if (storage.getItem(key) !== encoded) throw Error("Draft could not be saved. Nothing was sent.");
   }
-  return storage.getItem(key) ?? "";
+  return publicDraftSnapshot(storage, scope).value;
+}
+
+export function publicDraftSnapshot(storage: Storage, scope: string): { value: string; revision: string } {
+  const encoded = storage.getItem("dimle:draft:v2:" + scope);
+  if (encoded === null) {
+    const value = storage.getItem("dimle:draft:v1:" + scope) ?? "";
+    return { value, revision: "legacy:" + value };
+  }
+  const draft = JSON.parse(encoded);
+  if (!draft || typeof draft.value !== "string" || typeof draft.revision !== "string") {
+    throw Error("Saved draft is invalid. Sending is blocked.");
+  }
+  return draft;
+}
+
+/** Recover a validated ACK, never infer delivery from history or retry UNKNOWN.
+ * The confirmed row stays durable until the exact draft revision is cleared.
+ * A crash at either boundary is repeatable; a newer edit (even identical text) wins. */
+export async function reconcilePublicConfirmation(scope: string, storage: Storage, checkOwner: () => void) {
+  const pending = await publicOutbox(scope, "read");
+  checkOwner();
+  if (pending?.outcome !== "confirmed") return pending;
+  if (!Number.isSafeInteger(pending.confirmedMessageId) || pending.confirmedMessageId! < 1 ||
+      (pending.kind === "text" && (!pending.draft || typeof pending.draft.value !== "string" ||
+        typeof pending.draft.revision !== "string" || pending.draft.value.trim() !== pending.payload))) {
+    throw Error("Saved confirmation is invalid. Sending is blocked.");
+  }
+  if (pending.kind === "text" && pending.draft &&
+      publicDraftSnapshot(storage, scope).revision === pending.draft.revision) {
+    publicDraft(storage, scope, "");
+  }
+  checkOwner();
+  await publicOutbox(scope, "settle", undefined, pending.clientMessageId);
+  checkOwner();
+  return undefined;
 }
 
 /** A single uncertain operation per owner/room, no eviction, replay or implicit retry. */
 export async function publicOutbox(
-  scope: string, action: "read" | "reserve" | "settle", operation?: PendingPublicOperation,
+  scope: string, action: "read" | "reserve" | "confirm" | "settle", operation?: PendingPublicOperation,
   expectedId?: string, factory: IDBFactory = indexedDB,
 ): Promise<PendingPublicOperation | undefined> {
   if (operation?.kind === "file" && (!(operation.payload instanceof Blob) || operation.payload.size > 100 * 1024 * 1024)) {
@@ -51,7 +89,7 @@ export async function publicOutbox(
         try {
         result = request.result;
         if (action === "reserve") {
-          if (result || !operation) {
+          if (result || !operation || operation.outcome !== "unknown") {
             failure = Error("Delivery is not confirmed. Check room history; automatic retry is disabled.");
             tx.abort(); return;
           }
@@ -72,11 +110,17 @@ export async function publicOutbox(
               tx.abort();
             }
           };
-        } else if (action === "settle") {
+        } else if (action === "settle" || action === "confirm") {
           if (!result || result.clientMessageId !== expectedId) {
             failure = Error("Pending operation ownership changed."); tx.abort(); return;
           }
-          store.delete(scope); result = undefined;
+          if (action === "confirm") {
+            if (operation?.clientMessageId !== expectedId || !Number.isSafeInteger(operation.confirmedMessageId) || operation.confirmedMessageId! < 1) {
+              failure = Error("Validated delivery identity is required."); tx.abort(); return;
+            }
+            result = { ...result, outcome: "confirmed", confirmedMessageId: operation.confirmedMessageId };
+            store.put(result, scope);
+          } else { store.delete(scope); result = undefined; }
         }
         } catch (error) {
           failure = error instanceof Error ? error : Error("Browser storage failed. Nothing was sent.");

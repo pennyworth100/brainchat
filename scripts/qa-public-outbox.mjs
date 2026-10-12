@@ -10,6 +10,7 @@ const app = next({ dev: false, hostname: "127.0.0.1", dir: process.cwd() });
 await app.prepare();
 let uploads = 0, sends = 0;
 let failPreflightFor = "";
+let releaseAck;
 const server = createServer((req, res) => {
   if (req.url === "/api/upload") {
     uploads++;
@@ -33,7 +34,15 @@ io.on("connection", socket => {
   });
   socket.on("sync-room", (_data, ack) => ack(failPreflightFor === username
     ? { error: "Controlled predispatch sync failure" } : snapshot()));
-  socket.on("send-message", () => { sends++; }); // Deliberately lost ACK, no database write.
+  socket.on("send-message", (data, ack) => {
+    sends++;
+    if (username.startsWith("Confirmed-")) {
+      const reply = () => ack({ clientMessageId: data.clientMessageId,
+        message: { id: sends + 100, type: "message", username, message: data.message, ts: Date.now() } });
+      if (username.startsWith("Confirmed-revision")) releaseAck = reply;
+      else reply();
+    }
+  }); // Others deliberately lose ACK; no database write.
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const base = "http://127.0.0.1:" + server.address().port;
@@ -59,7 +68,7 @@ try {
       return await new Promise((resolve, reject) => {
         const tx = db.transaction("pending"); const r = tx.objectStore("pending").getAll();
         r.onsuccess = async () => resolve(await Promise.all(r.result.map(async value => ({
-          id: value.clientMessageId, kind: value.kind, outcome: value.outcome,
+          id: value.clientMessageId, kind: value.kind, outcome: value.outcome, confirmedMessageId: value.confirmedMessageId,
           payload: typeof value.payload === "string" ? value.payload : Array.from(new Uint8Array(await value.payload.arrayBuffer())),
           name: value.payload.name,
         }))));
@@ -181,6 +190,89 @@ try {
     await expect.poll(async () => (await pending()).length).toBe(rowsBefore.length + 1);
     checks.push(kind + " predispatch sync/rejoin failure releases exact reservation, preserves draft, and allows one explicit new attempt; dispatched UNKNOWN remains retained");
   }
+  // Fault injection after a validated ACK, on BOTH sides of editor clearing.
+  for (const phase of ["draft", "delete"]) {
+    await page.reload(); await join("Confirmed-" + phase);
+    await page.getByLabel("Message", { exact: true }).fill("confirmed " + phase);
+    const rowsBefore = await pending(), sendsBefore = sends;
+    await page.evaluate(phase => {
+      if (phase === "draft") {
+        const original = Storage.prototype.setItem;
+        Storage.prototype.setItem = function(key, value) {
+          if (key.startsWith("dimle:draft:v2:") && JSON.parse(value).value === "") throw Error("Controlled draft clear failure");
+          return original.call(this, key, value);
+        };
+      } else IDBObjectStore.prototype.delete = () => { throw Error("Controlled receipt cleanup failure"); };
+    }, phase);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(async () => (await pending()).filter(x => x.outcome === "confirmed").length).toBe(1);
+    assert.ok(Number.isSafeInteger((await pending()).find(x => x.outcome === "confirmed").confirmedMessageId));
+    await expect(page.getByText(phase === "draft" ? "Controlled draft clear failure" : "Controlled receipt cleanup failure", { exact: true })).toBeVisible();
+    assert.equal(sends, sendsBefore + 1);
+    await page.reload(); await join("Unrelated-owner");
+    assert.equal((await pending()).filter(x => x.outcome === "confirmed").length, 1);
+    await page.reload(); await join("Confirmed-" + phase);
+    await expect.poll(pending).toEqual(rowsBefore);
+    await expect(page.getByLabel("Message", { exact: true })).toHaveValue("");
+    await expect(page.getByRole("alert", { name: "Delivery status" })).toHaveCount(0);
+    assert.equal(sends, sendsBefore + 1);
+    checks.push("validated ACK survives " + phase + " failure, wrong owner cannot settle, same-owner reload clears exact draft/receipt without resend");
+  }
+  await page.reload(); await join("Confirmed-revision");
+  await page.getByLabel("Message", { exact: true }).fill("same text again");
+  const revisionRows = await pending();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => typeof releaseAck).toBe("function");
+  await page.getByLabel("Message", { exact: true }).fill("intermediate edit");
+  await page.getByLabel("Message", { exact: true }).fill("same text again");
+  releaseAck();
+  await expect.poll(pending).toEqual(revisionRows);
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("same text again");
+  await page.reload(); await join("Confirmed-revision");
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("same text again");
+  checks.push("delayed validated ACK preserves newer identical-text revision in editor and after reload");
+  releaseAck = undefined;
+  await page.reload(); await join("Confirmed-revision-unsaved");
+  await page.getByLabel("Message", { exact: true }).fill("new intent same text");
+  const unsavedRows = await pending();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => typeof releaseAck).toBe("function");
+  await page.evaluate(() => {
+    window.savedDraftSetter = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) {
+      if (key.startsWith("dimle:draft:v2:")) throw Error("Transient editor storage failure");
+      return window.savedDraftSetter.call(this, key, value);
+    };
+  });
+  await page.getByLabel("Message", { exact: true }).fill("intermediate unsaved edit");
+  await page.getByLabel("Message", { exact: true }).fill("new intent same text");
+  await page.evaluate(() => { Storage.prototype.setItem = window.savedDraftSetter; });
+  releaseAck();
+  await expect.poll(pending).toEqual(unsavedRows);
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("new intent same text");
+  await expect(page.getByRole("alert", { name: "Delivery status" })).toContainText("keep this page open");
+  checks.push("late ACK preserves newer identical unsaved editor after transient storage failure; warning remains");
+  await page.reload(); await join("Confirmed-write-failure");
+  await page.getByLabel("Message", { exact: true }).fill("ACK cannot be saved");
+  const beforeConfirmFailure = sends;
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function(value, key) {
+      if (value.outcome === "confirmed") throw Error("Controlled confirmation write failure");
+      return put.call(this, value, key);
+    };
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("Controlled confirmation write failure", { exact: true })).toBeVisible();
+  const unknownAfterAck = await pending();
+  assert.equal(unknownAfterAck.find(x => x.payload === "ACK cannot be saved").outcome, "unknown");
+  await page.reload(); await join("Confirmed-write-failure");
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("ACK cannot be saved");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText(/Delivery is not confirmed.*Check room history;/)).toBeVisible();
+  assert.deepEqual(await pending(), unknownAfterAck);
+  assert.equal(sends, beforeConfirmFailure + 1);
+  checks.push("failed durable confirmation retains original UNKNOWN and draft; reload and explicit attempt cannot replay");
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ result: "PASS", checks, uploads, sends, pageErrors: errors, browser: browser.version(), scope: "Built public UI + loopback controlled protocol; not real database/candidate acceptance" }));
 } catch (error) {
