@@ -73,6 +73,7 @@ jobs:
           path: |
             /tmp/dimle-provider-tls-*/report.json
             /tmp/dimle-provider-tls-*/server.log
+            /tmp/dimle-publication-*/server.log
           if-no-files-found: warn
 
   verify:

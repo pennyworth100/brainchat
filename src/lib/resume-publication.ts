@@ -1,0 +1,109 @@
+import { randomUUID } from "node:crypto";
+import type { Socket } from "socket.io";
+import type { ResumeBinding } from "./resume-bindings";
+import type { ResumeOperationGate } from "./resume-operation";
+import type { ResumeMemberships } from "./resume-membership";
+import type { ResumeSocketOwner } from "./resume-socket";
+import { ResumeCapacity } from "./resume-capacity";
+
+type Row = { id: number; type: string; username: string; content: string; ts: Date };
+export type PublicationBatch = { deliveryTry: string; roomId: string; sessionId: string;
+  generation: number; messages: Row[] };
+const BATCH = 16, TOTAL = 256, BYTES = 1024 * 1024;
+
+// PRIVATE bounded proof. No public handler/startup migration. Retained ACK set,
+// not MAX(id): IDs identify messages, never their commit order. Expiry/capacity
+// fail closed; no eviction or global journal deletion. Caller owns poll cadence.
+export class ResumePublication {
+  constructor(private readonly gate: ResumeOperationGate) {}
+  async claim(binding: ResumeBinding): Promise<PublicationBatch | null> {
+    const result = await this.gate.run(binding, async tx => {
+      // Gate already locks room/session and authenticates durable generation,
+      // physical incarnation and policy. One subscriber per logical session.
+      let subscriber = await tx.query("SELECT session_id FROM publication_subscribers WHERE session_id=$1 AND expires_at>clock_timestamp()", [binding.sessionId]);
+      if (!subscriber.rowCount) {
+        await tx.query("SELECT id FROM publication_admission WHERE id=1 FOR UPDATE");
+        const count = await tx.query("SELECT count(*)::int AS n FROM publication_subscribers");
+        if (count.rows[0].n >= 100) throw Error("Publication subscriber capacity");
+        await tx.query(`INSERT INTO publication_subscribers(session_id,expires_at)
+          VALUES ($1,to_timestamp($2/1000.0)) ON CONFLICT DO NOTHING`, [binding.sessionId, binding.expiresAt]);
+        subscriber = await tx.query("SELECT session_id FROM publication_subscribers WHERE session_id=$1 AND expires_at>clock_timestamp()", [binding.sessionId]);
+        if (!subscriber.rowCount) throw Error("Publication subscription expired");
+      }
+      // One bounded snapshot of the unACKed set. Concurrent later commits are
+      // still in the durable journal and appear on the next reconciliation.
+      const candidates = await tx.query<{id:number;bytes:number}>(`SELECT p.message_id AS id,
+          octet_length(m.content)+octet_length(m.username)+128 AS bytes
+        FROM message_publication_pending p JOIN messages m ON m.id=p.message_id
+        LEFT JOIN publication_deliveries d ON d.session_id=$1 AND d.message_id=p.message_id
+        WHERE p.room_id=$2 AND m.room_id=$2 AND (d.message_id IS NULL OR
+          (NOT d.acked AND (d.lease_until<=clock_timestamp() OR d.generation<>$3 OR d.transport_id<>$4)))
+        ORDER BY p.message_id LIMIT $5`,
+        [binding.sessionId,binding.roomId,binding.generation,binding.transportId,BATCH]);
+      const ids = candidates.rows.map(r=>r.id);
+      if (candidates.rows.reduce((n,r)=>n+r.bytes,0)>BYTES) throw Error("Publication byte capacity");
+      const size = await tx.query(`SELECT count(*)::int AS n FROM
+        (SELECT message_id FROM publication_deliveries WHERE session_id=$1
+         UNION SELECT unnest($2::integer[])) entries`, [binding.sessionId,ids]);
+      if (size.rows[0].n>TOTAL) throw Error("Publication receipt capacity");
+      const deliveryTry = randomUUID();
+      await tx.query(`INSERT INTO publication_deliveries
+        (session_id,message_id,generation,transport_id,delivery_try,lease_until)
+        SELECT $1,id,$3,$4,$5,clock_timestamp()+interval '5 seconds' FROM unnest($2::integer[]) id
+        ON CONFLICT(session_id,message_id) DO UPDATE SET generation=EXCLUDED.generation,
+        transport_id=EXCLUDED.transport_id,delivery_try=EXCLUDED.delivery_try,lease_until=EXCLUDED.lease_until`,
+        [binding.sessionId,ids,binding.generation,binding.transportId,deliveryTry]);
+      const rows = await tx.query<Row>("SELECT id,type,username,content,ts FROM messages WHERE room_id=$1 AND id=ANY($2::integer[]) ORDER BY id",[binding.roomId,ids]);
+      // UPDATE/DELETE are unsupported until tombstone semantics are designed.
+      if (rows.rowCount!==ids.length || Buffer.byteLength(JSON.stringify(rows.rows))>BYTES)
+        throw Error("Publication changed during claim");
+      return {deliveryTry,roomId:binding.roomId,sessionId:binding.sessionId,
+        generation:binding.generation,messages:rows.rows};
+    });
+    return result.authorized ? result.value : null;
+  }
+
+  async acknowledge(binding: ResumeBinding, batch: PublicationBatch, reply: unknown): Promise<boolean> {
+    if (!reply || typeof reply!=="object") return false;
+    const ack = reply as {deliveryTry?:unknown;ids?:unknown};
+    const ids = batch.messages.map(r=>r.id);
+    if (batch.roomId!==binding.roomId || batch.sessionId!==binding.sessionId ||
+        batch.generation!==binding.generation || ack.deliveryTry!==batch.deliveryTry ||
+        !Array.isArray(ack.ids) || ack.ids.length!==ids.length || !ids.length ||
+        !ack.ids.every((id,i)=>id===ids[i])) return false;
+    const result = await this.gate.run(binding, async tx => {
+      const rows = await tx.query(`UPDATE publication_deliveries d SET acked=true
+        FROM publication_subscribers s WHERE d.session_id=s.session_id AND s.expires_at>clock_timestamp()
+        AND d.session_id=$1 AND d.message_id=ANY($2::integer[]) AND d.generation=$3
+        AND d.transport_id=$4 AND d.delivery_try=$5 AND d.lease_until>clock_timestamp()
+        RETURNING d.message_id`,[binding.sessionId,ids,binding.generation,binding.transportId,batch.deliveryTry]);
+      if (rows.rowCount!==ids.length) throw Error("Publication ACK lease lost");
+      return true;
+    });
+    return result.authorized && result.value;
+  }
+}
+
+const busy = new WeakSet<Socket>();
+const capacity = new ResumeCapacity(32);
+// Real Socket.IO client ACK, NOT emit success. The DB transaction settles before
+// network IO; after await, exact physical membership AND DB policy revalidate.
+export async function reconcilePublication(socket: Socket, owner: ResumeSocketOwner,
+  members: ResumeMemberships, store: ResumePublication): Promise<boolean> {
+  const binding = members.currentBindingFor(socket,owner);
+  if (!binding || busy.has(socket)) return false;
+  const release = capacity.acquire();
+  if (!release) return false;
+  const current = () => members.currentBindingFor(socket,owner)===binding;
+  busy.add(socket);
+  try {
+    const batch = await store.claim(binding);
+    if (!batch || !current()) return false;
+    if (!batch.messages.length) return true;
+    let reply: unknown;
+    try { reply = await socket.timeout(4000).emitWithAck("publication-batch",batch); }
+    catch { return false; } // lost ACK keeps receipts pending for lease retry
+    if (!current()) return false;
+    return await store.acknowledge(binding,batch,reply) && current();
+  } finally { busy.delete(socket); release(); }
+}
