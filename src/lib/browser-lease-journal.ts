@@ -19,7 +19,7 @@ function validLease(value: BrowserLease, room: string, user: string) {
     typeof value.token === "string" && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.token) &&
     generation(value.generation) && Number.isSafeInteger(value.expiresAt) && value.expiresAt > 0;
 }
-function validate(row: LeaseCheckpoint) {
+export function validateLeaseCheckpoint(row: LeaseCheckpoint) {
   if (!row || row.version !== 1 || !key(row.revision) ||
       typeof row.roomId !== "string" || !isValidRoomId(row.roomId) ||
       normalizeRoomId(row.roomId) !== row.roomId ||
@@ -41,7 +41,7 @@ function validate(row: LeaseCheckpoint) {
 export function advanceLeaseCheckpoint(current: LeaseCheckpoint | undefined, expectedRevision: string | null,
   change: LeaseChange, revision: string, now = Date.now()): LeaseCheckpoint {
   if (!key(revision) || revision === expectedRevision || !Number.isSafeInteger(now)) throw Error("Invalid revision");
-  if (current) validate(current);
+  if (current) validateLeaseCheckpoint(current);
   if ((current?.revision ?? null) !== expectedRevision) throw Error("Session journal ownership changed");
   if (change.kind === "join") {
     if (current || !isValidRoomId(change.roomId) || normalizeRoomId(change.roomId) !== change.roomId ||
@@ -109,7 +109,7 @@ export async function browserLeaseJournal(scope: string,
       request.onsuccess = () => {
         try {
           result = request.result;
-          if (result) validate(result);
+          if (result) validateLeaseCheckpoint(result);
           if (!input) return;
           const next = advanceLeaseCheckpoint(result, input.expectedRevision, input.change, crypto.randomUUID(), now());
           const put = () => { result = next; store.put(next, scope); };
