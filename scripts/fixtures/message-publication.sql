@@ -6,14 +6,18 @@ LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE;
 CREATE TABLE message_publication_pending (
   message_id integer PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
   room_id text NOT NULL REFERENCES rooms(id),
-  queued_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  queued_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
 CREATE INDEX message_publication_room ON message_publication_pending(room_id, message_id);
+-- Keep invoker authority: absent INSERT permission fails the entire message.
+-- Caller-controlled temp/search_path objects must not intercept this write.
 CREATE FUNCTION enqueue_message_publication() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
-  INSERT INTO message_publication_pending(message_id, room_id)
-  VALUES (NEW.id, NEW.room_id);
+  EXECUTE pg_catalog.format(
+    'INSERT INTO %I.message_publication_pending(message_id, room_id) VALUES ($1, $2)',
+    TG_TABLE_SCHEMA
+  ) USING NEW.id, NEW.room_id;
   RETURN NEW;
 END
 $$;
