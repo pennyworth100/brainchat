@@ -172,6 +172,14 @@ jobs:
           cat /tmp/dimle-ci-server.log
           exit 1
 
+      # Browser creation precedes the API regression's intentional exhaustion
+      # of the shared create-room hourly limiter. Never reset/bypass the limiter.
+      - name: Install pinned Chromium for rendered browser acceptance
+        run: npx playwright install --with-deps chromium
+
+      - name: Rendered mobile-viewport and desktop browser acceptance
+        run: node scripts/qa-rendered-browser.mjs
+
       - name: HTTP, Socket.IO and PostgreSQL integration tests
         run: node --import tsx scripts/qa-reconnect-upload.ts
 
