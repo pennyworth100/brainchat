@@ -24,11 +24,13 @@ try:
     run(["node","--import","tsx","scripts/qa-message-publication.ts","seed"]).check_returncode()
     run(["node","--import","tsx","scripts/qa-publication-authority.ts"]).check_returncode()
     run(["node","--import","tsx","scripts/qa-publication-runtime-role.ts"]).check_returncode()
+    run(["node","--import","tsx","scripts/qa-message-write-admission.ts","seed"]).check_returncode()
     run(["node","--import","tsx","scripts/qa-publication-subscriber.ts","seed"]).check_returncode()
     run(["node","--import","tsx","scripts/qa-resume-store.ts"],timeout=90).check_returncode()
     run([pg/"pg_ctl","-D",data,"-m","immediate","-w","stop"]).check_returncode()
     start()
     run(["node","--import","tsx","scripts/qa-message-publication.ts","recover"]).check_returncode()
+    run(["node","--import","tsx","scripts/qa-message-write-admission.ts","recover"]).check_returncode()
     run(["node","--import","tsx","scripts/qa-publication-subscriber.ts","recover"]).check_returncode()
 finally:
     if run([pg/"pg_ctl","-D",data,"status"]).returncode == 0:
