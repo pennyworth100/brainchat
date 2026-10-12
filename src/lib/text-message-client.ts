@@ -1,11 +1,12 @@
 import type { Socket } from "socket.io-client";
 import type { ChatMessage, RoomSession } from "./room-session";
 
-type Session = Pick<RoomSession, "sync" | "isReady" | "canRetryText">;
+type Session = Pick<RoomSession, "sync" | "isReady" | "canRetryText" | "operationGuard">;
 interface PendingText {
   clientMessageId: string;
   roomId: string;
   message: string;
+  checkOwner: () => void;
   transport?: string;
   session?: Session;
 }
@@ -33,12 +34,15 @@ export function createTextSender(
         if (pending.size >= maxPending) {
           throw new Error("Too many unconfirmed messages. Check room history before sending more.");
         }
-        operation = { clientMessageId: newKey(), roomId, message };
+        operation = { clientMessageId: newKey(), roomId, message, checkOwner: session.operationGuard(roomId) };
         pending.set(identity, operation);
       }
       busy = true;
       try {
+        // Retried uncertain work keeps its ORIGINAL owner, not the current join.
+        operation.checkOwner();
         const transport = await session.sync();
+        operation.checkOwner();
         if (!socket.connected || socket.id !== transport || !session.isReady()) {
           throw new Error("Room is reconnecting. Your draft is kept.");
         }
@@ -56,6 +60,8 @@ export function createTextSender(
           message: operation.message,
           clientMessageId: operation.clientMessageId,
         });
+        // A valid receipt is not authority to publish into a replacement room.
+        operation.checkOwner();
         const receipt = result as { error?: unknown; clientMessageId?: unknown; message?: ChatMessage } | null;
         if (typeof receipt?.error === "string") throw new Error(receipt.error);
         const saved = receipt?.message;
@@ -72,6 +78,7 @@ export function createTextSender(
         // No emit means no uncertain write. Once emitted, even an error ACK can
         // represent an uncertain COMMIT; retain both the payload and its key.
         if (!operation.transport) pending.delete(identity);
+        operation.checkOwner();
         throw error;
       } finally {
         busy = false;
@@ -79,4 +86,3 @@ export function createTextSender(
     },
   };
 }
-
