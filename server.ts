@@ -41,7 +41,7 @@ import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
 import { ResumeMessageWriter } from "./src/lib/resume-message";
 import { ResumeImageWriter } from "./src/lib/resume-image";
-import { createStrictUploadService } from "./src/lib/strict-upload-service";
+import { createOwnedStrictUploadService, type OwnedStrictUploadConfiguration } from "./src/lib/owned-strict-upload-service";
 import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
@@ -228,7 +228,7 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-export async function main() {
+export async function main(options: Readonly<{ strictUploads?: OwnedStrictUploadConfiguration }> = {}) {
   // Run migrations
   console.log("Running database migrations...");
   await migrateDatabase(pool);
@@ -258,8 +258,12 @@ export async function main() {
   const resumeImage = new ResumeImageWriter(resumeGate);
   // Paired writer/reader use one pool and root. No production physical provider
   // yet: null provisioning keeps both disabled without a legacy fallback.
-  const strictFiles = createStrictUploadService(pool, uploadAdmissions, null);
+  const strictFiles = await createOwnedStrictUploadService(pool, uploadAdmissions, options.strictUploads ?? null)
+    .catch(async error => { await app.close(); throw error; });
   const strictUploads = strictFiles.uploads;
+  let startupLifecycle: ServerLifecycle | undefined;
+
+  try {
 
   const rateLimiterStore = {
     storeClient: pool,
@@ -304,7 +308,8 @@ export async function main() {
       return { rateLimits, sessions };
     },
   }, roomActivity);
-  lifecycle.own(strictUploads);
+  lifecycle.own(strictFiles);
+  startupLifecycle = lifecycle;
 
   // Security headers
   expressApp.disable("x-powered-by");
@@ -879,12 +884,22 @@ export async function main() {
   });
   console.log(`Dimle running on http://localhost:${PORT}`);
   sessionCleanup.start();
-  return { lifecycle, server, io, app };
+  return { lifecycle, server, io, app, settleStrictUploads: strictFiles.close };
+  } catch (error) {
+    await startupLifecycle?.stopAndSettle();
+    await strictFiles.close();
+    await new Promise<void>(resolve => io.close(() => resolve()));
+    await app.close();
+    throw error;
+  }
 }
 
 if (require.main === module) main().then(runtime => {
   installProcessShutdown(process, async () => {
     const report = await runtime.lifecycle.stopAndSettle();
+    // Lifecycle reports owner failures; this retained promise additionally
+    // refuses pool shutdown / a successful process report on ledger failure.
+    await runtime.settleStrictUploads();
     await new Promise<void>((resolve, reject) => runtime.io.close(error => error ? reject(error) : resolve()));
     await runtime.app.close();
     await pool.end();
