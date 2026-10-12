@@ -6,7 +6,10 @@ export type BrowserLease = Readonly<{
   generation: number; expiresAt: number;
 }>;
 type Phase = "empty" | "joining" | "syncing" | "ready" | "offline" | "uncertain" | "blocked";
-type Attempt = Readonly<{ kind: "join" | "resume"; operationId: string; expectedGeneration: number }>;
+type CasAttempt = Readonly<{ kind: "join" | "resume"; operationId: string; expectedGeneration: number }>;
+type TransferAttempt = Readonly<{ kind: "transfer"; originalOperationId: string; expectedGeneration: number;
+  transferOperationId: string }>;
+type Attempt = CasAttempt | TransferAttempt;
 type SyncAttempt = Readonly<{ sessionId: string; generation: number }>;
 type Operation = Readonly<{ clientMessageId: string; kind: "message" | "image" | "file"; payloadHash: string }>;
 const validKey = (key: string) => /^[A-Za-z0-9_-]{16,128}$/.test(key);
@@ -25,6 +28,7 @@ export function createBrowserResumeController(
   let lease: BrowserLease | null = null;
   let transport: object | null = null;
   let attempt: Attempt | null = null;
+  let lostCas: { ticket: CasAttempt; physical: object } | null = null;
   let syncAttempt: SyncAttempt | null = null;
   const pending = new Map<Operation, { sent: boolean }>();
   // Never recycle a key during this logical owner's lifetime, even after ACK.
@@ -59,7 +63,8 @@ export function createBrowserResumeController(
     const valid = value && value.roomId === roomId && value.username === username &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.sessionId) &&
       /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.token) &&
-      Number.isInteger(value.generation) && value.generation === ticket.expectedGeneration + 1 &&
+      Number.isInteger(value.generation) &&
+      value.generation === ticket.expectedGeneration + (ticket.kind === "transfer" ? 2 : 1) &&
       value.generation <= 2_147_483_647 &&
       Number.isFinite(value.expiresAt) && value.expiresAt > now() &&
       (!lease || (value.sessionId === lease.sessionId && value.token === lease.token &&
@@ -68,17 +73,18 @@ export function createBrowserResumeController(
     lease = Object.freeze({ roomId, username, sessionId: value.sessionId, token: value.token,
       generation: value.generation, expiresAt: value.expiresAt });
     attempt = null;
+    lostCas = null;
     phase = "syncing";
     return syncAttempt = Object.freeze({ sessionId: lease.sessionId, generation: lease.generation });
   };
   return {
-    beginJoin(nextRoom: string, nextUser: string, physical: object): Attempt {
+    beginJoin(nextRoom: string, nextUser: string, physical: object): CasAttempt {
       if (!isValidRoomId(nextRoom) || !nextUser.trim() || nextUser.length > 64) throw Error("Invalid room owner");
       // Explicit join is the ONLY way to discard an old logical owner. The UI
       // must keep its unresolved drafts separately; they are not transferable.
       roomId = nextRoom; username = nextUser; transport = physical;
       lease = null; pending.clear(); usedKeys.clear(); phase = "joining";
-      syncAttempt = null;
+      syncAttempt = null; lostCas = null;
       attempt = Object.freeze({ kind: "join", operationId: freshKey(), expectedGeneration: 0 });
       return attempt;
     },
@@ -88,17 +94,34 @@ export function createBrowserResumeController(
       transport = null;
       syncAttempt = null;
       if (phase === "blocked" || phase === "uncertain") return;
-      // A lost CAS ACK cannot be resolved by guessing a generation or retrying
-      // on another transport. A future authenticated lookup adapter is required.
+      // Keep ORIGINAL CAS provenance, never a transfer receipt/provenance chain.
+      // Only an explicit atomic server transfer may resolve this uncertainty.
+      lostCas = attempt?.kind === "resume" ? { ticket: attempt, physical } : null;
       phase = attempt ? "uncertain" : lease ? "offline" : "empty";
       attempt = null;
     },
-    beginResume(physical: object): Attempt {
+    beginResume(physical: object): CasAttempt {
       const current = live();
       if (phase === "syncing" && attempt?.kind === "resume" && physical === transport) return attempt;
       if (phase !== "offline" || current.generation >= 2_147_483_647) throw Error("Resume requires reconciliation");
       transport = physical;
       attempt = Object.freeze({ kind: "resume", operationId: freshKey(), expectedGeneration: current.generation });
+      phase = "syncing";
+      return attempt;
+    },
+    beginTransfer(physical: object): TransferAttempt {
+      const current = live();
+      if (phase === "syncing" && attempt?.kind === "transfer" && physical === transport) return attempt;
+      if (phase !== "uncertain" || !lostCas || physical === lostCas.physical ||
+          current.generation !== lostCas.ticket.expectedGeneration ||
+          current.generation > 2_147_483_645) throw Error("Transfer requires original CAS provenance");
+      const transferOperationId = freshKey();
+      attempt = Object.freeze({ kind: "transfer", originalOperationId: lostCas.ticket.operationId,
+        expectedGeneration: lostCas.ticket.expectedGeneration, transferOperationId });
+      // Consume locally BEFORE transport effects. A lost transfer ACK is terminal
+      // for this logical owner; no replay or promotion into another original CAS.
+      lostCas = null;
+      transport = physical;
       phase = "syncing";
       return attempt;
     },

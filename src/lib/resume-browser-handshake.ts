@@ -42,6 +42,15 @@ export async function publishBrowserResume(socket: Socket, owner: ResumeSocketOw
     operationId: request.operationId });
   return !!binding && publish(socket, owner, members, binding, credential, handoff);
 }
+export async function publishBrowserTransfer(socket: Socket, owner: ResumeSocketOwner,
+  members: ResumeMemberships, request: Parameters<ResumeSocketOwner["transfer"]>[0],
+  handoff: Handoff): Promise<boolean> {
+  if (!socket.connected || !ownsResumeSocket(socket, owner)) return false;
+  const credential = Object.freeze({ ...request.credential });
+  const binding = await owner.transfer({ credential, expectedGeneration: request.expectedGeneration,
+    originalOperationId: request.originalOperationId, transferOperationId: request.transferOperationId });
+  return !!binding && publish(socket, owner, members, binding, credential, handoff);
+}
 // Intentionally NO lookup->admit composition: lookup is not membership and cannot
 // distinguish a lost ACK from a concurrent winner. No automatic generation retry.
 // This lease also cannot finish browser history synchronization by itself.

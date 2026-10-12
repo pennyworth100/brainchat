@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import http from "node:http";
 import { Server, type Socket as ServerSocket } from "socket.io";
 import { io, type Socket as ClientSocket } from "socket.io-client";
 import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
-import { publishBrowserJoin, publishBrowserResume } from "../src/lib/resume-browser-handshake";
+import { publishBrowserJoin, publishBrowserResume, publishBrowserTransfer } from "../src/lib/resume-browser-handshake";
 import type { BrowserLease } from "../src/lib/browser-resume-controller";
 import { createBrowserResumeController } from "../src/lib/browser-resume-controller";
 import { createBrowserInlineReceiptAdapter } from "../src/lib/browser-inline-receipt";
@@ -68,18 +68,18 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
     const payloadHash = createHash("sha256").update(JSON.stringify(["core333", "browser-core", kind, ...payload])).digest("hex");
     const operation = c.beginOperation(kind, payloadHash);
     c.dispatch(operation, first);
-    const save = async (binding: ResumeBinding) => {
+    const save = async (binding: ResumeBinding, clientMessageId = operation.clientMessageId) => {
       if (kind === "message") {
-        const result = await new ResumeMessageWriter(gate).saveOnceWithOutcome(binding, operation.clientMessageId, text);
+        const result = await new ResumeMessageWriter(gate).saveOnceWithOutcome(binding, clientMessageId, text);
         assert(result.authorized); return result.value;
       }
       if (kind === "image") {
-        const result = await new ResumeImageWriter(gate).saveOnceWithOutcome(binding, operation.clientMessageId, image);
+        const result = await new ResumeImageWriter(gate).saveOnceWithOutcome(binding, clientMessageId, image);
         assert(result.authorized); return result.value;
       }
       const grant = admissions.admit(binding); assert(grant);
       try {
-        const result = await files.saveOnceWithOutcome(grant, operation.clientMessageId, file);
+        const result = await files.saveOnceWithOutcome(grant, clientMessageId, file);
         assert(result.completed && result.result.authorized); return result.result.value;
       } finally { admissions.release(grant); }
     };
@@ -114,14 +114,56 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
       check(await adapter.accept({ clientMessageId: operation.clientMessageId, message: retried.message }) === saved.message.id);
     }
     check(c.status().pending === 0);
+    const retained = c.beginOperation(kind, payloadHash);
+    c.dispatch(retained, second);
+    const retainedSaved = await save(binding, retained.clientMessageId);
+    check(retainedSaved.inserted); // Lose this write ACK as well as the next CAS ACK.
     // A CAS did commit but its ACK was lost on a DIFFERENT physical transport.
     c.disconnect(second); await two.owner.close(); second.disconnect();
-    const third = {}, uncertain = c.beginResume(third);
-    const advanced = await store.advanceGeneration(credential, 2, uncertain.operationId, randomUUID());
-    check(advanced?.generation === 3);
+    const three = await connect(), third = three.client, uncertain = c.beginResume(third);
+    check(await publishBrowserResume(three.socket, three.owner, members,
+      { credential, expectedGeneration: uncertain.expectedGeneration, operationId: uncertain.operationId },
+      () => {})); // Drop CAS lease ACK after actual owner admission.
     c.disconnect(third);
+    await three.owner.close(); third.disconnect();
     assert.throws(() => c.beginResume({}), /reconciliation/); checks++;
     check((await store.lookup(credential))?.generation === 3);
+    const four = await connect(), fourth = four.client, transfer = c.beginTransfer(fourth);
+    check(transfer.originalOperationId === uncertain.operationId && transfer.expectedGeneration === 2);
+    const transferWire = new Promise<BrowserLease>(resolve => fourth.once("fixture-transfer", resolve));
+    check(await publishBrowserTransfer(four.socket, four.owner, members,
+      { credential, expectedGeneration: transfer.expectedGeneration, originalOperationId: transfer.originalOperationId,
+        transferOperationId: transfer.transferOperationId },
+      value => four.socket.emit("fixture-transfer", value)));
+    const transferred = members.currentBindingFor(four.socket, four.owner); assert(transferred);
+    check(transferred.generation === 4);
+    const transferSync = c.accept(transfer, fourth, await transferWire);
+    check(c.status().phase === "syncing");
+    assert.throws(() => c.beginOperation(kind, payloadHash), /synchronized/); checks++;
+    check((await new ResumeHistoryReader(gate).read(transferred))?.some(value => (value as { id: number }).id === saved.message.id));
+    c.finishSync(fourth, 4, transferSync);
+    check(c.status().phase === "ready");
+    check(members.legacyUploadBindingFor(four.socket, four.owner, "core333") === null);
+    check(c.dispatch(retained, fourth).clientMessageId === retained.clientMessageId);
+    const replay = await save(transferred, retained.clientMessageId);
+    check(!replay.inserted && replay.message.id === retainedSaved.message.id);
+    check(c.status().pending === 1); // No invented receipt to discard pending data.
+    c.disconnect(fourth); await four.owner.close(); fourth.disconnect();
+    const five = await connect(), fifth = five.client, lostAgain = c.beginResume(fifth);
+    check(await publishBrowserResume(five.socket, five.owner, members,
+      { credential, expectedGeneration: lostAgain.expectedGeneration, operationId: lostAgain.operationId },
+      () => {}));
+    c.disconnect(fifth); await five.owner.close(); fifth.disconnect();
+    const six = await connect(), sixth = six.client, lostTransfer = c.beginTransfer(sixth);
+    check(await publishBrowserTransfer(six.socket, six.owner, members,
+      { credential, expectedGeneration: lostTransfer.expectedGeneration,
+        originalOperationId: lostTransfer.originalOperationId, transferOperationId: lostTransfer.transferOperationId },
+      () => {})); // DB/membership succeeds, transfer ACK never reaches controller.
+    c.disconnect(sixth); await six.owner.close(); sixth.disconnect();
+    check(c.status().phase === "uncertain" && c.status().pending === 1);
+    assert.throws(() => c.beginTransfer({}), /provenance/); checks++;
+    assert.throws(() => c.beginResume({}), /reconciliation/); checks++;
+    check((await store.lookup(credential))?.generation === 6);
   }
   } finally {
     await Promise.all(owners.map(owner => owner.close()));

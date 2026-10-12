@@ -38,10 +38,12 @@ the prior 33 checks, plus the existing 42 browser-core checks. Counts are nested
 not additive. Local full suite: 907 application + 5 plugin tests PASS;
 build/typecheck PASS; production dependency audit zero.
 
-This is a PRIVATE server seam. No public event, browser transfer ticket,
-credential publication, rendered resume UI or readiness claim is added.
-The browser still needs original-CAS provenance preservation across disconnect,
-an explicit owner/physical-attempt-fenced transfer state, and a separate +2
-acceptance path. Lost transfer ACK must remain uncertain; it cannot authorize
-another blind CAS or an endless provenance chain. Full synchronization and
-persisted file-byte identity remain independent gates.
+This is a PRIVATE server seam. No public event, public credential publication,
+rendered resume UI or readiness claim is added. The subsequent same-3.0.33
+browser slice now retains original-CAS provenance across disconnect and has a
+distinct physical-attempt-fenced transfer ticket with explicit +2 acceptance.
+The private handoff uses actual owner.transfer, never lookup followed by CAS.
+Lost transfer ACK stays uncertain and cannot authorize another transfer, blind
+CAS or an endless provenance chain. Full synchronization and persisted file-byte
+identity remain independent gates. See browser-resume-migration.md for the
+newer browser slice evidence; the counts above describe the admission slice.

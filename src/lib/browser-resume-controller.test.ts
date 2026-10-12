@@ -1,6 +1,84 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBrowserResumeController, type BrowserLease } from "./browser-resume-controller";
+
+test("explicit transfer preserves original CAS, accepts only +2, and requires separate sync", () => {
+  const { controller: c, first } = fixture();
+  const pending = c.beginOperation("image", "a".repeat(64));
+  c.dispatch(pending, first);
+  c.disconnect(first);
+  const second = {}, cas = c.beginResume(second);
+  c.disconnect(second);
+  assert.throws(() => c.beginTransfer(second), /provenance/);
+  const third = {}, transfer = c.beginTransfer(third);
+  assert.equal(c.beginTransfer(third), transfer);
+  assert.equal(transfer.originalOperationId, cas.operationId);
+  assert.equal(transfer.expectedGeneration, 1);
+  assert.notEqual(transfer.transferOperationId, cas.operationId);
+  assert.throws(() => c.beginTransfer({}), /provenance/);
+  assert.throws(() => c.accept({ ...transfer }, third, { ...lease, generation: 3 }), /Stale/);
+  assert.throws(() => c.accept(cas, second, { ...lease, generation: 2 }), /Stale/);
+  c.disconnect(second);
+  const sync = c.accept(transfer, third, { ...lease, generation: 3 });
+  assert.throws(() => c.dispatch(pending, third), /synchronized/);
+  assert.throws(() => c.finishSync(second, 3, sync), /Stale/);
+  c.finishSync(third, 3, sync);
+  assert.equal(c.dispatch(pending, third).clientMessageId, pending.clientMessageId);
+  assert.equal(c.status().pending, 1);
+});
+test("transfer refuses normal CAS generation and malformed credentials", () => {
+  for (const change of [{ generation: 2 }, { generation: 4 }, { token: "bad" }, { expiresAt: 6000 }]) {
+    const { controller: c, first } = fixture();
+    c.disconnect(first);
+    const second = {}; c.beginResume(second); c.disconnect(second);
+    const third = {}, transfer = c.beginTransfer(third);
+    assert.throws(() => c.accept(transfer, third, { ...lease, generation: 3, ...change }), /Invalid/);
+    assert.equal(c.status().phase, "blocked");
+  }
+});
+test("lost transfer ACK cannot create an endless provenance chain or blind CAS", () => {
+  const { controller: c, first } = fixture();
+  const pending = c.beginOperation("file", "a".repeat(64));
+  c.dispatch(pending, first); c.disconnect(first);
+  const second = {}; c.beginResume(second); c.disconnect(second);
+  const third = {}, transfer = c.beginTransfer(third);
+  c.disconnect(third);
+  assert.equal(c.status().phase, "uncertain");
+  assert.equal(c.status().pending, 1);
+  assert.throws(() => c.beginTransfer({}), /provenance/);
+  assert.throws(() => c.beginResume({}), /reconciliation/);
+  assert.throws(() => c.accept(transfer, third, { ...lease, generation: 3 }), /Stale/);
+});
+test("transfer denial is terminal, stale denial cannot poison successor", () => {
+  const { controller: c, first } = fixture();
+  c.disconnect(first);
+  const second = {}, cas = c.beginResume(second); c.disconnect(second);
+  const third = {}, transfer = c.beginTransfer(third);
+  c.reject(cas, second);
+  assert.equal(c.status().phase, "syncing");
+  c.reject(transfer, third); c.disconnect(third);
+  assert.equal(c.status().phase, "blocked");
+  assert.throws(() => c.beginTransfer({}), /provenance/);
+});
+test("join loss, explicit owner replacement, and expiry cannot reuse CAS provenance", () => {
+  const { controller: c, first, expire } = fixture();
+  c.disconnect(first);
+  const second = {}; c.beginResume(second); c.disconnect(second);
+  expire();
+  assert.throws(() => c.beginTransfer({}), /expired/);
+  const other = createBrowserResumeController(() => "new_owner_operation");
+  const physical = {};
+  other.beginJoin("candy986", "alice", physical); other.disconnect(physical);
+  assert.throws(() => other.beginTransfer({}), /expired/);
+  const next = fixture(), d = next.controller;
+  d.disconnect(next.first);
+  const old = {}; d.beginResume(old); d.disconnect(old);
+  const joinPhysical = {}, join = d.beginJoin("candy986", "alice", joinPhysical);
+  const sync = d.accept(join, joinPhysical, lease); d.finishSync(joinPhysical, 1, sync);
+  d.disconnect(joinPhysical);
+  assert.throws(() => d.beginTransfer({}), /provenance/);
+});
+
 test("old history cannot activate a replacement join on the same physical connection and generation", () => {
   const { controller: c, first } = fixture();
   const oldJoin = c.beginJoin("candy986", "alice", first);

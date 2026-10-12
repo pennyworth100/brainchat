@@ -90,3 +90,39 @@ generation evidence, never membership or permission to automatically steal a CAS
 winner. Public authentication/negotiation, snapshot-gap sync, all-producer wiring,
 file-byte response authority and reload durability are STILL pending.
 Keep this same 3.0.33 PR draft and unmerged.
+
+## Explicit original-CAS transfer (same draft, October 12)
+
+Disconnect now retains the exact outstanding resume CAS operation and expected
+generation. beginTransfer consumes that provenance into a separate frozen ticket
+with originalOperationId and a distinct transferOperationId, bound to one new
+physical connection. It cannot reuse the lost connection, substitute a fresh CAS
+or manufacture an incremented expected generation. Exact calls on the same
+in-flight transfer share the ticket. Acceptance requires the original generation
+plus two, the same credentials, exact ticket and physical owner, then a separate sync
+ticket. A lease ACK alone never makes the controller ready.
+
+The private publishBrowserTransfer handoff invokes actual owner.transfer through
+the shared admission path. Exact membership and the irreversible strict-upload
+transition precede publication. This is not public event registration.
+
+Lost transfer ACK consumes the single transfer opportunity: pending operations
+remain uncertain and neither another transfer nor a blind CAS is allowed. A
+transfer ID is never promoted into original provenance. Denial, expired leases,
+malformed +1/+3 responses, copied tickets, stale ACKs and stale disconnects are
+covered by five new controller regression tests.
+
+The isolated SQL/Socket.IO fixture now drops a CAS ACK after actual owner
+admission, sends the +2 transfer lease over the physical socket, verifies
+sync-before-ready, and retries retained text/image/file DB operations to their
+original message IDs (inserted:false). It also drops the transfer ACK after real
+DB success and verifies terminal uncertainty with pending data retained.
+These tests use trusted private join input; they are not public password login,
+rendered resume UI, reload durability, persisted file-byte proof or an atomic
+full-history snapshot/gap protocol. Current bounded history reads are fixture
+evidence only, not a complete synchronization design.
+
+Next: define and test full-sync snapshot/gap completion before public activation,
+then authenticated persisted file-byte identity, capability negotiation and
+coherent page/all-producer/private-message integration. Physical byte/inode
+capacity and fresh fenced recovery/exact-image rollout remain release gates.
