@@ -160,10 +160,35 @@ export function createBrowserResumeController(
       try {
         if (!publication) throw Error("Missing publication snapshot");
         const staged = publication.consume(completion);
-        publication = null;
         // Remain syncing. No public READY path until durable ACK confirmation,
         // empty-cut semantics and continued journal reconciliation are composed.
         return staged;
+      } catch (error) { phase = "blocked"; throw error; }
+    },
+    publicationAck(physical: object, ticket: SyncAttempt) {
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
+        throw Error("Stale publication acknowledgement");
+      }
+      live();
+      try {
+        if (!publication) throw Error("Missing publication snapshot");
+        // The same immutable request/ID set may be retried after confirmation loss.
+        // This does not extend its original deadline or claim delivery.
+        return publication.retryAck();
+      } catch (error) { phase = "blocked"; throw error; }
+    },
+    confirmPublication(physical: object, ticket: SyncAttempt, value: unknown) {
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
+        throw Error("Stale publication confirmation");
+      }
+      live();
+      try {
+        if (!publication) throw Error("Missing publication snapshot");
+        const result = publication.confirm(value);
+        publication = null;
+        // A settled cut is NOT a continuing journal subscription. Never grant
+        // READY here or discard pending payload/operation ownership.
+        return result;
       } catch (error) { phase = "blocked"; throw error; }
     },
     snapshot(physical: object, ticket: SyncAttempt) {

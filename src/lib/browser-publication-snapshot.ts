@@ -10,13 +10,16 @@ const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(valu
 
 /** Private full-cut validator. Deliberately distinct from newest100.
  * Validated data may be staged and ACKed, but neither validation nor sending an
- * ACK is durable server settlement or READY. Durable cut settlement is not wired here.
+ * ACK is durable server settlement or READY. Confirmation validates server settlement
+ * for this retained request only; continuing reconciliation is still required.
  * No live events are mixed into the cut's exact receipt set.
  */
 export function createBrowserPublicationSnapshot(request: SnapshotRequest, now = Date.now) {
   const captured = Object.freeze({ ...request }), deadline = now() + 4000;
-  let completion: PublicationCompletion | null = null, closed = false;
-  const cancel = () => { closed = true; completion = null; };
+  let completion: PublicationCompletion | null = null, closed = false, consumed = false;
+  let staged: Readonly<{ snapshot: PublicationCompletion;
+    ack: Readonly<{ deliveryTry: string; ids: readonly number[] }> }> | null = null;
+  const cancel = () => { closed = true; completion = null; staged = null; };
   const guard = () => {
     if (closed || now() >= deadline) { cancel(); throw Error("Publication snapshot closed or expired"); }
   };
@@ -54,11 +57,34 @@ export function createBrowserPublicationSnapshot(request: SnapshotRequest, now =
   return { api, cancel,
     consume(value: PublicationCompletion) {
       guard();
+      if (consumed) { cancel(); throw Error("Publication snapshot closed"); }
       if (!completion || value !== completion) { cancel(); throw Error("Unvalidated publication snapshot"); }
       const result = completion;
-      cancel();
-      return Object.freeze({ snapshot: result,
+      consumed = true;
+      staged = Object.freeze({ snapshot: result,
         ack: Object.freeze({ deliveryTry: result.deliveryTry, ids: Object.freeze(result.history.map(row => row.id)) }) });
+      return staged;
+    },
+    retryAck() {
+      guard();
+      if (!staged) { cancel(); throw Error("Publication snapshot not staged"); }
+      return Object.freeze({ ...captured, ...staged.ack });
+    },
+    confirm(value: unknown): PublicationCompletion {
+      guard();
+      if (!staged || !value || typeof value !== "object" || Array.isArray(value)) {
+        cancel(); throw Error("Invalid publication confirmation");
+      }
+      const v = value as Record<string, unknown>;
+      if (v.roomId !== captured.roomId || v.sessionId !== captured.sessionId ||
+          v.generation !== captured.generation || v.requestId !== captured.requestId ||
+          v.deliveryTry !== staged.ack.deliveryTry || v.cut !== "full-bounded-statement" ||
+          v.settled !== true) {
+        cancel(); throw Error("Invalid publication confirmation");
+      }
+      const result = staged.snapshot;
+      cancel();
+      return result;
     },
   };
 }

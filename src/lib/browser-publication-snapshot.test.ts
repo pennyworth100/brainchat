@@ -6,6 +6,113 @@ const request = { roomId: "candy986", sessionId: "11111111-1111-4111-8111-111111
 const row = (id: number) => ({ id, type: "message", username: "alice", ts: 1000, message: "hello" });
 const reply = (history: unknown[] = []) => ({ ...request, cut: "full-bounded-statement",
   deliveryTry: "22222222-2222-4222-8222-222222222222", history, users: ["alice", "alice"] });
+
+const confirmation = (identity: typeof request, deliveryTry = reply().deliveryTry) =>
+  ({ ...identity, deliveryTry, cut: "full-bounded-statement", settled: true });
+function stagedFixture(history: unknown[] = []) {
+  const f = fixture();
+  const completion = f.adapter.accept({ ...reply(history), ...f.adapter.request });
+  const staged = f.c.stagePublication(f.physical, f.ticket, completion);
+  return { ...f, staged, confirmation: confirmation(f.adapter.request) };
+}
+for (const history of [[], [row(1), row(3)]]) {
+  test("exact full/empty confirmation returns retained cut but never READY", () => {
+    const f = stagedFixture(history);
+    const ack = f.c.publicationAck(f.physical, f.ticket);
+    assert.deepEqual(ack, { ...f.adapter.request, ...f.staged.ack });
+    assert.ok(Object.isFrozen(ack) && Object.isFrozen(ack.ids));
+    // Lost confirmation: retry the SAME request/attempt/IDs, no fresh cut.
+    assert.deepEqual(f.c.publicationAck(f.physical, f.ticket), ack);
+    assert.equal(f.c.confirmPublication(f.physical, f.ticket, f.confirmation), f.staged.snapshot);
+    assert.equal(f.c.status().phase, "syncing");
+    assert.throws(() => f.c.beginOperation("message", "a".repeat(64)), /synchronized/);
+    assert.throws(() => f.c.uploadAuthority(f.physical, "socket"), /synchronized/);
+    assert.throws(() => f.c.publicationAck(f.physical, f.ticket), /Missing/);
+  });
+}
+for (const change of [{ roomId: "apple123" }, { sessionId: "33333333-3333-4333-8333-333333333333" },
+  { generation: 2 }, { requestId: "another_request_0001" },
+  { deliveryTry: "33333333-3333-4333-8333-333333333333" },
+  { cut: "newest100" }, { settled: false }, { settled: "true" }, { settled: undefined }]) {
+  test("confirmation mismatch fails closed: " + JSON.stringify(change), () => {
+    const f = stagedFixture([row(1)]);
+    assert.throws(() => f.c.confirmPublication(f.physical, f.ticket,
+      { ...f.confirmation, ...change }), /Invalid/);
+    assert.equal(f.c.status().phase, "blocked");
+    assert.throws(() => f.c.confirmPublication(f.physical, f.ticket, f.confirmation), /Stale/);
+  });
+}
+for (const value of [null, true, [], {}, "settled"]) {
+  test("confirmation rejects malformed envelope: " + JSON.stringify(value), () => {
+    const f = stagedFixture();
+    assert.throws(() => f.c.confirmPublication(f.physical, f.ticket, value), /Invalid/);
+    assert.equal(f.c.status().phase, "blocked");
+  });
+}
+test("confirmation/ACK cannot precede validated staging", () => {
+  const f = fixture();
+  assert.throws(() => f.c.confirmPublication(f.physical, f.ticket,
+    confirmation(f.adapter.request)), /Invalid/);
+  assert.equal(f.c.status().phase, "blocked");
+  const g = fixture();
+  assert.throws(() => g.c.publicationAck(g.physical, g.ticket), /not staged/);
+});
+test("copied tickets and foreign physical connections do not poison the retained current cut", () => {
+  const f = stagedFixture();
+  for (const [physical, ticket] of [[{}, f.ticket], [f.physical, { ...f.ticket }]] as const) {
+    assert.throws(() => f.c.confirmPublication(physical, ticket, f.confirmation), /Stale/);
+    assert.throws(() => f.c.publicationAck(physical, ticket), /Stale/);
+  }
+  assert.equal(f.c.confirmPublication(f.physical, f.ticket, f.confirmation), f.staged.snapshot);
+});
+test("disconnect and resumed generation fence an old staged confirmation and retry", () => {
+  const f = stagedFixture();
+  f.c.disconnect(f.physical);
+  assert.throws(() => f.c.publicationAck(f.physical, f.ticket), /Stale/);
+  assert.throws(() => f.c.confirmPublication(f.physical, f.ticket, f.confirmation), /Stale/);
+  const next = {}, ticket = f.c.accept(f.c.beginResume(next), next, { ...f.lease, generation: 2 });
+  const adapter = f.c.publicationSnapshot(next, ticket);
+  const staged = f.c.stagePublication(next, ticket, adapter.accept({ ...reply(), ...adapter.request }));
+  assert.throws(() => f.c.confirmPublication(f.physical, f.ticket, f.confirmation), /Stale/);
+  assert.equal(f.c.confirmPublication(next, ticket, confirmation(adapter.request)), staged.snapshot);
+});
+test("same physical rejoin rejects old request; expiry fences current confirmation", () => {
+  const f = stagedFixture();
+  f.c.beginJoin("candy986", "alice", f.physical);
+  assert.throws(() => f.c.confirmPublication(f.physical, f.ticket, f.confirmation), /Stale/);
+  const g = stagedFixture();
+  g.expire();
+  assert.throws(() => g.c.confirmPublication(g.physical, g.ticket, g.confirmation), /expired/);
+  assert.equal(g.c.status().phase, "blocked");
+});
+test("ACK retries never extend the original deadline, even for empty cut", () => {
+  let time = 1000;
+  const f = createBrowserPublicationSnapshot(request, () => time);
+  f.consume(f.api.accept(reply()));
+  time = 4999;
+  assert.deepEqual(f.retryAck().ids, []);
+  time = 5000;
+  assert.throws(() => f.confirm(confirmation(request)), /expired/);
+  assert.throws(() => f.retryAck(), /closed/);
+  const g = createBrowserPublicationSnapshot(request, () => time);
+  g.consume(g.api.accept(reply()));
+  time = 9000;
+  assert.throws(() => g.retryAck(), /expired/);
+});
+test("retained request/cut ignores mutations of caller input and confirmation is one-shot", () => {
+  const identity = { ...request }, envelope = reply([row(1)]);
+  const f = createBrowserPublicationSnapshot(identity);
+  const completion = f.api.accept(envelope);
+  f.consume(completion);
+  identity.requestId = "mutated_request_0001";
+  envelope.deliveryTry = "33333333-3333-4333-8333-333333333333";
+  envelope.history.splice(0);
+  assert.deepEqual(f.retryAck(), { ...request, deliveryTry: reply().deliveryTry, ids: [1] });
+  assert.equal(f.confirm(confirmation(request)), completion);
+  assert.throws(() => f.confirm(confirmation(request)), /closed/);
+  assert.throws(() => f.retryAck(), /closed/);
+});
+
 test("full cut stages 256 unique rows without newest100 truncation and owns exact immutable ACK set", () => {
   const f = createBrowserPublicationSnapshot(request);
   const result = f.consume(f.api.accept(reply(Array.from({ length: 256 }, (_, i) => row(i + 1)))));

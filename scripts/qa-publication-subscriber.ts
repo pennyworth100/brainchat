@@ -138,13 +138,18 @@ async function requestBoundConfirmation() {
   try {
     for (const count of [0, 1]) {
       if (count) check((await writer.save(physical.binding, "before confirmed cut")).authorized);
-      const request = { roomId: physical.binding.roomId, sessionId: physical.binding.sessionId,
-        generation: physical.binding.generation, requestId: "confirmed_request_" + count };
+      const controller = createBrowserResumeController(undefined, Date.now, 32, "publication-cut");
+      const join = controller.beginJoin("conf123", "Reader", physical.client);
+      const sync = controller.accept(join, physical.client, { ...physical.credential, username: "Reader",
+        generation: physical.binding.generation, expiresAt: physical.binding.expiresAt });
+      const adapter = controller.publicationSnapshot(physical.client, sync);
+      const request = adapter.request;
       const exchange = createBrowserPublicationExchange(physical.socket, physical.owner,
         physical.binding, members, journal, request); assert.ok(exchange);
       physical.client.once("request-cut", (value, ack) => {
         check(value.history.length === count);
-        ack({ ...request, deliveryTry: value.deliveryTry, ids: value.history.map((r: {id:number}) => r.id) });
+        controller.stagePublication(physical.client, sync, adapter.accept(value));
+        ack(controller.publicationAck(physical.client, sync));
       });
       let clientACK!: Promise<unknown>;
       check(await exchange.publish(value => {
@@ -154,6 +159,8 @@ async function requestBoundConfirmation() {
       let attempted = 0;
       check(await exchange.acknowledge(reply, () => { attempted++; /* deliberately lose network confirmation */ }));
       check(attempted === 1);
+      check(controller.status().phase === "syncing");
+      assert.deepEqual(controller.publicationAck(physical.client, sync), reply); checks++;
       check((await db.query("SELECT acked FROM publication_snapshot_attempts WHERE session_id=$1",
         [physical.binding.sessionId])).rows[0].acked === true);
       check((await db.query("SELECT count(*)::int n FROM publication_deliveries WHERE session_id=$1 AND NOT acked",
@@ -163,6 +170,10 @@ async function requestBoundConfirmation() {
         check(value.settled === true && value.requestId === request.requestId &&
           value.sessionId === request.sessionId && value.generation === request.generation &&
           value.roomId === request.roomId && value.deliveryTry === (reply as any).deliveryTry);
+        const confirmed = controller.confirmPublication(physical.client, sync, value);
+        check(confirmed.history.length === count);
+        check(controller.status().phase === "syncing");
+        assert.throws(() => controller.beginOperation("message", "a".repeat(64)), /synchronized/); checks++;
         ack({ received: true });
       });
       check(await exchange.acknowledge(reply, value => {
@@ -175,7 +186,8 @@ async function requestBoundConfirmation() {
     check(pending.messages.length === 1 && pending.messages[0].id === later.value.id);
     console.log(JSON.stringify({phase:"request-bound-confirmation",fullAndEmpty:true,
       actualSocketDelivery:true,lostConfirmationRetry:true,durableBeforeConfirmation:true,
-      laterCommitRetained:true,scope:"private exchange; controller READY and continuing browser reconciliation NOT wired"}));
+      laterCommitRetained:true,actualControllerConfirmation:true,controllerRemainsSyncing:true,
+      scope:"private exchange and browser controller; READY, reload and continuing reconciliation NOT wired"}));
   } finally {
     await physical.owner.close(); physical.client.disconnect();
     await db.query("DELETE FROM messages WHERE room_id='conf123'");
