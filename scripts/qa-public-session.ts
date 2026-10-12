@@ -18,9 +18,11 @@ async function main() {
   assert.match(port, /^\d+$/);
   const base = "http://127.0.0.1:" + port;
   const db = new Pool({ connectionString: url });
+  const publicationProof = process.env.OWNED_PUBLICATION_PROOF === "1";
+  const agentKey = publicationProof ? randomBytes(24).toString("hex") : "";
   const child = spawn(process.execPath, ["--import", "tsx", "server.ts"], {
     env: { ...process.env, DATABASE_URL: url, PORT: port, NODE_ENV: "production",
-      ALFRED_API_KEY: "", DIMLE_AGENT_API_KEYS_JSON: "", UPLOAD_DIR: process.env.OWNED_UPLOAD_DIR! },
+      ALFRED_API_KEY: agentKey, DIMLE_AGENT_API_KEYS_JSON: "", UPLOAD_DIR: process.env.OWNED_UPLOAD_DIR! },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let logs = ""; child.stdout.on("data", x => logs += x); child.stderr.on("data", x => logs += x);
@@ -43,6 +45,9 @@ async function main() {
       await new Promise(r => setTimeout(r, 100));
     }
     assert.ok(ready, logs);
+    if (publicationProof) {
+      await db.query(await fs.readFile("scripts/fixtures/message-publication.sql", "utf8"));
+    }
     const created = await (await fetch(base + "/api/rooms", { method: "POST" })).json();
     assert.ok(created.roomId && created.creationToken);
     const a = await connect();
@@ -485,6 +490,124 @@ async function main() {
     assert.equal((await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n, countBefore);
     const revoked = await b.timeout(3000).emitWithAck("sync-room", { roomId: created.roomId });
     assert.ok(revoked.error); assert.equal(revoked.history, undefined);
+    if (publicationProof) {
+      const sendAgent = (message: string, clientMessageId?: string) => fetch(base + "/api/send", {
+        method: "POST", headers: { "content-type": "application/json", "x-api-key": agentKey },
+        body: JSON.stringify({ roomId: created.roomId, message, clientMessageId }),
+      });
+      assert.equal((await sendAgent("actual-unkeyed-agent")).status, 200);
+      const firstAgent = await sendAgent("actual-keyed-agent", "publication-agent-key");
+      assert.equal(firstAgent.status, 200);
+      const firstAgentBody = await firstAgent.json();
+      const replayAgent = await sendAgent("actual-keyed-agent", "publication-agent-key");
+      assert.equal(replayAgent.status, 200);
+      assert.equal((await replayAgent.json()).message.id, firstAgentBody.message.id);
+      assert.equal((await sendAgent("conflicting-agent", "publication-agent-key")).status, 409);
+      assert.equal((await db.query("SELECT count(*)::int AS n FROM messages WHERE client_message_id='publication-agent-key'")).rows[0].n, 1);
+      // Fault is in the actual post-COMMIT room activity path, not a fake throw.
+      await db.query(`CREATE SEQUENCE fixture_activity_fault_calls;
+        CREATE FUNCTION fixture_reject_activity() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM nextval('fixture_activity_fault_calls'); RAISE EXCEPTION 'owned activity fault'; END $$;
+        CREATE TRIGGER fixture_reject_activity BEFORE UPDATE ON rooms
+        FOR EACH ROW EXECUTE FUNCTION fixture_reject_activity()`);
+      try {
+        for (const key of [undefined, "publication-touch-key"]) {
+          const content = key ? "keyed-touch-failed" : "unkeyed-touch-failed";
+          assert.equal((await sendAgent(content, key)).status, 200,
+            "activity failure must not turn a committed message into a retry signal");
+          const durable = await db.query(`SELECT m.id FROM messages m JOIN message_publication_pending p
+            ON p.message_id=m.id AND p.room_id=m.room_id WHERE m.content=$1`, [content]);
+          assert.equal(durable.rowCount, 1, "actual post-commit activity failure retains journal work");
+        }
+        const faults = (await db.query("SELECT last_value, is_called FROM fixture_activity_fault_calls")).rows[0];
+        assert.equal(faults.is_called, true);
+        assert.equal(Number(faults.last_value), 2, "both actual activity updates hit the injected database fault");
+      } finally {
+        await db.query("DROP TRIGGER fixture_reject_activity ON rooms; DROP FUNCTION fixture_reject_activity(); DROP SEQUENCE fixture_activity_fault_calls");
+      }
+      // Actual capacity denial at every public message producer. Private schema
+      // remains opt-in; the fixture starts its budget CLOSED at exact occupancy.
+      // Fresh room preserves the real eight-joins/minute limiter used above.
+      const capacityRoom = await (await fetch(base + "/api/rooms", { method: "POST" })).json();
+      assert.ok(capacityRoom.roomId && capacityRoom.creationToken);
+      const capacitySocket = await connect();
+      const capacityJoined = event(capacitySocket, "room-snapshot");
+      capacitySocket.emit("join-room", { ...capacityRoom, username: "Capacity", password: join.password });
+      await capacityJoined;
+      const capacityPayload = { roomId: capacityRoom.roomId, message: "capacity-prior", clientMessageId: "capacity-prior" };
+      const priorReceipt = await capacitySocket.timeout(3000).emitWithAck("send-message", capacityPayload);
+      assert.ok(priorReceipt.message.id);
+      const capacityPeer = await connect();
+      const capacityPeerJoined = event(capacityPeer, "room-snapshot");
+      capacityPeer.emit("join-room", { roomId: capacityRoom.roomId, username: "CapacityPeer", password: join.password });
+      await capacityPeerJoined;
+      await db.query(await fs.readFile("scripts/fixtures/message-write-admission.sql", "utf8"));
+      const capacityState = async () => ({
+        budget: (await db.query("SELECT * FROM message_write_budget")).rows,
+        counts: (await db.query(`SELECT (SELECT count(*) FROM messages) AS messages,
+          (SELECT count(*) FROM message_publication_pending) AS journal,
+          (SELECT count(*) FROM resume_message_receipts) AS receipts`)).rows,
+      });
+      const beforeCapacity = await capacityState();
+      let deniedFanouts = 0;
+      const recordDenied = (value: { message?: string; dataUrl?: string; name?: string }) => {
+        if (value.message === "capacity-denied" || value.dataUrl || value.name) deniedFanouts++;
+      };
+      for (const name of ["chat-message", "chat-image", "chat-file"]) {
+        capacitySocket.on(name, recordDenied); capacityPeer.on(name, recordDenied);
+      }
+      for (const name of ["send-message", "send-image"]) {
+        const reply = await capacitySocket.timeout(3000).emitWithAck(name, {
+          roomId: capacityRoom.roomId, message: "capacity-denied", dataUrl: imagePayload.dataUrl,
+          clientMessageId: "capacity-denied-" + name,
+        });
+        assert.equal(reply.code, "WRITE_CAPACITY_EXHAUSTED");
+        assert.equal(reply.outcome, "unknown"); assert.equal(reply.autoRetry, false);
+        assert.equal(reply.clientMessageId, "capacity-denied-" + name);
+        assert.equal(reply.message, undefined);
+      }
+      for (const key of [undefined, "capacity-denied-agent"]) {
+        const response = await sendAgent("capacity-denied", key);
+        assert.equal(response.status, 503); assert.equal(response.headers.get("retry-after"), null);
+        const reply = await response.json();
+        assert.equal(reply.code, "WRITE_CAPACITY_EXHAUSTED");
+        assert.equal(reply.outcome, "unknown"); assert.equal(reply.autoRetry, false);
+        assert.equal(reply.ok, undefined);
+      }
+      const filesAtCapacity = await fs.readdir(process.env.OWNED_UPLOAD_DIR!, { recursive: true });
+      const fullUpload = await upload(capacitySocket.id!, capacityRoom.roomId);
+      assert.equal(fullUpload.status, 503);
+      const fullUploadReply = await fullUpload.json();
+      assert.equal(fullUploadReply.code, "UPLOAD_OUTCOME_UNKNOWN");
+      assert.equal(fullUploadReply.reason, "WRITE_CAPACITY_EXHAUSTED");
+      assert.equal(fullUploadReply.autoRetry, false);
+      const afterFiles = await fs.readdir(process.env.OWNED_UPLOAD_DIR!, { recursive: true });
+      const newFiles = [];
+      for (const relative of afterFiles.filter(name => !filesAtCapacity.includes(name))) {
+        const full = process.env.OWNED_UPLOAD_DIR! + "/" + relative;
+        if ((await fs.stat(full)).isFile()) newFiles.push(await fs.readFile(full, "utf8"));
+      }
+      assert.deepEqual(newFiles, ["wire-upload"], "exact ambiguous upload bytes retained, never reclaimed on error");
+      assert.deepEqual(await capacityState(), beforeCapacity, "all five denied attempts preserve rows, journal, receipts and budget");
+      assert.equal((await capacitySocket.timeout(3000).emitWithAck("send-message", capacityPayload)).message.id,
+        priorReceipt.message.id, "same-session saved receipt remains readable at capacity");
+      const fullReplay = await sendAgent("actual-keyed-agent", "publication-agent-key");
+      assert.equal(fullReplay.status, 200);
+      assert.equal((await fullReplay.json()).message.id, firstAgentBody.message.id);
+      assert.deepEqual(await capacityState(), beforeCapacity, "receipt retries consume no capacity");
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(deniedFanouts, 0, "denied writes never publish success events");
+      console.log("PUBLIC_CAPACITY_PASS: real SQL53100 socket text/image, keyed/unkeyed HTTP and multipart; no success/fanout/automatic retry signal; unchanged rows/journal/receipts/budget; upload bytes preserved; existing keyed receipts readable at full budget");
+      const missing = await db.query(`SELECT id FROM messages EXCEPT
+        SELECT m.id FROM messages m JOIN message_publication_pending p
+        ON p.message_id=m.id AND p.room_id=m.room_id`);
+      assert.equal(missing.rowCount, 0);
+      assert.equal((await db.query("SELECT message_id FROM message_publication_pending EXCEPT SELECT id FROM messages")).rowCount, 0);
+      const types = (await db.query("SELECT DISTINCT type FROM messages ORDER BY type")).rows.map(r => r.type);
+      assert.deepEqual(types, ["file", "image", "message"]);
+      assert.equal((await db.query("SELECT id FROM messages WHERE content IN ('must-rollback','conflicting-agent')")).rowCount, 0);
+      console.log("PUBLIC_PRODUCER_JOURNAL_PASS: actual server text/image/legacy multipart + keyed/unkeyed agent; duplicate/conflict/rollback; post-COMMIT activity failure retains exact pending row; no missing or orphan journal rows. NOT public resume activation, strict-file writer or rendered delivery proof.");
+    }
     console.log("PUBLIC_SESSION_PASS: real authenticated join, one issuance/generation/snapshot on retry, wrong-password denial, no credential leak, two-user presence, legacy send compatibility, authorized sync, disconnect cleanup, blocked-history disconnect fencing, policy-change history/text/image denial, text/image same-key retry and conflict, legacy image echo, actual blocked INSERT disconnect rollback");
   } finally {
     clients.forEach(s => s.disconnect());

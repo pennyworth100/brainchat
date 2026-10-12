@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Socket } from "socket.io";
-import { ResumeAdmission } from "./resume-admission";
+import { ResumeAdmission, type ResumeAdmissionStore } from "./resume-admission";
 import { ResumeCapacity } from "./resume-capacity";
 import type { ResumeBindings, ResumeBinding } from "./resume-bindings";
 import type { ResumeIdentity, ResumeStore, ResumeCredential } from "./resume-store";
@@ -8,7 +8,7 @@ import { isValidRoomId } from "./room-id";
 import type { ResumeMemberships } from "./resume-membership";
 
 type Options = {
-  store: Pick<ResumeStore, "advanceGeneration">;
+  store: ResumeAdmissionStore;
   bindings: ResumeBindings;
   // No room membership, history, presence or other outbound access here.
   prepare: (identity: ResumeIdentity) => Promise<() => Promise<void>>;
@@ -28,6 +28,7 @@ type Options = {
 export type ResumeSocketOwner = Readonly<{
   incarnation: string;
   admit: (request: Parameters<ResumeAdmission["admit"]>[0]) => Promise<ResumeBinding | null>;
+  transfer: (request: Parameters<ResumeAdmission["transfer"]>[0]) => Promise<ResumeBinding | null>;
   join: (authenticated: { roomId: string; username: string; authVersion: number }) =>
     Promise<Readonly<{ credential: Readonly<ResumeCredential>; binding: ResumeBinding }> | null>;
   close: () => Promise<void>;
@@ -143,8 +144,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     closeAutomatically();
     socket.disconnect(true);
   };
-  const admitInternal: ResumeSocketOwner["admit"] = request => {
-    const flight = admission.admit(request);
+  const ownFlight = (flight: Promise<ResumeBinding | null>): Promise<ResumeBinding | null> => {
     if (!mode && admission.ownsAttempt(flight)) mode = "resume";
     if (!memberships || !admission.ownsAttempt(flight)) return flight;
     const previous = flights.get(flight);
@@ -161,6 +161,11 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     }, error => { terminate(); throw error; });
     flights.set(flight, result);
     return result;
+  };
+  const admitInternal: ResumeSocketOwner["admit"] = request => ownFlight(admission.admit(request));
+  const transfer: ResumeSocketOwner["transfer"] = request => {
+    if (mode === "join") return Promise.resolve(null);
+    return ownFlight(admission.transfer(request));
   };
   const admit: ResumeSocketOwner["admit"] = request => {
     if (mode === "join") return Promise.resolve(null);
@@ -218,7 +223,7 @@ export function attachResumeSocket(socket: Socket, options: Options): ResumeSock
     joinSettlement = settled;
     return joinFlight = Promise.race([settled, timeout]);
   };
-  const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, join, close });
+  const owner: ResumeSocketOwner = Object.freeze({ incarnation, admit, transfer, join, close });
   owners.set(socket, { options, owner,
     legacyUpload: binding => !closed && !strictUpload && mode === "join" &&
       joined === binding && socket.connected && bindings.isCurrent(binding),

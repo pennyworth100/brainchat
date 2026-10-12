@@ -15,6 +15,7 @@ import { rooms as roomsTable, messages as messagesTable } from "../src/lib/db/sc
 import { createUploadParser } from "../src/lib/upload-parser";
 import { RoomActivityWriter } from "../src/lib/room-activity";
 import { UploadStorageSettlement } from "../src/lib/upload-storage-settlement";
+import { isWriteCapacityError, writeCapacityReply } from "../src/lib/write-capacity-error";
 
 // Byte-preservation regression for unknown INSERT and post-save emit errors.
 // Not a quota, recovery or all-writer barrier test. No server startup,
@@ -89,6 +90,9 @@ async function main() {
       if (insert) {
         insertAttempts++;
         if (mode === "before-insert") throw Error("injected pre-insert rejection");
+        if (mode === "capacity-before-insert") {
+          throw Object.assign(Error("injected capacity rejection"), { code: "53100" });
+        }
       }
       const result = await (query as (...args: any[]) => Promise<any>)(...args);
       if (touch) touchCompleted++;
@@ -104,6 +108,9 @@ async function main() {
   };
   const context = vm.createContext({
     db: drizzle(pool), messagesTable, roomsTable, eq, Date, JSON, crypto, path, multer, RoomActivityWriter,
+    // AST extraction does not carry imports into the VM. Use the real helpers,
+    // including the capacity branch, rather than replacing error classification.
+    isWriteCapacityError, writeCapacityReply,
     UPLOAD_DIR: root, storageSettlement: new UploadStorageSettlement(),
     // Persistence gate is substituted only in this byte-retention harness.
     // Real authority/transaction checks live in qa-public-session.ts.
@@ -147,7 +154,7 @@ async function main() {
     await pool.query("ALTER TABLE messages ADD COLUMN client_message_id text");
     await pool.query("INSERT INTO rooms (id) VALUES ('proof123')");
     let expectedFiles = 0;
-    for (const scenario of ["normal", "before-insert", "after-commit", "after-save-emit", "after-save-response",
+    for (const scenario of ["normal", "before-insert", "capacity-before-insert", "after-commit", "after-save-emit", "after-save-response",
       "delayed-touch-complete", "delayed-touch-reject"]) {
       mode = scenario; insertAttempts = 0; committed = 0; emitted = 0; unlinks.length = 0;
       assert.equal(writes.size, 0, "previous scenario has no outstanding intercepted queries");
@@ -206,7 +213,8 @@ async function main() {
         responseLost = true;
       }
       assert.equal(responseLost, scenario === "after-save-response");
-      const payload: { code?: string; error?: string; message?: { id: number } } =
+      const payload: { code?: string; error?: string; reason?: string; outcome?: string;
+        autoRetry?: boolean; message?: { id: number } } =
         response ? await response.json() : {};
       await Promise.allSettled([...writes]);
       const cleanup = await Promise.allSettled(unlinks);
@@ -214,10 +222,17 @@ async function main() {
       assert.equal(insertAttempts, 1, "no retry/replay");
       const rows = (await admin.query(`SELECT id, content FROM "${schema}".messages
         WHERE content::jsonb->>'name' = $1`, [scenario + ".txt"])).rows;
-      const expectedRows = scenario === "before-insert" ? 0 : 1;
+      const capacity = scenario === "capacity-before-insert";
+      const expectedRows = scenario === "before-insert" || capacity ? 0 : 1;
       assert.equal(rows.length, expectedRows); assert.equal(committed, expectedRows);
       const acknowledged = scenario === "normal" || scenario === "after-save-emit" || delayedTouch;
-      assert.equal(response?.status, responseLost ? undefined : acknowledged ? 200 : 500);
+      assert.equal(response?.status, responseLost ? undefined : acknowledged ? 200 : capacity ? 503 : 500);
+      if (capacity) {
+        assert.equal(payload.reason, "WRITE_CAPACITY_EXHAUSTED");
+        assert.equal(payload.outcome, "unknown");
+        assert.equal(payload.autoRetry, false);
+        assert.equal(response!.headers.has("retry-after"), false);
+      }
       if (!acknowledged && !responseLost) {
         assert.equal(payload.code, "UPLOAD_OUTCOME_UNKNOWN");
         assert.ok(typeof payload.error === "string");
@@ -255,7 +270,7 @@ async function main() {
         retainedExactFiles: scenarioFiles,
         emitted, cleanupCalls: unlinks.length, deferredEvidence });
     }
-    assert.deepEqual(errors, ["before-insert", "after-commit", "after-save-emit", "after-save-response"]);
+    assert.deepEqual(errors, ["before-insert", "capacity-before-insert", "after-commit", "after-save-emit", "after-save-response"]);
     console.log(JSON.stringify({ result: "BYTE_PRESERVATION_PASS", scenarios: results,
       sourceSha: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
       serverSha256: crypto.createHash("sha256").update(source).digest("hex"),

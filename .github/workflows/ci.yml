@@ -61,6 +61,10 @@ jobs:
         env:
           PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
         run: python3 scripts/qa-resume-session-cleanup-fixture.py
+      - name: Private all-writer publication journal crash recovery
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: python3 scripts/qa-message-publication-fixture.py
       - name: Retain fixture evidence (no keys or database files)
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,6 +73,7 @@ jobs:
           path: |
             /tmp/dimle-provider-tls-*/report.json
             /tmp/dimle-provider-tls-*/server.log
+            /tmp/dimle-publication-*/server.log
           if-no-files-found: warn
 
   verify:
@@ -131,10 +136,25 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-public-session-fixture.py
 
+      - name: Actual server with separate runtime and maintenance LOGINs
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py --database-authorities
+
       - name: Actual server owns verified-TLS ledger settlement (separate owned cluster)
         env:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py --server
+
+      - name: Private candidate CLI verifies TLS and role isolation before migration
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-upload-ledger-tls-fixture.py --candidate
+
+      - name: Actual public producers retain journal work through post-commit failure
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py --publication
 
       - name: Concurrent startup migrations and SIGKILL lock release (owned PostgreSQL)
         env:

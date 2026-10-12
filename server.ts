@@ -1,4 +1,5 @@
 import express from "express";
+import { isWriteCapacityError, writeCapacityReply } from "./src/lib/write-capacity-error";
 import { createUploadDownloadRouter } from "./src/lib/upload-download";
 import http from "http";
 import { Server, type Socket } from "socket.io";
@@ -8,6 +9,7 @@ import multer from "multer";
 import { createUploadParser } from "./src/lib/upload-parser";
 import crypto from "crypto";
 import fs from "fs";
+import type { Pool } from "pg";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
@@ -228,10 +230,20 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-export async function main(options: Readonly<{ strictUploads?: OwnedStrictUploadConfiguration }> = {}) {
+export async function main(options: Readonly<{
+  strictUploads?: OwnedStrictUploadConfiguration;
+  // Private composition only. Caller owns these pools and closes them AFTER
+  // lifecycle settlement. No environment toggle or public activation.
+  databaseAuthorities?: Readonly<{ migrations: Pool; maintenance: Pool; publicationTables: boolean }>;
+}> = {}) {
+  const authorities = options.databaseAuthorities && { ...options.databaseAuthorities };
+  if (authorities && (authorities.migrations === pool || authorities.maintenance === pool ||
+      authorities.migrations === authorities.maintenance)) {
+    throw Error("Database authorities require three distinct pools");
+  }
   // Run migrations
   console.log("Running database migrations...");
-  await migrateDatabase(pool);
+  await migrateDatabase(authorities?.migrations ?? pool);
   // No upload namespace mutation during module import or failed migrations.
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   console.log("Migrations complete.");
@@ -298,8 +310,10 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
   });
   // One owner for the shared table, replacing four dependency-owned timers.
   // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
-  const rateLimitCleanup = new RateLimitCleanup(pool);
-  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(pool));
+  const maintenancePool = authorities?.maintenance ?? pool;
+  const rateLimitCleanup = new RateLimitCleanup(maintenancePool);
+  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(
+    maintenancePool, authorities?.publicationTables ?? false));
   const lifecycle = new ServerLifecycle({
     stopAndSettle: async () => {
       const [rateLimits, sessions] = await Promise.allSettled([
@@ -542,6 +556,11 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
           // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
           // even when no row is visible: there is no safe retry/reclamation receipt.
           console.error("upload persistence outcome unknown:", err);
+          if (isWriteCapacityError(err)) return res.status(503).json({
+            ...writeCapacityReply(), code: "UPLOAD_OUTCOME_UNKNOWN",
+            reason: "WRITE_CAPACITY_EXHAUSTED",
+            error: "Attachment storage capacity is exhausted. Check room history before uploading again.",
+          });
           return res.status(500).json({
             code: "UPLOAD_OUTCOME_UNKNOWN",
             error: "Attachment status is unknown. Check room history before uploading again.",
@@ -653,6 +672,7 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
         return res.status(409).json({ error: err.message });
       }
       console.error("POST /api/send error:", err);
+      if (isWriteCapacityError(err)) return res.status(503).json(writeCapacityReply());
       res.status(500).json({ error: "Internal error" });
     }
   })));
@@ -836,6 +856,9 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
           }
         } catch (err) {
           console.error(event + " error:", err);
+          if (current() && isWriteCapacityError(err)) return reply({
+            ...writeCapacityReply(), clientMessageId: request.clientMessageId,
+          });
           // Even a COMMIT rejection can mean a committed row. Never claim rollback.
           if (current()) reply({ error: "Write outcome unknown; sync before retrying",
             outcome: "unknown", clientMessageId: request.clientMessageId });

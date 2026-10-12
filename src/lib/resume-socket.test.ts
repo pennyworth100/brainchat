@@ -1,5 +1,93 @@
 import assert from "node:assert/strict";
 
+import { publishBrowserJoin, publishBrowserResume } from "./resume-browser-handshake";
+import { createBrowserResumeController, type BrowserLease } from "./browser-resume-controller";
+
+test("private join projects actual owner lease, fences legacy before handoff, and leaves browser syncing", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings);
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+    issue: async () => ({ ...issuedJoin(), sessionId }),
+    store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } });
+  t.after(() => owner.close());
+  let operationKey = 0;
+  const browser = createBrowserResumeController(() => "browser_operation_" + (++operationKey).toString().padStart(4, "0"), () => 0);
+  const physical = {}, ticket = browser.beginJoin("candy986", "Alice", physical);
+  let received: BrowserLease | undefined;
+  assert.equal(await publishBrowserJoin(socket, owner, members, authenticatedJoin, lease => {
+    received = lease;
+    assert.ok(Object.isFrozen(lease));
+    assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+    browser.accept(ticket, physical, lease);
+  }), true);
+  assert.deepEqual(Object.keys(received!).sort(),
+    ["expiresAt", "generation", "roomId", "sessionId", "token", "username"].sort());
+  assert.equal(browser.status().phase, "syncing");
+  assert.throws(() => browser.beginOperation("message", "a".repeat(64)), /synchronized/);
+  assert.ok(await owner.join(authenticatedJoin));
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+});
+
+test("private handshake rejects copied owner and different socket before issuance", async t => {
+  const f = await fixture(t), first = await f.connect(), second = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let issues = 0;
+  const owner = attachResumeSocket(first.socket, { ...opts, memberships: members,
+    issue: async () => { issues++; return issuedJoin(); } });
+  t.after(() => owner.close());
+  const handoff = () => assert.fail("forged handoff");
+  assert.equal(await publishBrowserJoin(first.socket, { ...owner }, members, authenticatedJoin, handoff), false);
+  assert.equal(await publishBrowserJoin(second.socket, owner, members, authenticatedJoin, handoff), false);
+  assert.equal(issues, 0);
+});
+
+test("private resume snapshots credentials and never publishes after close during CAS", async t => {
+  for (const close of [false, true]) {
+    const f = await fixture(t), { socket } = await f.connect(), opts = options();
+    const members = new ResumeMemberships(opts.bindings), gate = deferred<void>(), entered = deferred<void>();
+    const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+      store: { advanceGeneration: async credential => {
+        assert.equal(credential.token, request().credential.token);
+        entered.resolve(); await gate.promise; return identity();
+      } } });
+    t.after(() => owner.close());
+    const input = request(); let handed = 0;
+    const flight = publishBrowserResume(socket, owner, members, input, lease => {
+      handed++; assert.equal(lease.token, request().credential.token);
+    });
+    await entered.promise;
+    input.credential.token = "mutated"; input.credential.roomId = "other123";
+    const closing = close ? owner.close() : undefined;
+    gate.resolve(); await closing;
+    assert.equal(await flight, !close); assert.equal(handed, close ? 0 : 1);
+  }
+});
+
+test("private handshake refuses a foreign membership registry and preserves errors", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings), wrong = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members, issue: async () => issuedJoin() });
+  t.after(() => owner.close());
+  assert.equal(await publishBrowserJoin(socket, owner, wrong, authenticatedJoin,
+    () => assert.fail("foreign registry")), false);
+  await assert.rejects(publishBrowserJoin(socket, owner, members, authenticatedJoin,
+    () => { throw Error("handoff lost"); }), /handoff lost/);
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null,
+    "uncertain credential handoff must never downgrade");
+});
+
+test("private resume denial never looks up or steals a newer generation", async t => {
+  const f = await fixture(t), { socket } = await f.connect(), opts = options();
+  const members = new ResumeMemberships(opts.bindings); let calls = 0;
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members,
+    store: { advanceGeneration: async () => { calls++; return null; } } });
+  t.after(() => owner.close());
+  const handoff = () => assert.fail("denied handoff");
+  assert.equal(await publishBrowserResume(socket, owner, members, request(), handoff), false);
+  assert.equal(await publishBrowserResume(socket, owner, members, request(1), handoff), false);
+  assert.equal(calls, 1);
+});
+
 import { LegacyUploadAdmission } from "./legacy-upload-admission";
 import type { ResumeOperationGate } from "./resume-operation";
 
@@ -202,7 +290,7 @@ import http from "node:http";
 import { Server, type Socket as ServerSocket } from "socket.io";
 import { io, type Socket } from "socket.io-client";
 import { attachResumeSocket } from "./resume-socket";
-import { ResumeBindings } from "./resume-bindings";
+import { ResumeBindings, type ResumeBinding } from "./resume-bindings";
 import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
 import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
@@ -1781,4 +1869,258 @@ test("cleanup rejection is reported once and remains awaitable; closed socket ca
   const closedOwner = attachResumeSocket(other.socket, options());
   assert.equal(await closedOwner.admit(request()), null); await closedOwner.close();
   assert.equal(other.socket.listenerCount("disconnecting"), 0);
+});
+
+import { publishBrowserSnapshot } from "./resume-browser-snapshot";
+import { publishBrowserPublicationSnapshot } from "./resume-browser-snapshot";
+import type { PublicationSnapshot } from "./resume-publication";
+
+import { createBrowserPublicationExchange } from "./resume-browser-snapshot";
+
+for (const empty of [false, true]) test("request-bound confirmation follows settlement, including empty cut; lost confirmation retries SQL " + empty, async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), req = publicationRequest(f.binding);
+  if (empty) cut.messages = [];
+  let commits = 0, wire: any;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut,
+    acknowledgeSnapshot: async (_binding, retained, reply: any) => {
+      commits++;
+      assert.deepEqual(retained.messages.map(r => r.id), empty ? [] : [1]);
+      assert.deepEqual(reply.ids, empty ? [] : [1]);
+      assert.ok(Object.isFrozen(reply.ids));
+      return true;
+    },
+  }, req)!;
+  req.requestId = "mutated_request_001";
+  assert.equal(await exchange.publish(value => { wire = value; }), true);
+  cut.messages = []; // retained cut is not caller-owned
+  const ack = { ...exchange.request, deliveryTry: wire.deliveryTry, ids: empty ? [] : [1] };
+  await assert.rejects(exchange.acknowledge(ack, () => { throw Error("confirmation lost"); }), /confirmation lost/);
+  let confirmed: any;
+  assert.equal(await exchange.acknowledge(ack, value => { confirmed = value; }), true);
+  assert.equal(commits, 2);
+  assert.deepEqual(confirmed, { ...exchange.request, deliveryTry: wire.deliveryTry,
+    cut: "full-bounded-statement", settled: true });
+  assert.ok(Object.isFrozen(confirmed));
+  assert.equal(await exchange.publish(() => assert.fail("second snapshot")), false);
+});
+
+test("exchange refuses forged physical authority and malformed requests before SQL", async t => {
+  const f = await syncFixture(t), other = await f.connect(), req = publicationRequest(f.binding);
+  const store = { snapshot: async () => { assert.fail("SQL"); },
+    acknowledgeSnapshot: async () => { assert.fail("SQL"); } };
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(createBrowserPublicationExchange(socket, owner, binding, f.members, store, req), null);
+  }
+  for (const change of [{ roomId: "apple123" }, { sessionId: "wrong" }, { generation: 2 }, { requestId: "bad" }]) {
+    assert.equal(createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, store, { ...req, ...change }), null);
+  }
+});
+
+test("exchange rejects stale request, forged subset, reordered or duplicate IDs before settlement", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding); let commits = 0;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut, acknowledgeSnapshot: async () => { commits++; return true; },
+  }, publicationRequest(f.binding))!;
+  const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+  assert.equal(await exchange.acknowledge(ack, () => assert.fail("before publish")), false);
+  await exchange.publish(() => {});
+  for (const change of [{ roomId: "apple123" }, { sessionId: "wrong" }, { generation: 2 },
+    { requestId: "other_request_001" }, { deliveryTry: "wrong" }, { ids: [] }, { ids: [1, 1] }, { ids: ["1"] }]) {
+    assert.equal(await exchange.acknowledge({ ...ack, ...change }, () => assert.fail("forged confirmation")), false);
+  }
+  assert.equal(commits, 0);
+});
+
+for (const fence of ["disconnect", "expiry", "deadline", "supersession"] as const) {
+  test("request-bound confirmation is fenced after pending COMMIT: " + fence, async t => {
+    const f = await syncFixture(t), cut = publicationCut(f.binding), gate = deferred<boolean>();
+    const entered = deferred<void>(); let time = 0, calls = 0;
+    const store = { snapshot: async () => cut, acknowledgeSnapshot: async () => {
+      calls++; entered.resolve(); return gate.promise;
+    } };
+    const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members,
+      store, publicationRequest(f.binding), () => time)!;
+    await exchange.publish(() => {});
+    const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+    const pending = exchange.acknowledge(ack, () => assert.fail("stale confirmation"));
+    await entered.promise;
+    assert.equal(await exchange.acknowledge(ack, () => assert.fail("concurrent confirmation")), false);
+    if (fence === "disconnect") f.socket.disconnect(true);
+    if (fence === "expiry") f.expire();
+    if (fence === "deadline") time = 4000;
+    if (fence === "supersession") assert.ok(createBrowserPublicationExchange(f.socket, f.owner,
+      f.binding, f.members, store, { ...exchange.request, requestId: "successor_request_001" }, () => time));
+    gate.resolve(true);
+    assert.equal(await pending, false);
+    assert.equal(await exchange.acknowledge(ack, () => assert.fail("retired request")), false);
+    assert.equal(calls, 1);
+  });
+}
+
+test("exchange cannot confirm denied settlement and captures ACK before await", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), gate = deferred<boolean>(), entered = deferred<void>();
+  let captured: any;
+  const exchange = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, {
+    snapshot: async () => cut, acknowledgeSnapshot: async (_b, _c, ack) => {
+      captured = ack; entered.resolve(); return gate.promise;
+    },
+  }, publicationRequest(f.binding))!;
+  await exchange.publish(() => {});
+  const ack = { ...exchange.request, deliveryTry: cut.deliveryTry, ids: [1] };
+  const pending = exchange.acknowledge(ack, () => assert.fail("denied"));
+  await entered.promise;
+  ack.ids[0] = 999; ack.deliveryTry = "mutated";
+  assert.deepEqual(captured, { deliveryTry: cut.deliveryTry, ids: [1] });
+  gate.resolve(false); assert.equal(await pending, false);
+});
+
+test("superseded snapshot read cannot hand off or create an ACK capability", async t => {
+  const f = await syncFixture(t), gate = deferred<PublicationSnapshot>(), entered = deferred<void>();
+  const store = { snapshot: async () => { entered.resolve(); return gate.promise; },
+    acknowledgeSnapshot: async () => { assert.fail("superseded SQL"); } };
+  const old = createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members,
+    store, publicationRequest(f.binding))!;
+  const pending = old.publish(() => assert.fail("superseded handoff"));
+  await entered.promise;
+  createBrowserPublicationExchange(f.socket, f.owner, f.binding, f.members, store,
+    { ...old.request, requestId: "successor_request_001" });
+  gate.resolve(publicationCut(f.binding)); assert.equal(await pending, false);
+  assert.equal(await old.acknowledge({ ...old.request, deliveryTry: publicationCut(f.binding).deliveryTry, ids: [1] },
+    () => assert.fail("superseded confirmation")), false);
+});
+
+
+const publicationCut = (binding: ResumeBinding): PublicationSnapshot => ({
+  roomId: binding.roomId, sessionId: binding.sessionId, generation: binding.generation,
+  cut: "full-bounded-statement", deliveryTry: "11111111-1111-4111-8111-111111111111",
+  messages: [{ id: 1, type: "message", username: "Alice", content: "hello", ts: new Date(1000) }],
+});
+const publicationRequest = (binding: ResumeBinding) => ({ roomId: binding.roomId,
+  sessionId: binding.sessionId, generation: binding.generation, requestId: "publication_request_001" });
+
+test("full publication rejects wrong request and copied physical authority before SQL", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let reads = 0;
+  const store = { snapshot: async () => { reads++; return publicationCut(f.binding); } };
+  const req = publicationRequest(f.binding), ack = () => assert.fail("unauthorized handoff");
+  for (const change of [{ roomId: "apple123" }, { sessionId: "other" }, { generation: 99 }, { requestId: "bad" }]) {
+    assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      store, { ...req, ...change }, ack), false);
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(await publishBrowserPublicationSnapshot(socket, owner, binding, f.members, store, req, ack), false);
+  }
+  assert.equal(reads, 0);
+});
+test("full publication projects all media using persisted identity and strips unknown content", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), replies: any[] = [];
+  cut.messages.push({ id: 2, type: "image", username: "Alice", ts: new Date(2000),
+    content: JSON.stringify({ id: 900, username: "spoof", ts: 0, dataUrl: "data:image/png;base64,YQ==", secret: "discard" }) },
+  { id: 3, type: "file", username: "Alice", ts: new Date(3000), content: JSON.stringify({
+    url: "/uploads/abc/blob", name: "a.txt", mime: "text/plain", size: 1, sha256: "a".repeat(64), token: "discard" }) });
+  assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => cut }, publicationRequest(f.binding), value => replies.push(value)), true);
+  const value = replies[0];
+  assert.equal(value.cut, "full-bounded-statement"); assert.equal(value.window, undefined);
+  assert.deepEqual(value.history.map((r: any) => [r.id, r.username, r.ts]), [[1,"Alice",1000],[2,"Alice",2000],[3,"Alice",3000]]);
+  assert.equal(value.history[2].sha256, "a".repeat(64));
+  assert.equal(value.history[1].secret, undefined); assert.equal(value.history[2].token, undefined);
+  assert.ok(Object.isFrozen(value) && Object.isFrozen(value.history) && value.history.every(Object.isFrozen));
+});
+test("full publication captures request and never hands off after disconnect or expiry", async t => {
+  for (const close of ["none", "disconnect", "expire"]) {
+    const f = await syncFixture(t), pending = deferred<PublicationSnapshot | null>(), replies: any[] = [];
+    const req = publicationRequest(f.binding), original = { ...req };
+    const flight = publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: () => pending.promise }, req, value => replies.push(value));
+    req.requestId = "changed_request_001"; req.generation = 99;
+    if (close === "disconnect") f.socket.disconnect(true);
+    if (close === "expire") f.expire();
+    pending.resolve(publicationCut(f.binding));
+    assert.equal(await flight, close === "none");
+    assert.equal(replies.length, close === "none" ? 1 : 0);
+    if (replies.length) assert.equal(replies[0].requestId, original.requestId);
+  }
+});
+test("full publication fails closed on corrupt metadata, identity, media and count/byte overflow", async t => {
+  const f = await syncFixture(t);
+  const changes: ((cut: PublicationSnapshot) => void)[] = [
+    c => { c.roomId = "apple123"; }, c => { c.sessionId = "other"; }, c => { c.generation++; },
+    c => { c.deliveryTry = "bad"; }, c => { c.messages[0].ts = new Date(NaN); },
+    c => { c.messages[0].type = "unknown"; }, c => { c.messages[0].content = ""; },
+    c => { c.messages.push(c.messages[0]); },
+    c => { c.messages[0].type = "image"; c.messages[0].content = "null"; },
+    c => { c.messages[0].type = "file"; c.messages[0].content = "{}"; },
+    c => { c.messages = Array.from({ length: 257 }, (_, i) => ({ ...c.messages[0], id: i + 1 })); },
+    c => { c.messages = Array.from({ length: 256 }, (_, i) => ({ ...c.messages[0], id: i + 1, content: "x".repeat(5000) })); },
+  ];
+  for (const change of changes) {
+    const cut = publicationCut(f.binding); change(cut);
+    await assert.rejects(publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: async () => cut }, publicationRequest(f.binding), () => assert.fail("corrupt cut handoff")));
+  }
+});
+test("full publication supports more than 100 rows and empty cut without inventing READY or ACK", async t => {
+  const f = await syncFixture(t);
+  for (const count of [0, 103, 256]) {
+    const cut = publicationCut(f.binding); cut.messages = Array.from({ length: count }, (_, i) => ({ ...cut.messages[0], id: i + 1 }));
+    let reply: any;
+    assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: async () => cut }, publicationRequest(f.binding), value => { reply = value; }), true);
+    assert.equal(reply.history.length, count); assert.equal(reply.ready, undefined); assert.equal(reply.acked, undefined);
+  }
+  assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => null }, publicationRequest(f.binding), () => assert.fail("denied cut")), false);
+  await assert.rejects(publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => publicationCut(f.binding) }, publicationRequest(f.binding), () => { throw Error("handoff failed"); }), /handoff failed/);
+});
+
+test("private snapshot binds request/session/generation before any read and rejects copied authorities", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let reads = 0, acks = 0;
+  const reader = { read: async () => { reads++; return []; } };
+  const req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId,
+    generation: f.binding.generation, requestId: "snapshot_request_001" };
+  for (const change of [{ roomId: "apple123" }, { sessionId: "other" }, { generation: 2 }, { requestId: "bad" }]) {
+    assert.equal(await publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members, reader,
+      { ...req, ...change }, () => { acks++; }), false);
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(await publishBrowserSnapshot(socket, owner, binding, f.members, reader, req, () => { acks++; }), false);
+  }
+  assert.deepEqual([reads, acks], [0, 0]);
+});
+test("snapshot envelope captures original request and ignores probe/afterId, publishing full window", async t => {
+  const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let reads = 0;
+  const req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId, generation: f.binding.generation,
+    requestId: "snapshot_request_001", probeOnly: true, afterId: 999 };
+  const original = { roomId: req.roomId, sessionId: req.sessionId, generation: req.generation, requestId: req.requestId };
+  const replies: unknown[] = [];
+  const pending = publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => { reads++; return gate.promise; } }, req, value => replies.push(value));
+  req.requestId = "changed_request_001"; req.generation = 99;
+  gate.resolve([{ id: 1 }]);
+  assert.equal(await pending, true); assert.equal(reads, 1);
+  assert.deepEqual(replies, [{ ...original, window: "newest-100-id-ascending", history: [{ id: 1 }], users: ["Alice"] }]);
+});
+test("snapshot envelope never acknowledges a disconnected or expired reader after await", async t => {
+  for (const expire of [false, true]) {
+    const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let acks = 0;
+    const pending = publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members, { read: () => gate.promise },
+      { roomId: f.binding.roomId, sessionId: f.binding.sessionId, generation: f.binding.generation,
+        requestId: "snapshot_request_001" }, () => { acks++; });
+    if (expire) f.expire(); else f.socket.disconnect(true);
+    gate.resolve([]);
+    assert.equal(await pending, false); assert.equal(acks, 0);
+  }
+});
+test("snapshot denied history cannot become completion and handoff exceptions propagate", async t => {
+  const f = await syncFixture(t), req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId,
+    generation: f.binding.generation, requestId: "snapshot_request_001" };
+  assert.equal(await publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => null }, req, () => assert.fail("no authorized history")), false);
+  await assert.rejects(publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => [] }, req, () => { throw Error("snapshot handoff failed"); }), /handoff failed/);
 });

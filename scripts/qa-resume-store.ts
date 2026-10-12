@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { checkBrowserResumeCore } from "./qa-browser-resume-core";
 import { randomBytes } from "node:crypto";
 import { readFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeAdmission } from "../src/lib/resume-admission";
+import { ResumeCapacity } from "../src/lib/resume-capacity";
 import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
 import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
@@ -52,6 +54,10 @@ try {
   await a.query("INSERT INTO resume_upload_budget VALUES (1, 10000000000, 0)");
   await a.query((await readFile("drizzle/0006_cold_zuras.sql", "utf8"))
     .replaceAll('"public".', '"' + schema + '".'));
+  const publicationPrototype = process.env.DIMLE_PUBLICATION_PROTOTYPE === "1";
+  if (publicationPrototype) {
+    await a.query(await readFile("scripts/fixtures/message-publication.sql", "utf8"));
+  }
   await a.query("INSERT INTO rooms (id) VALUES ('candy986'), ('spoon651')");
   const first = new ResumeStore(a);
   const second = new ResumeStore(b);
@@ -102,12 +108,41 @@ try {
   const cc = { roomId: cas.roomId, sessionId: cas.sessionId, token: cas.token };
   const opA = "operation_A_123456", opB = "operation_B_123456";
   const socketA = "transport_A_123456", socketB = "transport_B_123456";
+  check(await first.operationOutcome(cc, 0, opA) === "unknown");
   const race = await Promise.all([
     first.advanceGeneration(cc, 0, opA, socketA),
     second.advanceGeneration(cc, 0, opB, socketB),
   ]);
   check(race.filter(Boolean).length === 1);
   const winner = race[0] ? { op: opA, socket: socketA } : { op: opB, socket: socketB };
+  const loserOp = race[0] ? opB : opA;
+  // Real two-client CAS race: read-only outcome distinguishes the original
+  // operation, without exposing/using the winning transport or granting recovery.
+  const beforeOutcome = (await a.query("SELECT * FROM room_resume_sessions WHERE id=$1", [cc.sessionId])).rows[0];
+  check(await first.operationOutcome(cc, 0, winner.op) === "own-applied");
+  check(await second.operationOutcome(cc, 0, loserOp) === "superseded");
+  check(await second.operationOutcome(cc, 1, winner.op) === "unknown");
+  check(await second.operationOutcome(cc, 2, winner.op) === "unknown");
+  check(await second.operationOutcome({ ...cc, roomId: "spoon651" }, 0, winner.op) === "unknown");
+  check(await second.operationOutcome({ ...cc, token: randomBytes(32).toString("base64url") }, 0, winner.op) === "unknown");
+  check(await first.operationOutcome(currentCredential, 0, opA) === "unknown"); // revoked
+  check(await first.operationOutcome(credential, 0, opA) === "unknown"); // old policy
+  check(await first.operationOutcome({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }, 0, opA) === "unknown");
+  assert.deepEqual((await a.query("SELECT * FROM room_resume_sessions WHERE id=$1", [cc.sessionId])).rows[0], beforeOutcome); checks++;
+  // Exercise denials against a known own-applied receipt, not merely an empty
+  // receipt whose result would be unknown even if authorization were broken.
+  for (const mutation of [
+    "UPDATE room_resume_sessions SET revoked_at=statement_timestamp() WHERE id=$1",
+    "UPDATE room_resume_sessions SET expires_at=statement_timestamp() WHERE id=$1",
+    "UPDATE rooms SET auth_version=auth_version+1 WHERE id=(SELECT room_id FROM room_resume_sessions WHERE id=$1)",
+  ]) {
+    await a.query("BEGIN");
+    try {
+      await a.query(mutation, [cc.sessionId]);
+      check(await first.operationOutcome(cc, 0, winner.op) === "unknown");
+    } finally { await a.query("ROLLBACK"); }
+    check(await first.operationOutcome(cc, 0, winner.op) === "own-applied");
+  }
   check(race.find(Boolean)?.generation === 1);
   check((await second.advanceGeneration(cc, 0, winner.op, winner.socket))?.generation === 1);
   check(await second.advanceGeneration(cc, 0, winner.op, "different_socket_123") === null);
@@ -117,9 +152,13 @@ try {
   check(await first.revoke(cc, 0) === false);
   check(await first.advanceGeneration({ ...cc, roomId: "spoon651" }, 1, "operation_C_123456", socketA) === null);
   check(await first.advanceGeneration({ ...cc, token: randomBytes(32).toString("base64url") }, 1, "operation_C_123456", socketA) === null);
-  // New transport explicitly recovers generation through read-only lookup, then
-  // makes a new operation. The data layer never retries a losing CAS itself.
+  // Explicit data-layer successor fixture; NOT an authorized recovery workflow.
+  // A read-only outcome cannot authorize this call or a transport replacement.
   check((await second.advanceGeneration(cc, 1, "operation_C_123456", socketB))?.generation === 2);
+  check(await first.operationOutcome(cc, 0, winner.op) === "unknown"); // overwritten
+  check(await first.operationOutcome(cc, 0, loserOp) === "unknown");
+  check(await first.operationOutcome(cc, 1, "operation_C_123456") === "own-applied");
+  check(await first.operationOutcome(cc, 1, winner.op) === "superseded");
   check(await first.advanceGeneration(cc, 0, winner.op, winner.socket) === null);
   const retries = await Promise.all([
     first.advanceGeneration(cc, 2, "operation_D_123456", socketB),
@@ -134,6 +173,101 @@ try {
   check(await first.advanceGeneration({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }, 0, opA, socketA) === null);
   const unchanged = (await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [cas.sessionId])).rows[0];
   check(unchanged.generation === 3);
+
+  // Atomic transfer never trusts an earlier own-applied observation.
+  const transferOp = "transfer_operation_123", transferTransport = "transfer_transport_123";
+  const transferFixture = async () => {
+    const issued = await first.issueAfterAuthenticatedJoin("candy986", "Transfer Guest", 2);
+    assert.ok(issued);
+    const c = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+    assert.ok(await first.advanceGeneration(c, 0, opA, socketA));
+    return c;
+  };
+  const transferred = await transferFixture();
+  const originalExpiry = (await first.lookup(transferred))!.expiresAt.getTime();
+  check(await first.operationOutcome(transferred, 0, opA) === "own-applied");
+  check(await second.transferAppliedGeneration(transferred, 0, opB, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration(transferred, 1, opA, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration({ ...transferred, token: randomBytes(32).toString("base64url") }, 0, opA, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration({ ...transferred, roomId: "spoon651" }, 0, opA, transferOp, transferTransport) === null);
+  const transferResult = await second.transferAppliedGeneration(transferred, 0, opA, transferOp, transferTransport);
+  check(transferResult?.generation === 2);
+  check(transferResult?.expiresAt.getTime() === originalExpiry);
+  check(await first.transferAppliedGeneration(transferred, 0, opA, transferOp, transferTransport) === null);
+  check(await first.advanceGeneration(transferred, 0, opA, socketA) === null);
+  const afterTransfer = (await a.query("SELECT generation, last_operation_id, last_transport_id FROM room_resume_sessions WHERE id = $1", [transferred.sessionId])).rows[0];
+  check(afterTransfer.generation === 2 && afterTransfer.last_operation_id === transferOp && afterTransfer.last_transport_id === transferTransport);
+  const unproven = await first.issueAfterAuthenticatedJoin("candy986", "Unknown Transfer", 2);
+  assert.ok(unproven);
+  check(await first.transferAppliedGeneration(unproven, 0, opA, transferOp, transferTransport) === null);
+
+  // Actual independent client waits; recheck provenance/revocation/expiry after
+  // the competing mutation commits, not merely before taking the row lock.
+  for (const mode of ["successor", "revoked", "expired", "clock-expired"] as const) {
+    const c = await transferFixture();
+    check(await second.operationOutcome(c, 0, opA) === "own-applied");
+    if (mode === "clock-expired") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '5 seconds' WHERE id = $1", [c.sessionId]);
+    await a.query("BEGIN");
+    await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [c.sessionId]);
+    const pendingTransfer = second.transferAppliedGeneration(c, 0, opA, transferOp, transferTransport);
+    await waitForBlockedSecond();
+    if (mode === "successor") check((await first.advanceGeneration(c, 1, opB, socketB))?.generation === 2);
+    if (mode === "revoked") await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [c.sessionId]);
+    if (mode === "expired") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [c.sessionId]);
+    if (mode === "clock-expired") await a.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (expires_at - clock_timestamp()))) + 0.05) FROM room_resume_sessions WHERE id = $1", [c.sessionId]);
+    await a.query("COMMIT");
+    check(await pendingTransfer === null);
+    const row = (await a.query("SELECT generation, last_operation_id FROM room_resume_sessions WHERE id = $1", [c.sessionId])).rows[0];
+    check(row.generation === (mode === "successor" ? 2 : 1));
+    check(row.last_operation_id === (mode === "successor" ? opB : opA));
+  }
+  const contendedTransfer = await transferFixture();
+  await a.query("BEGIN");
+  check((await first.transferAppliedGeneration(contendedTransfer, 0, opA, transferOp, transferTransport))?.generation === 2);
+  const losingTransfer = second.transferAppliedGeneration(contendedTransfer, 0, opA, "other_transfer_123", "other_transport_123");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await losingTransfer === null);
+  check((await first.lookup(contendedTransfer))?.generation === 2);
+
+  // Policy wins room lock first: even a previously proven operation is denied.
+  const transferPolicy = await transferFixture();
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 99 WHERE id = 'candy986'");
+  const deniedTransfer = second.transferAppliedGeneration(transferPolicy, 0, opA, transferOp, transferTransport);
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await deniedTransfer === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [transferPolicy.sessionId])).rows[0].generation === 1);
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'candy986'");
+  // Transfer wins first: SHARE holds policy updater until transfer commit.
+  const transferFirst = await transferFixture();
+  await a.query("BEGIN");
+  check((await first.transferAppliedGeneration(transferFirst, 0, opA, transferOp, transferTransport))?.generation === 2);
+  const policyAfterTransfer = b.query("UPDATE rooms SET auth_version = 99 WHERE id = 'candy986'");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  await policyAfterTransfer;
+  check(await first.lookup(transferFirst) === null);
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'candy986'");
+
+
+  const clockCas = await first.issueAfterAuthenticatedJoin("candy986", "Clock CAS", 2);
+  assert.ok(clockCas);
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '5 seconds' WHERE id = $1", [clockCas.sessionId]);
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [clockCas.sessionId]);
+  const clockPendingCas = second.advanceGeneration(clockCas, 0, opA, socketA);
+  await waitForBlockedSecond();
+  await a.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (expires_at - clock_timestamp()))) + 0.05) FROM room_resume_sessions WHERE id = $1", [clockCas.sessionId]);
+  await a.query("COMMIT");
+  check(await clockPendingCas === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [clockCas.sessionId])).rows[0].generation === 0);
+  const maximumTransfer = await transferFixture();
+  await a.query("UPDATE room_resume_sessions SET generation = 2147483646 WHERE id = $1", [maximumTransfer.sessionId]);
+  check((await first.transferAppliedGeneration(maximumTransfer, 2147483645, opA, transferOp, transferTransport))?.generation === 2147483647);
+  check(await first.transferAppliedGeneration(maximumTransfer, 2147483646, transferOp, opB, socketB) === null);
+
   // Force a session-row lock wait, then revoke before the pending CAS can run.
   const locked = await first.issueAfterAuthenticatedJoin("candy986", "Locked Guest", 2);
   assert.ok(locked);
@@ -1023,7 +1157,7 @@ try {
   const cleanupErrors: unknown[] = [];
   await new Promise<void>(resolve => http.listen(0, "127.0.0.1", resolve));
   const address = http.address(); assert.ok(address && typeof address !== "string");
-  const connectOwner = async () => {
+  const connectOwner = async (extra: Partial<Parameters<typeof attachResumeSocket>[1]> = {}) => {
     const connected = new Promise<ServerSocket>(resolve => sockets.once("connection", resolve));
     const client = io(`http://127.0.0.1:${address.port}`, { transports: ["websocket"], reconnection: false });
     clients.push(client);
@@ -1033,7 +1167,7 @@ try {
     const socket = await connected; await ready;
     const owner = attachResumeSocket(socket, { store: first, bindings: preflightBindings,
       memberships: members, prepare: async () => async () => {},
-      onCleanupError: error => cleanupErrors.push(error) });
+      onCleanupError: error => cleanupErrors.push(error), ...extra });
     owners.push(owner);
     return { socket, owner };
   };
@@ -1051,6 +1185,94 @@ try {
       check(members.bindingFor(physical.socket, physical.owner, issued.roomId) === binding);
       return { ...physical, credential, binding };
     };
+    // Real PostgreSQL provenance transfer through actual Socket.IO owners.
+    const beforeTransfers = checks;
+    for (const outcome of ["success", "superseded", "unknown", "lost-ack", "disconnect", "timeout"] as const) {
+      const issued = await first.issueAfterAuthenticatedJoin("prefl123", "Transfer guest", 1);
+      assert.ok(issued);
+      const credential = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+      const originalOperationId = "original_" + issued.sessionId;
+      const transferOperationId = "transfer_" + issued.sessionId;
+      const original = await connectOwner();
+      if (outcome !== "unknown") {
+        assert.ok(await original.owner.admit({ credential, expectedGeneration: 0,
+          operationId: originalOperationId }));
+      }
+      if (outcome === "superseded") {
+        assert.ok(await second.advanceGeneration(credential, 1,
+          "competitor_" + issued.sessionId, "competitor_transport_1"));
+      }
+      let transferCalls = 0;
+      const transferCapacity = new ResumeCapacity(1);
+      const lateErrors: unknown[] = [];
+      const next = await connectOwner({ capacity: transferCapacity,
+        timeoutMs: outcome === "timeout" ? 200 : 5000,
+        onCleanupError: e => lateErrors.push(e),
+        store: { advanceGeneration: async () => assert.fail("no blind CAS"),
+          transferAppliedGeneration: async (...args) => {
+            transferCalls++;
+            const result = await second.transferAppliedGeneration(...args);
+            if (outcome === "lost-ack") throw Error("withheld transfer database acknowledgment");
+            return result;
+          } } });
+      const request = { credential, expectedGeneration: 0, originalOperationId, transferOperationId };
+      const held = outcome === "disconnect" || outcome === "timeout";
+      if (held) {
+        await a.query("BEGIN");
+        await a.query("SELECT id FROM room_resume_sessions WHERE id=$1 FOR UPDATE", [issued.sessionId]);
+      }
+      let flight: ReturnType<ResumeSocketOwner["transfer"]> | undefined;
+      try {
+        flight = next.owner.transfer(request);
+        check(next.owner.transfer(request) === flight);
+        check(await next.owner.admit({ credential, expectedGeneration: 1,
+          operationId: "blind_fresh_operation" }) === null);
+        if (held) {
+          await waitForBlockedSecond();
+          check(transferCapacity.acquire() === null);
+          const closing = outcome === "disconnect" ? next.owner.close() : undefined;
+          if (outcome === "timeout") {
+            check(await flight === null);
+            check(!next.socket.connected);
+            check(transferCapacity.acquire() === null);
+          }
+          check(members.currentBindingFor(next.socket, next.owner) === null);
+          await a.query("COMMIT");
+          await closing;
+        }
+        if (outcome === "lost-ack") {
+          await assert.rejects(flight, /withheld transfer/); checks++;
+        } else {
+          const binding = await flight;
+          if (outcome === "success") {
+            assert.ok(binding);
+            check(binding.generation === 2 && binding.transportId === next.owner.incarnation);
+            check(members.currentBindingFor(next.socket, next.owner) === binding);
+            check(members.currentBindingFor(original.socket, original.owner) === null);
+            check(!original.socket.connected);
+            check(next.owner.transfer(request) === flight);
+            const duplicate = await connectOwner();
+            check(await duplicate.owner.transfer(request) === null);
+            check(members.currentBindingFor(next.socket, next.owner) === binding);
+          } else check(binding === null);
+        }
+        if (outcome !== "success") {
+          check(members.currentBindingFor(next.socket, next.owner) === null);
+          check(await next.owner.transfer({ ...request, transferOperationId: "fresh_transfer_attempt" }) === null);
+        }
+        check(transferCalls === 1);
+        await next.owner.close();
+        const permit = transferCapacity.acquire(); check(!!permit); permit?.();
+        check(lateErrors.length === 0);
+        const stored = await first.lookup(credential);
+        check(stored?.generation === (outcome === "unknown" ? 0 : 2));
+      } finally {
+        if (held) await a.query("ROLLBACK");
+      }
+    }
+    console.log(JSON.stringify({ suite: "resume-transfer-admission-postgresql-loopback",
+      checks: checks - beforeTransfers, result: "PASS",
+      scope: "actual socket owners and atomic SQL transfer; no public browser readiness" }));
     const run = async (f: Awaited<ReturnType<typeof fixture>>, credential = f.credential) => {
       const grant = await preflightResumeUpload(f.socket, f.owner, members, second,
         preflightUploads, credential);
@@ -1127,6 +1349,13 @@ try {
   check(cleanupErrors.length === 0);
   console.log(JSON.stringify({ suite: "resume-upload-preflight-postgresql-loopback", checks: checks - beforePreflight,
     result: "PASS", scope: "real bearer lookup, physical owners, durable denials and observed DB lock races; no public HTTP parser" }));
+  checks += await checkBrowserResumeCore(a, operationPool);
+  if (publicationPrototype) {
+    check((await a.query("SELECT id FROM messages EXCEPT SELECT message_id FROM message_publication_pending")).rowCount === 0);
+    check((await a.query("SELECT message_id FROM message_publication_pending EXCEPT SELECT id FROM messages")).rowCount === 0);
+    console.log(JSON.stringify({ suite: "private-publication-actual-writers", result: "PASS",
+      scope: "journal composed with actual text/image/file writer retries, rollback and private browser fixtures; NOT public all-producer acceptance" }));
+  }
   console.log(JSON.stringify({ suite: "resume-store-postgresql", checks, result: "PASS", scope: "isolated migrations, policy/CAS locks, durable retry receipts, expiry cleanup and private preflight loopback; not full socket resume" }));
 } finally {
   await a.query("ROLLBACK");
@@ -1138,8 +1367,9 @@ try {
 }
 }
 
-main().catch(() => {
+main().catch((error: unknown) => {
   // Do not dump database errors/parameters or bearer values into CI logs.
   console.error("Resume persistence PostgreSQL checks FAILED");
+  if (error instanceof Error) console.error(error.stack?.split("\n").filter(line => /^\s+at /.test(line)).join("\n"));
   process.exitCode = 1;
 });

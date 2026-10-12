@@ -1,16 +1,18 @@
 import type { Pool, PoolClient } from "pg";
 
-export type SessionCleanupResult = { sessions: number; receipts: number };
+export type SessionCleanupResult = { sessions: number; receipts: number; deliveries?: number };
 
 /** Private maintenance primitive. No scheduler/public activation.
- * One session and at most 100 receipts per transaction; never cascade a backlog.
+ * One session and at most 100 retry receipts + delivery rows per transaction.
+ * Publication opt-in also allows at most two singleton children to cascade.
  * Row counts are NOT a physical byte/WAL bound. Each SQL statement has a server
  * timeout, not a JavaScript race. Transport loss may keep settlement pending.
  */
 export class ResumeSessionCleanup {
   private active?: Promise<SessionCleanupResult>;
   private stopped = false;
-  constructor(private readonly pool: Pick<Pool, "connect">) {}
+  constructor(private readonly pool: Pick<Pool, "connect">,
+    private readonly publicationTables = false) {}
 
   runOnce(): Promise<SessionCleanupResult> {
     if (this.stopped) return Promise.reject(Error("Session cleanup stopped"));
@@ -42,9 +44,15 @@ export class ResumeSessionCleanup {
         WHERE expires_at <= statement_timestamp()
         ORDER BY expires_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
       `);
-      let receipts = 0, sessions = 0;
+      let receipts = 0, sessions = 0, deliveries = 0;
       if (selected.rows.length) {
         const id = selected.rows[0].id;
+        if (this.publicationTables) {
+          // Delivery FK references the subscriber, not the session: lock BOTH
+          // parents so direct FK insertions cannot race the final empty check.
+          await client.query(
+            "SELECT session_id FROM publication_subscribers WHERE session_id = $1 FOR UPDATE", [id]);
+        }
         // Parent FOR UPDATE blocks FK insertion and serializes normal writers.
         // Do not SKIP LOCKED receipts: a timeout must roll back this transaction.
         const removed = await client.query(`
@@ -56,6 +64,28 @@ export class ResumeSessionCleanup {
           WHERE r.session_id = b.session_id AND r.client_message_id = b.client_message_id
         `, [id]);
         receipts = removed.rowCount ?? 0;
+        if (this.publicationTables) {
+          // Private schema opt-in only. Shared 100-row budget across both
+          // unbounded child tables; no pruning of live ACK/retry provenance.
+          const removedDeliveries = await client.query(`
+            WITH batch AS MATERIALIZED (
+              SELECT session_id, message_id FROM publication_deliveries
+              WHERE session_id = $1 ORDER BY message_id LIMIT $2 FOR UPDATE
+            )
+            DELETE FROM publication_deliveries d USING batch b
+            WHERE d.session_id = b.session_id AND d.message_id = b.message_id
+          `, [id, 100 - receipts]);
+          deliveries = removedDeliveries.rowCount ?? 0;
+          // Keep the parent until its delivery backlog is fully drained.
+          // Its remaining subscriber and snapshot rows have singleton PKs.
+          const pending = await client.query(
+            "SELECT 1 FROM publication_deliveries WHERE session_id = $1 LIMIT 1", [id]);
+          if (pending.rows.length) {
+            await client.query("COMMIT");
+            if (connectionError) throw connectionError;
+            return { sessions: 0, receipts, deliveries };
+          }
+        }
         // Separate statement observes our deletes. Never invoke an unbounded
         // cascade; retained tombstones for every unexpired session are untouched.
         const removedSession = await client.query(`
@@ -67,7 +97,7 @@ export class ResumeSessionCleanup {
       }
       await client.query("COMMIT");
       if (connectionError) throw connectionError;
-      return { sessions, receipts };
+      return { sessions, receipts, ...(this.publicationTables ? { deliveries } : {}) };
     } catch (error) {
       failed = true;
       // Wait for actual server rollback acknowledgement. No fire-and-forget

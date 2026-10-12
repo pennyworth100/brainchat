@@ -10,7 +10,7 @@ export type ResumeStoredFile = Readonly<{
 }>;
 export type ResumeFileMessage = {
   id: number; type: "file"; username: string; ts: number;
-  url: string; name: string; size: number; mime: string;
+  url: string; name: string; size: number; mime: string; sha256: string;
 };
 export type ResumeFileWrite = { inserted: boolean; message: ResumeFileMessage };
 
@@ -72,7 +72,7 @@ export class ResumeFileWriter {
           throw Error("Invalid resume file receipt content");
         }
         return { id: row.id, type: "file", username: row.username, ts: row.ts.getTime(),
-          url: stored.url, name: original.name, size: original.size, mime: original.mime };
+          url: stored.url, name: original.name, size: original.size, mime: original.mime, sha256: original.sha256 };
       };
       // Authorization precedes lookup. Same session/key namespace as text/image;
       // the gate's session lock serializes all three types across processes.

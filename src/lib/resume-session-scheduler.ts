@@ -8,7 +8,7 @@ const clock: Clock = {
 };
 type Cleanup = { runOnce(): Promise<SessionCleanupResult>; stopAndSettle(): Promise<void> };
 export type SessionMaintenanceReport = {
-  completedRuns: number; failedRuns: number; sessions: number; receipts: number;
+  completedRuns: number; failedRuns: number; sessions: number; receipts: number; deliveries?: number;
 };
 
 /** One bounded transaction per tick, with a nominal 1s timer AFTER settlement.
@@ -45,6 +45,9 @@ export class ResumeSessionScheduler {
         this.report.completedRuns++;
         this.report.sessions += result.sessions;
         this.report.receipts += result.receipts;
+        if (result.deliveries !== undefined) {
+          this.report.deliveries = (this.report.deliveries ?? 0) + result.deliveries;
+        }
         this.failuresInARow = 0;
       }, () => {
         this.report.failedRuns++;
