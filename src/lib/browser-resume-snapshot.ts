@@ -11,7 +11,7 @@ const object = (value: unknown): Record<string, unknown> => {
   return value as Record<string, unknown>;
 };
 const username = (value: unknown): value is string => typeof value === "string" && !!value.trim() && value.length <= 64;
-const row = (value: unknown): Row => {
+export const validateBrowserSnapshotRow = (value: unknown): Row => {
   const v = object(value);
   if (!Number.isSafeInteger(v.id) || (v.id as number) < 1 || !username(v.username) ||
       !Number.isSafeInteger(v.ts) || (v.ts as number) < 0 || (v.ts as number) > 8_640_000_000_000_000) {
@@ -33,6 +33,7 @@ const row = (value: unknown): Row => {
   return Object.freeze({ ...base, type: "file", url: v.url, name: v.name, size: v.size as number, mime: v.mime,
     ...(v.sha256 === undefined ? {} : { sha256: v.sha256 as string }) });
 };
+const row = validateBrowserSnapshotRow;
 const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 /** PRIVATE, request-local validation, not authentication or a gap-free cut.

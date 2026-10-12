@@ -10,7 +10,8 @@ import { ResumeOperationGate } from "../src/lib/resume-operation";
 import { ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeMemberships } from "../src/lib/resume-membership";
 import { attachResumeSocket, type ResumeSocketOwner } from "../src/lib/resume-socket";
-import { ResumePublication, reconcilePublication, type PublicationBatch } from "../src/lib/resume-publication";
+import { ResumePublication, reconcilePublication, type PublicationBatch, type PublicationSnapshot } from "../src/lib/resume-publication";
+import { publishBrowserPublicationSnapshot } from "../src/lib/resume-browser-snapshot";
 
 // Owned loopback database only. Raw SQL authority manipulation is TEST INPUT,
 // never a public authorization/transfer path.
@@ -75,8 +76,31 @@ async function snapshotCut() {
     check(seen.size === 102);
     check(await journal.acknowledge(physical.binding,cut,reply));
     check(await journal.acknowledge(physical.binding,later,{deliveryTry:later.deliveryTry,ids:[low]}));
-    const refreshed = await journal.snapshot(physical.binding); assert.ok(refreshed);
+    let refreshed!: PublicationSnapshot;
+    // The actual SQL cut crosses the exact-owner request boundary, not newest100.
+    // Withhold persistence of this client ACK to retain the lease-loss test below.
+    let normalizedReply!: Promise<unknown>;
+    physical.client.on("normalized-cut", (value, ack) => {
+      check(value.cut === "full-bounded-statement" && value.window === undefined && value.ready === undefined);
+      check(value.history.length === 103 && value.history.some((row: {id:number}) => row.id === low));
+      check(value.history.every((row: {message:unknown;ts:unknown;content:unknown}) =>
+        typeof row.message === "string" && typeof row.ts === "number" && row.content === undefined));
+      check(value.requestId === "normalized_request_001" && value.sessionId === physical.binding.sessionId);
+      ack({ deliveryTry: value.deliveryTry, ids: value.history.map((row: {id:number}) => row.id) });
+    });
+    check(await publishBrowserPublicationSnapshot(physical.socket, physical.owner, physical.binding, members,
+      { snapshot: async binding => {
+        check(binding === physical.binding);
+        const snapshot = await journal.snapshot(binding); assert.ok(snapshot);
+        refreshed = snapshot; return snapshot;
+      } },
+      { roomId: "snap123", sessionId: physical.binding.sessionId, generation: physical.binding.generation,
+        requestId: "normalized_request_001" }, value => {
+        normalizedReply = physical.socket.timeout(4000).emitWithAck("normalized-cut", value);
+      }));
+    const normalizedACK = await normalizedReply as {deliveryTry:string;ids:number[]};
     check(refreshed.messages.length === 103 && refreshed.deliveryTry !== cut.deliveryTry);
+    check(normalizedACK.deliveryTry === refreshed.deliveryTry && normalizedACK.ids.length === 103);
     await assert.rejects(journal.acknowledge(physical.binding,cut,reply),/lease lost/); checks++;
     // Snapshot ACK loss is recoverable as ordinary leased journal batches.
     await db.query("UPDATE publication_deliveries SET lease_until=clock_timestamp()-interval '1 second' WHERE session_id=$1",[physical.binding.sessionId]);
@@ -88,7 +112,8 @@ async function snapshotCut() {
     check((await db.query("SELECT delivery_try FROM publication_deliveries WHERE session_id=$1 AND message_id=$2",[physical.binding.sessionId,retry.messages[0].id])).rows[0].delivery_try === retry.deliveryTry);
     console.log(JSON.stringify({phase:"subscriber-full-snapshot",rows:103,cutRows:102,
       lateLowerCommit:true,emptyClaimNotReady:true,physicalClientACK:true,
-      snapshotACKLossRedelivers:true,scope:"private bounded SQL cut; no browser normalization/READY or public wiring"}));
+      snapshotACKLossRedelivers:true,normalizedPhysicalHandoff:true,
+      scope:"private normalized bounded SQL cut; no controller READY, retained browser dedup or public wiring"}));
   } finally {
     await lowTx.query("ROLLBACK"); lowTx.release();
     await physical.owner.close(); physical.client.disconnect();

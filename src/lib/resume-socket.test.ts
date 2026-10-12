@@ -290,7 +290,7 @@ import http from "node:http";
 import { Server, type Socket as ServerSocket } from "socket.io";
 import { io, type Socket } from "socket.io-client";
 import { attachResumeSocket } from "./resume-socket";
-import { ResumeBindings } from "./resume-bindings";
+import { ResumeBindings, type ResumeBinding } from "./resume-bindings";
 import { ResumeMemberships } from "./resume-membership";
 import { ResumeCapacity } from "./resume-capacity";
 import { resumeJoinPublication, resumeResyncPublication } from "./resume-join-publication";
@@ -1872,6 +1872,93 @@ test("cleanup rejection is reported once and remains awaitable; closed socket ca
 });
 
 import { publishBrowserSnapshot } from "./resume-browser-snapshot";
+import { publishBrowserPublicationSnapshot } from "./resume-browser-snapshot";
+import type { PublicationSnapshot } from "./resume-publication";
+
+const publicationCut = (binding: ResumeBinding): PublicationSnapshot => ({
+  roomId: binding.roomId, sessionId: binding.sessionId, generation: binding.generation,
+  cut: "full-bounded-statement", deliveryTry: "11111111-1111-4111-8111-111111111111",
+  messages: [{ id: 1, type: "message", username: "Alice", content: "hello", ts: new Date(1000) }],
+});
+const publicationRequest = (binding: ResumeBinding) => ({ roomId: binding.roomId,
+  sessionId: binding.sessionId, generation: binding.generation, requestId: "publication_request_001" });
+
+test("full publication rejects wrong request and copied physical authority before SQL", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let reads = 0;
+  const store = { snapshot: async () => { reads++; return publicationCut(f.binding); } };
+  const req = publicationRequest(f.binding), ack = () => assert.fail("unauthorized handoff");
+  for (const change of [{ roomId: "apple123" }, { sessionId: "other" }, { generation: 99 }, { requestId: "bad" }]) {
+    assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      store, { ...req, ...change }, ack), false);
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(await publishBrowserPublicationSnapshot(socket, owner, binding, f.members, store, req, ack), false);
+  }
+  assert.equal(reads, 0);
+});
+test("full publication projects all media using persisted identity and strips unknown content", async t => {
+  const f = await syncFixture(t), cut = publicationCut(f.binding), replies: any[] = [];
+  cut.messages.push({ id: 2, type: "image", username: "Alice", ts: new Date(2000),
+    content: JSON.stringify({ id: 900, username: "spoof", ts: 0, dataUrl: "data:image/png;base64,YQ==", secret: "discard" }) },
+  { id: 3, type: "file", username: "Alice", ts: new Date(3000), content: JSON.stringify({
+    url: "/uploads/abc/blob", name: "a.txt", mime: "text/plain", size: 1, sha256: "a".repeat(64), token: "discard" }) });
+  assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => cut }, publicationRequest(f.binding), value => replies.push(value)), true);
+  const value = replies[0];
+  assert.equal(value.cut, "full-bounded-statement"); assert.equal(value.window, undefined);
+  assert.deepEqual(value.history.map((r: any) => [r.id, r.username, r.ts]), [[1,"Alice",1000],[2,"Alice",2000],[3,"Alice",3000]]);
+  assert.equal(value.history[2].sha256, "a".repeat(64));
+  assert.equal(value.history[1].secret, undefined); assert.equal(value.history[2].token, undefined);
+  assert.ok(Object.isFrozen(value) && Object.isFrozen(value.history) && value.history.every(Object.isFrozen));
+});
+test("full publication captures request and never hands off after disconnect or expiry", async t => {
+  for (const close of ["none", "disconnect", "expire"]) {
+    const f = await syncFixture(t), pending = deferred<PublicationSnapshot | null>(), replies: any[] = [];
+    const req = publicationRequest(f.binding), original = { ...req };
+    const flight = publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: () => pending.promise }, req, value => replies.push(value));
+    req.requestId = "changed_request_001"; req.generation = 99;
+    if (close === "disconnect") f.socket.disconnect(true);
+    if (close === "expire") f.expire();
+    pending.resolve(publicationCut(f.binding));
+    assert.equal(await flight, close === "none");
+    assert.equal(replies.length, close === "none" ? 1 : 0);
+    if (replies.length) assert.equal(replies[0].requestId, original.requestId);
+  }
+});
+test("full publication fails closed on corrupt metadata, identity, media and count/byte overflow", async t => {
+  const f = await syncFixture(t);
+  const changes: ((cut: PublicationSnapshot) => void)[] = [
+    c => { c.roomId = "apple123"; }, c => { c.sessionId = "other"; }, c => { c.generation++; },
+    c => { c.deliveryTry = "bad"; }, c => { c.messages[0].ts = new Date(NaN); },
+    c => { c.messages[0].type = "unknown"; }, c => { c.messages[0].content = ""; },
+    c => { c.messages.push(c.messages[0]); },
+    c => { c.messages[0].type = "image"; c.messages[0].content = "null"; },
+    c => { c.messages[0].type = "file"; c.messages[0].content = "{}"; },
+    c => { c.messages = Array.from({ length: 257 }, (_, i) => ({ ...c.messages[0], id: i + 1 })); },
+    c => { c.messages = Array.from({ length: 256 }, (_, i) => ({ ...c.messages[0], id: i + 1, content: "x".repeat(5000) })); },
+  ];
+  for (const change of changes) {
+    const cut = publicationCut(f.binding); change(cut);
+    await assert.rejects(publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: async () => cut }, publicationRequest(f.binding), () => assert.fail("corrupt cut handoff")));
+  }
+});
+test("full publication supports more than 100 rows and empty cut without inventing READY or ACK", async t => {
+  const f = await syncFixture(t);
+  for (const count of [0, 103, 256]) {
+    const cut = publicationCut(f.binding); cut.messages = Array.from({ length: count }, (_, i) => ({ ...cut.messages[0], id: i + 1 }));
+    let reply: any;
+    assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+      { snapshot: async () => cut }, publicationRequest(f.binding), value => { reply = value; }), true);
+    assert.equal(reply.history.length, count); assert.equal(reply.ready, undefined); assert.equal(reply.acked, undefined);
+  }
+  assert.equal(await publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => null }, publicationRequest(f.binding), () => assert.fail("denied cut")), false);
+  await assert.rejects(publishBrowserPublicationSnapshot(f.socket, f.owner, f.binding, f.members,
+    { snapshot: async () => publicationCut(f.binding) }, publicationRequest(f.binding), () => { throw Error("handoff failed"); }), /handoff failed/);
+});
 
 test("private snapshot binds request/session/generation before any read and rejects copied authorities", async t => {
   const f = await syncFixture(t), other = await f.connect(); let reads = 0, acks = 0;

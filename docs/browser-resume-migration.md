@@ -1,5 +1,30 @@
 # Browser resume migration — 3.0.33 draft, first implementation slice
 
+## Full-cut physical request projection (October 12, 05:58 EDT)
+
+`publishBrowserPublicationSnapshot` now reads the actual authorized full bounded
+SQL cut through the shared exact physical-owner/membership/deadline/capacity
+fences. It binds room/session/generation/request before the await, validates the
+cut and delivery attempt, and projects all persisted media through the same
+strict browser row validator. Persisted identity overrides embedded JSON;
+unknown fields are stripped, timestamps become milliseconds, and canonical file
+digests are retained. Invalid media, duplicate/unordered IDs, >256 rows or >1 MiB
+serialized projected rows fail closed. The row byte check is after loading, NOT
+a database memory allocation bound. Presence is recomputed, not part of the SQL cut.
+
+The isolated SQL/physical Socket.IO fixture now delivers 103 normalized rows,
+including the late lower-ID commit, under the captured request. It deliberately
+does not persist this client ACK, then checks lease retry with a fresh deliveryTry.
+Unit regressions cover request/authority substitution, disconnect/expiry,
+all media, malformed rows, limits, empty cuts and handoff failure.
+
+This is handoff evidence ONLY: it neither ACKs the journal nor makes the browser
+controller READY. The full-cut envelope deliberately has no legacy `window`
+field, so the old newest100 completion validator cannot silently accept it.
+Empty-cut ACK/READY, bounded retained browser dedup, journal reconciliation,
+controller composition and rendered/public authentication remain pending.
+No public handler, migration registration, activation or deployment is added.
+
 Not activated or integrated. The public browser continues to use the existing
 legacy room-session controller; the server does not publish bearer credentials.
 This branch is the single ongoing migration, not a deployable owner-only patch.
