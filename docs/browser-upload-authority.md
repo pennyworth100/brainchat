@@ -3,7 +3,8 @@
 The upload client now requires an explicit room/transport-bound authority from
 its session controller. Missing authority, partial bearer credentials, mismatched
 room/transport and mixed legacy/bearer shapes fail BEFORE FormData/HTTP. There is
-no missing-header fallback. The current public room controller deliberately
+no missing-header fallback. HTTP redirects are refused, so custom bearer headers
+cannot be forwarded to a redirect target. The current public room controller deliberately
 returns only legacy authority for its exact ready room and current transport.
 
 The private resume branch supplies all three headers: session ID, token and one

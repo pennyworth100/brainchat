@@ -27,6 +27,7 @@ export async function uploadRoomFile(
       form.append("file", file);
       const response = await request("/api/upload", {
         method: "POST",
+        redirect: "error", // Never forward bearer headers to a redirect target.
         headers,
         body: form,
         signal: controller.signal,

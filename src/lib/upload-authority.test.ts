@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import http from "node:http";
 import { uploadAuthorityHeaders, type UploadAuthority } from "./upload-authority";
 import { uploadRoomFile } from "./upload-client";
 
@@ -93,4 +94,24 @@ test("headers are an immutable snapshot without retaining mutable credential inp
   auth.token = "B".repeat(43);
   assert.equal(headers["x-resume-token"], "A".repeat(43));
   assert.equal(Object.isFrozen(headers), true);
+});
+
+test("actual HTTP redirect cannot forward strict bearer headers to another endpoint", async t => {
+  let targets = 0, requests = 0;
+  const server = http.createServer((req, res) => {
+    if (req.url === "/target") { targets++; res.end("must not be reached"); return; }
+    requests++;
+    assert.equal(req.headers["x-resume-token"], credential().token);
+    res.writeHead(307, { Location: "/target" }); res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+  const port = (server.address() as { port: number }).port;
+  await assert.rejects(uploadRoomFile(file(), "files123", session(),
+    (_path, options) => fetch("http://127.0.0.1:" + port + "/upload", options)), /Network interrupted/);
+  assert.equal(requests, 1);
+  assert.equal(targets, 0);
 });
