@@ -5,7 +5,7 @@ import { MAX_FILE_SIZE, uploadRoomFile } from "./upload-client";
 const operationGuard = () => () => {};
 const uploadAuthority = (roomId: string, socketId: string) => ({ kind: "legacy" as const, roomId, socketId });
 const pdf = () => new File(["%PDF-1.7\nQA\n%%EOF"], "report.pdf", { type: "application/pdf" });
-const response = () => Response.json({ message: { id: 42, type: "file" } });
+const response = () => Response.json({ message: { id: 42, type: "file", name: pdf().name, size: pdf().size, username: "Owner", ts: 1, url: "/uploads/report.pdf" } });
 
 test("PDF upload waits for resync and uses the fresh authenticated socket ID", async () => {
   let ready = false;

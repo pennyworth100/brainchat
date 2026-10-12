@@ -18,6 +18,7 @@ import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
 import { createTextSender } from "@/lib/text-message-client";
+import { publicOwnerScope, publicDraft, publicOutbox, type PendingPublicOperation } from "@/lib/public-outbox";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -369,8 +370,9 @@ function RoomInner() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
-  const textSenderRef = useRef<ReturnType<typeof createTextSender> | null>(null);
-  if (!textSenderRef.current) textSenderRef.current = createTextSender();
+  const durableScopeRef = useRef<string | null>(null);
+  const [durableError, setDurableError] = useState("");
+  const [pendingOperation, setPendingOperation] = useState<PendingPublicOperation>();
 
   // Timeline: mixed messages and system messages
   const [timeline, setTimeline] = useState<
@@ -474,7 +476,22 @@ function RoomInner() {
       },
       onJoined: () => {
         setJoinError("");
-        sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+        try {
+          sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+          const scope = publicOwnerScope(sessionStorage, roomId, usernameRef.current!);
+          durableScopeRef.current = scope;
+          setMsgInput(publicDraft(localStorage, scope));
+          const checkOwner = session.operationGuard(roomId);
+          void publicOutbox(scope, "read").then((pending) => {
+            checkOwner();
+            if (durableScopeRef.current === scope) setPendingOperation(pending);
+          }).catch(() => {
+            if (durableScopeRef.current === scope) setDurableError("Could not read saved delivery status. Sending is blocked.");
+          });
+        } catch {
+          durableScopeRef.current = null;
+          setDurableError("Browser storage is unavailable. Sending is blocked.");
+        }
       },
       onError: (message, terminal = true) => {
         setJoinError(message);
@@ -592,6 +609,10 @@ function RoomInner() {
       void Notification.requestPermission().catch(() => {});
     }
     const name = usernameInput.trim() || "User_" + Math.floor(10 + Math.random() * 90);
+    durableScopeRef.current = null;
+    setPendingOperation(undefined);
+    setDurableError("");
+    setMsgInput("");
     setUsername(name);
     usernameRef.current = name;
     if (!roomId) return;
@@ -615,7 +636,18 @@ function RoomInner() {
     sendingRef.current = true;
     setSending(true);
     try {
-      const message = await textSenderRef.current!.send(socket, session, roomId, msg);
+      const scope = durableScopeRef.current;
+      if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
+      const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "text", payload: msg, outcome: "unknown" };
+      await publicOutbox(scope, "reserve", operation);
+      checkOwner();
+      setPendingOperation(operation);
+      const message = await createTextSender(() => operation.clientMessageId).send(socket, session, roomId, msg);
+      checkOwner();
+      await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
+      checkOwner();
+      setPendingOperation(undefined);
+      if (publicDraft(localStorage, scope) === msgInput) publicDraft(localStorage, scope, "");
       checkOwner();
       receiveMessages([message]);
       setMsgInput((current) => current === msgInput ? "" : current);
@@ -629,7 +661,7 @@ function RoomInner() {
       sendingRef.current = false;
       setSending(false);
     }
-  }, [msgInput, username, roomId, receiveMessages]);
+  }, [msgInput, username, roomId, receiveMessages, durableError]);
 
   const uploadFile = useCallback(
     async (file: File) => {
@@ -640,7 +672,17 @@ function RoomInner() {
       const uploadId = getId();
       setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
       try {
-        const data = await uploadRoomFile(file, roomId, session);
+        const scope = durableScopeRef.current;
+        if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
+        const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "file", payload: file, outcome: "unknown" };
+        await publicOutbox(scope, "reserve", operation);
+        checkOwner();
+        setPendingOperation(operation);
+        const data = await uploadRoomFile(file, roomId, session, fetch, operation.clientMessageId);
+        checkOwner();
+        await publicOutbox(scope, "settle", undefined, operation.clientMessageId);
+        checkOwner();
+        setPendingOperation(undefined);
         checkOwner();
         // The server persists + broadcasts before returning. No second socket
         // send is needed, so a disconnect cannot strand an uploaded attachment.
@@ -659,7 +701,7 @@ function RoomInner() {
         try { checkOwner(); session.sync().catch(() => {}); } catch { /* owner ended */ }
       }
     },
-    [username, roomId, receiveMessages]
+    [username, roomId, receiveMessages, durableError]
   );
 
   const handleDrop = useCallback(
@@ -947,6 +989,13 @@ function RoomInner() {
         })}
       </div>
 
+      {(durableError || pendingOperation) && (
+        <div role="alert" aria-label="Delivery status" className="px-5 py-2 text-sm text-dimle-text-primary">
+          {durableError || (pendingOperation?.kind === "file"
+            ? "Attachment status is unknown. Saved attachment retained; check room history. Automatic retry is disabled."
+            : "Delivery is not confirmed. Saved message retained; check room history. Automatic retry is disabled.")}
+        </div>
+      )}
       {/* Input bar */}
       <div className="chat-composer flex items-center gap-2 px-5 py-3 bg-dimle-card border-t border-dimle-border">
         <input
@@ -973,7 +1022,14 @@ function RoomInner() {
           type="text"
           aria-label="Message"
           value={msgInput}
-          onChange={(e) => setMsgInput(e.target.value)}
+          onChange={(e) => {
+            const value = e.target.value;
+            setMsgInput(value);
+            try {
+              if (!durableScopeRef.current) throw Error();
+              publicDraft(localStorage, durableScopeRef.current, value);
+            } catch { setDurableError("Draft could not be saved. Sending is blocked; keep this page open."); }
+          }}
           onKeyDown={(e) => e.key === "Enter" && sendMessage()}
           placeholder="Type a message…"
           autoComplete="off"
