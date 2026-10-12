@@ -463,7 +463,7 @@ export async function main(options: Readonly<{ strictUploads?: OwnedStrictUpload
               try { resumeMembers.broadcast(roomId, "chat-file", message); }
               catch (error) { console.error("strict upload notification after save:", error); }
             }
-            try { return res.json({ url: message.url, name: message.name,
+            try { return res.json({ clientMessageId: result.clientMessageId, url: message.url, name: message.name,
               size: message.size, mime: message.mime, message }); }
             catch (error) { console.error("strict upload response after save:", error); res.destroy(); return; }
           }

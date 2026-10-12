@@ -9,7 +9,7 @@ import { validateResumeUploadFraming } from "./resume-upload-framing";
 export type StrictUploadRuntimeResult =
   | { status: "unavailable" | "invalid" | "denied" }
   | { status: "failed"; commit: "not-dispatched" | "unknown"; error: unknown }
-  | { status: "saved"; value: ResumeFileWrite };
+  | { status: "saved"; clientMessageId: string; value: ResumeFileWrite };
 
 /** Server-owned HTTP lifetime, not provisioning authority. A null storage is
  * mandatory until physical byte+object authority AND exact download mapping
@@ -48,7 +48,7 @@ export class StrictUploadRuntime {
         const outcome = await this.upload.saveWithOutcome(grant, key, resumeHttpSource(request), framing);
         if (!outcome.completed) return { status: "failed", commit: outcome.commit, error: outcome.error };
         if (!outcome.result.authorized) return { status: "denied" };
-        return { status: "saved", value: outcome.result.value };
+        return { status: "saved", clientMessageId: key, value: outcome.result.value };
       } catch (error) {
         // Unexpected exceptions cannot establish rollback.
         return { status: "failed", commit: "unknown", error };

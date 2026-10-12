@@ -95,7 +95,7 @@ test("runtime preserves durable insert/replay and ambiguous outcome distinctions
     });
     const f = await fixture({} as StrictFileStorage);
     const result = await f.runtime.run(f.grant, request());
-    if (mode === "insert" || mode === "replay") assert.deepEqual(result, { status: "saved", value });
+    if (mode === "insert" || mode === "replay") assert.deepEqual(result, { status: "saved", clientMessageId: "key", value });
     else if (mode === "denied") assert.deepEqual(result, { status: "denied" });
     else assert.ok(result.status === "failed" && result.commit === (mode === "precommit" ? "not-dispatched" : "unknown"));
     assert.equal(f.admissions.isCurrent(f.grant), false);
@@ -103,4 +103,20 @@ test("runtime preserves durable insert/replay and ambiguous outcome distinctions
       "the same admitted attempt cannot hand a second publisher a successful insert receipt");
     await f.runtime.close(); mock.mock.restore();
   }
+});
+
+test("strict saved receipt retains the operation key captured before asynchronous persistence", async t => {
+  const req = request();
+  const value = { inserted: true, message: { id: 1, type: "file" as const,
+    username: "Guest", ts: 1, url: "/uploads/" + "a".repeat(64) + "/blob",
+    name: "file.txt", size: 3, mime: "text/plain" } };
+  t.mock.method(StrictMultipartUpload.prototype, "saveWithOutcome", async (_grant: Parameters<StrictMultipartUpload["saveWithOutcome"]>[0], key: string) => {
+    assert.equal(key, "key");
+    req.headers["x-client-message-id"] = "changed";
+    await new Promise(r => setImmediate(r));
+    return { completed: true, result: { authorized: true, value } };
+  });
+  const f = await fixture({} as StrictFileStorage);
+  assert.deepEqual(await f.runtime.run(f.grant, req), { status: "saved", clientMessageId: "key", value });
+  await f.runtime.close();
 });
