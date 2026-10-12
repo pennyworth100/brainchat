@@ -6,6 +6,7 @@ import { isValidRoomId } from "./room-id";
 // A successful lookup is NOT membership or authority to send/leave a room.
 type Database = Pick<Pool | PoolClient, "query">;
 export type ResumeCredential = { roomId: string; sessionId: string; token: string };
+export type ResumeOperationOutcome = "own-applied" | "superseded" | "unknown";
 export type ResumeIdentity = {
   sessionId: string; roomId: string; username: string; authVersion: number;
   generation: number; issuedAt: Date; expiresAt: Date;
@@ -95,11 +96,39 @@ export class ResumeStore {
     return result.rows[0] ?? null;
   }
 
+  // Private authenticated observation, NOT a recovery/admission capability.
+  // Only the last operation is retained. Older/absent/denied observations stay
+  // unknown; a later generation cannot prove whether an earlier CAS succeeded.
+  // A result can become stale immediately. Never feed it into a blind fresh CAS:
+  // any future recovery must atomically recheck original operation + generation.
+  // No transport identity, session identity or current generation leaves this API.
+  async operationOutcome(credential: ResumeCredential, expectedGeneration: number,
+    operationId: string): Promise<ResumeOperationOutcome> {
+    if (!validCredential(credential) || !Number.isInteger(expectedGeneration) ||
+        expectedGeneration < 0 || expectedGeneration >= 2_147_483_647 ||
+        typeof operationId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(operationId)) return "unknown";
+    const tokenHash = hashResumeToken(credential.token);
+    if (!tokenHash) return "unknown";
+    const result = await this.database.query<{ outcome: ResumeOperationOutcome }>(`
+      SELECT CASE
+        WHEN s.generation = $4 + 1 AND s.last_operation_id = $5 THEN 'own-applied'
+        WHEN s.generation = $4 + 1 AND s.last_operation_id IS NOT NULL
+          AND s.last_operation_id <> $5 THEN 'superseded'
+        ELSE 'unknown' END AS outcome
+      FROM room_resume_sessions s JOIN rooms r ON r.id = s.room_id
+      WHERE s.id = $1 AND s.token_hash = $2 AND s.room_id = $3
+        AND s.revoked_at IS NULL AND s.expires_at > statement_timestamp()
+        AND s.auth_version = r.auth_version
+    `, [credential.sessionId, tokenHash, credential.roomId, expectedGeneration, operationId]);
+    return result.rows[0]?.outcome ?? "unknown";
+  }
+
   // Persistence CAS only; this does NOT install membership or evict a socket.
   // transportId must be a server-owned, globally unique connection incarnation,
   // never a client-provided value. ACK retry is valid only on that same transport.
-  // After transport loss, lookup recovers generation without granting membership;
-  // a fresh operation is needed. A CAS loser must not automatically steal it back.
+  // After transport loss, lookup reveals generation but cannot establish a CAS
+  // winner. Neither lookup nor operationOutcome authorizes a fresh operation.
+  // A CAS loser must not automatically steal it back.
   async advanceGeneration(credential: ResumeCredential, expectedGeneration: number,
     operationId: string, transportId: string): Promise<ResumeIdentity | null> {
     if (!validCredential(credential) || !Number.isInteger(expectedGeneration) ||

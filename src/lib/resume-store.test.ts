@@ -4,6 +4,26 @@ import { randomBytes } from "node:crypto";
 import { hashResumeToken, ResumeStore } from "./resume-store";
 import { claimRoomPolicy } from "./room-policy";
 
+test("operation outcome rejects malformed requests and propagates database uncertainty", async () => {
+  let calls = 0;
+  const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);
+  const credential = { roomId: "candy986", sessionId: "b4b7467b-978a-4323-b151-0de94c57d598", token: randomBytes(32).toString("base64url") };
+  const op = "operation_1234567";
+  for (const generation of [-1, 0.5, NaN, Infinity, 2_147_483_647]) {
+    assert.equal(await store.operationOutcome(credential, generation, op), "unknown");
+  }
+  for (const operation of ["", "short", "!".repeat(16), "x".repeat(129), null]) {
+    assert.equal(await store.operationOutcome(credential, 0, operation as string), "unknown");
+  }
+  for (const invalid of [null, { ...credential, roomId: "wrong" },
+    { ...credential, sessionId: "wrong" }, { ...credential, token: "bad" }]) {
+    assert.equal(await store.operationOutcome(invalid as typeof credential, 0, op), "unknown");
+  }
+  assert.equal(calls, 0);
+  await assert.rejects(store.operationOutcome(credential, 0, op), /offline/);
+  assert.equal(calls, 1);
+});
+
 test("cleanup bounds are strict and database failure propagates", async () => {
   let calls = 0;
   const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);

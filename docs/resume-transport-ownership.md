@@ -32,3 +32,27 @@ failure/success/disconnect, expiry sweep, exact ACK retry and resource release.
 PostgreSQL integration fixtures use independent transport incarnations for
 independent sessions, and explicitly reject a conflicting session on an active
 transport.
+
+## Private operation outcome observation (3.0.33 draft)
+
+`ResumeStore.operationOutcome` authenticates the bearer against the session,
+room, expiry, revocation and current room policy. It returns only a string:
+
+- `own-applied`: the retained last operation matches the original operation ID
+  and its generation is exactly the expected generation plus one.
+- `superseded`: a different retained operation occupies that exact next generation.
+  This describes the requested CAS, not the browser/user who owns the credential.
+- `unknown`: no matching live authorization, no retained receipt, a mismatched
+  generation or overwritten history. It does not mean the operation failed.
+
+Database failures propagate; the caller must remain uncertain/fail closed.
+Reads never extend expiry, mutate generation, return a transport identity, grant
+membership or make the browser ready. They are only point-in-time observations;
+even `own-applied` may be obsolete before its caller receives it. Operation IDs
+must be fresh and preserved for their original attempt, not reused as identity.
+
+There is no public endpoint or browser recovery wiring in this change. A future
+recovery transfer needs one atomic predicate over the original operation and
+generation, current authorization and expiry; an intervening competitor must
+make it fail. Lookup/outcome followed by a blind CAS is forbidden. Full-sync,
+exact membership fencing, file-byte identity and public acceptance remain gates.

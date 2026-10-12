@@ -103,12 +103,41 @@ try {
   const cc = { roomId: cas.roomId, sessionId: cas.sessionId, token: cas.token };
   const opA = "operation_A_123456", opB = "operation_B_123456";
   const socketA = "transport_A_123456", socketB = "transport_B_123456";
+  check(await first.operationOutcome(cc, 0, opA) === "unknown");
   const race = await Promise.all([
     first.advanceGeneration(cc, 0, opA, socketA),
     second.advanceGeneration(cc, 0, opB, socketB),
   ]);
   check(race.filter(Boolean).length === 1);
   const winner = race[0] ? { op: opA, socket: socketA } : { op: opB, socket: socketB };
+  const loserOp = race[0] ? opB : opA;
+  // Real two-client CAS race: read-only outcome distinguishes the original
+  // operation, without exposing/using the winning transport or granting recovery.
+  const beforeOutcome = (await a.query("SELECT * FROM room_resume_sessions WHERE id=$1", [cc.sessionId])).rows[0];
+  check(await first.operationOutcome(cc, 0, winner.op) === "own-applied");
+  check(await second.operationOutcome(cc, 0, loserOp) === "superseded");
+  check(await second.operationOutcome(cc, 1, winner.op) === "unknown");
+  check(await second.operationOutcome(cc, 2, winner.op) === "unknown");
+  check(await second.operationOutcome({ ...cc, roomId: "spoon651" }, 0, winner.op) === "unknown");
+  check(await second.operationOutcome({ ...cc, token: randomBytes(32).toString("base64url") }, 0, winner.op) === "unknown");
+  check(await first.operationOutcome(currentCredential, 0, opA) === "unknown"); // revoked
+  check(await first.operationOutcome(credential, 0, opA) === "unknown"); // old policy
+  check(await first.operationOutcome({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }, 0, opA) === "unknown");
+  assert.deepEqual((await a.query("SELECT * FROM room_resume_sessions WHERE id=$1", [cc.sessionId])).rows[0], beforeOutcome); checks++;
+  // Exercise denials against a known own-applied receipt, not merely an empty
+  // receipt whose result would be unknown even if authorization were broken.
+  for (const mutation of [
+    "UPDATE room_resume_sessions SET revoked_at=statement_timestamp() WHERE id=$1",
+    "UPDATE room_resume_sessions SET expires_at=statement_timestamp() WHERE id=$1",
+    "UPDATE rooms SET auth_version=auth_version+1 WHERE id=(SELECT room_id FROM room_resume_sessions WHERE id=$1)",
+  ]) {
+    await a.query("BEGIN");
+    try {
+      await a.query(mutation, [cc.sessionId]);
+      check(await first.operationOutcome(cc, 0, winner.op) === "unknown");
+    } finally { await a.query("ROLLBACK"); }
+    check(await first.operationOutcome(cc, 0, winner.op) === "own-applied");
+  }
   check(race.find(Boolean)?.generation === 1);
   check((await second.advanceGeneration(cc, 0, winner.op, winner.socket))?.generation === 1);
   check(await second.advanceGeneration(cc, 0, winner.op, "different_socket_123") === null);
@@ -118,9 +147,13 @@ try {
   check(await first.revoke(cc, 0) === false);
   check(await first.advanceGeneration({ ...cc, roomId: "spoon651" }, 1, "operation_C_123456", socketA) === null);
   check(await first.advanceGeneration({ ...cc, token: randomBytes(32).toString("base64url") }, 1, "operation_C_123456", socketA) === null);
-  // New transport explicitly recovers generation through read-only lookup, then
-  // makes a new operation. The data layer never retries a losing CAS itself.
+  // Explicit data-layer successor fixture; NOT an authorized recovery workflow.
+  // A read-only outcome cannot authorize this call or a transport replacement.
   check((await second.advanceGeneration(cc, 1, "operation_C_123456", socketB))?.generation === 2);
+  check(await first.operationOutcome(cc, 0, winner.op) === "unknown"); // overwritten
+  check(await first.operationOutcome(cc, 0, loserOp) === "unknown");
+  check(await first.operationOutcome(cc, 1, "operation_C_123456") === "own-applied");
+  check(await first.operationOutcome(cc, 1, winner.op) === "superseded");
   check(await first.advanceGeneration(cc, 0, winner.op, winner.socket) === null);
   const retries = await Promise.all([
     first.advanceGeneration(cc, 2, "operation_D_123456", socketB),
