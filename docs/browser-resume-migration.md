@@ -48,3 +48,20 @@ returns the SAME message ID with inserted:false and the database's actual payloa
 hash. A lost generation-CAS ACK is fenced without advancing again.
 File checks here are database-only: no filesystem write or byte/inode proof.
 This adds no public server or browser imports and does not validate a wire adapter.
+
+## Private inline receipt adapter (same 3.0.33 draft)
+
+The next slice validates the actual text/image ResumeSendReply projection:
+request-local clientMessageId plus persisted message ID/type/username/content/time.
+It recomputes the server canonical payload identity with browser WebCrypto;
+client-echoed hash/session fields do not confer evidence. Exact operation/physical
+owner/expiry is rechecked after the asynchronous digest. Differential tests compare
+browser image canonicalization with the server. The isolated PostgreSQL fixture
+now passes real text/image retry results through this adapter after withheld ACK.
+This is payload validation, NOT authenticated transport or Socket.IO acceptance.
+
+File replies currently omit the persisted byte digest, so this adapter explicitly
+refuses files instead of inferring byte identity from name/size/MIME/path. A
+reviewed authenticated byte-identity response contract is still needed. No public
+imports, credential publication, join/resume handler, automatic replay, reload
+durability, or activation was added. Keep PR44 draft and unmerged.

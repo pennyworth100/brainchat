@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { createBrowserResumeController } from "../src/lib/browser-resume-controller";
+import { createBrowserInlineReceiptAdapter } from "../src/lib/browser-inline-receipt";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings, type ResumeBinding } from "../src/lib/resume-bindings";
 import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
@@ -78,8 +79,16 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
     const rows = await database.query("SELECT payload_hash, message_id FROM resume_message_receipts WHERE session_id=$1 AND client_message_id=$2",
       [credential.sessionId, operation.clientMessageId]);
     check(rows.rows.length === 1 && rows.rows[0].payload_hash === payloadHash);
-    check(c.reconcile(operation, second, { ...operation, sessionId: credential.sessionId,
-      payloadHash: rows.rows[0].payload_hash, messageId: rows.rows[0].message_id }) === saved.message.id);
+    if (kind === "file") {
+      // DB-only file proof: current HTTP projection omits the persisted byte hash.
+      check(c.reconcile(operation, second, { ...operation, sessionId: credential.sessionId,
+        payloadHash: rows.rows[0].payload_hash, messageId: rows.rows[0].message_id }) === saved.message.id);
+    } else {
+      const adapter = createBrowserInlineReceiptAdapter(c, operation, second, kind === "message" ? text : image);
+      // Exact ResumeSendReply shape with actual DB-returned content, no invented
+      // session/hash fields. Network authentication remains a separate gate.
+      check(await adapter.accept({ clientMessageId: operation.clientMessageId, message: retried.message }) === saved.message.id);
+    }
     check(c.status().pending === 0);
     // A CAS did commit but its ACK was lost on a DIFFERENT physical transport.
     c.disconnect(second); bindings.detach(binding);
