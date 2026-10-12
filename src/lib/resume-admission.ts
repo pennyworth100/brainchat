@@ -3,6 +3,9 @@ import { ResumeCapacity } from "./resume-capacity";
 import { hashResumeToken, type ResumeCredential, type ResumeIdentity, type ResumeStore } from "./resume-store";
 
 type Request = { credential: ResumeCredential; expectedGeneration: number; operationId: string };
+type TransferRequest = Omit<Request, "operationId"> & { originalOperationId: string; transferOperationId: string };
+export type ResumeAdmissionStore = Pick<ResumeStore, "advanceGeneration"> &
+  Partial<Pick<ResumeStore, "transferAppliedGeneration">>;
 type Cleanup = () => Promise<void>;
 type Limits = { capacity: ResumeCapacity; timeoutMs: number; onLateError: (error: unknown) => void };
 
@@ -20,7 +23,7 @@ export class ResumeAdmission {
   private binding: ResumeBinding | undefined;
   private cleanup: Cleanup | undefined;
 
-  constructor(private readonly store: Pick<ResumeStore, "advanceGeneration">,
+  constructor(private readonly store: ResumeAdmissionStore,
     private readonly bindings: ResumeBindings, private readonly transportId: string,
     private readonly connected: () => boolean,
     // Preparation must not publish history/presence or grant outbound access.
@@ -49,13 +52,30 @@ export class ResumeAdmission {
   }
 
   admit(request: Request): Promise<ResumeBinding | null> {
+    return this.start(request);
+  }
+
+  // Same physical attempt, capacity, deadline, preparation and finalizer as CAS.
+  // Original provenance is never rewritten to the transfer operation ID.
+  transfer(request: TransferRequest): Promise<ResumeBinding | null> {
+    if (!this.store.transferAppliedGeneration ||
+        typeof request.transferOperationId !== "string" ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(request.transferOperationId) ||
+        typeof request.originalOperationId !== "string" ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(request.originalOperationId) ||
+        request.originalOperationId === request.transferOperationId) return Promise.resolve(null);
+    return this.start({ credential: request.credential, expectedGeneration: request.expectedGeneration,
+      operationId: request.originalOperationId }, request.transferOperationId);
+  }
+
+  private start(request: Request, transferOperationId?: string): Promise<ResumeBinding | null> {
     if (!this.live()) return Promise.resolve(null);
     const credential = { ...request.credential };
     const tokenHash = hashResumeToken(credential.token);
     if (!tokenHash) return Promise.resolve(null);
     const { expectedGeneration, operationId } = request;
     const key = JSON.stringify([credential.sessionId, credential.roomId, tokenHash,
-      expectedGeneration, operationId]);
+      expectedGeneration, operationId, transferOperationId ?? null]);
     if (this.flight) {
       if (key !== this.key || (this.binding && !this.bindings.isCurrent(this.binding))) {
         return Promise.resolve(null);
@@ -72,10 +92,12 @@ export class ResumeAdmission {
     if (this.limits) this.deadline = performance.now() + this.limits.timeoutMs;
     this.work = Promise.resolve().then(async () => {
       if (!this.live()) return null;
-      const identity = await this.store.advanceGeneration(credential,
-        expectedGeneration, operationId, this.transportId);
+      const identity = transferOperationId === undefined
+        ? await this.store.advanceGeneration(credential, expectedGeneration, operationId, this.transportId)
+        : await this.store.transferAppliedGeneration!(credential, expectedGeneration, operationId,
+          transferOperationId, this.transportId);
       if (!identity || !this.live() || identity.sessionId !== credential.sessionId ||
-          identity.roomId !== credential.roomId || identity.generation !== expectedGeneration + 1) return null;
+          identity.roomId !== credential.roomId || identity.generation !== expectedGeneration + (transferOperationId === undefined ? 1 : 2)) return null;
       try {
         const binding = await this.bindings.activate(identity, this.transportId, async () => {
           this.cleanup = await this.prepare(identity);

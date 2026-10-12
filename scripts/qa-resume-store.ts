@@ -8,6 +8,7 @@ import { Pool } from "pg";
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings } from "../src/lib/resume-bindings";
 import { ResumeAdmission } from "../src/lib/resume-admission";
+import { ResumeCapacity } from "../src/lib/resume-capacity";
 import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
 import { ResumeUploadAdmissions } from "../src/lib/resume-upload-admission";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
@@ -1152,7 +1153,7 @@ try {
   const cleanupErrors: unknown[] = [];
   await new Promise<void>(resolve => http.listen(0, "127.0.0.1", resolve));
   const address = http.address(); assert.ok(address && typeof address !== "string");
-  const connectOwner = async () => {
+  const connectOwner = async (extra: Partial<Parameters<typeof attachResumeSocket>[1]> = {}) => {
     const connected = new Promise<ServerSocket>(resolve => sockets.once("connection", resolve));
     const client = io(`http://127.0.0.1:${address.port}`, { transports: ["websocket"], reconnection: false });
     clients.push(client);
@@ -1162,7 +1163,7 @@ try {
     const socket = await connected; await ready;
     const owner = attachResumeSocket(socket, { store: first, bindings: preflightBindings,
       memberships: members, prepare: async () => async () => {},
-      onCleanupError: error => cleanupErrors.push(error) });
+      onCleanupError: error => cleanupErrors.push(error), ...extra });
     owners.push(owner);
     return { socket, owner };
   };
@@ -1180,6 +1181,94 @@ try {
       check(members.bindingFor(physical.socket, physical.owner, issued.roomId) === binding);
       return { ...physical, credential, binding };
     };
+    // Real PostgreSQL provenance transfer through actual Socket.IO owners.
+    const beforeTransfers = checks;
+    for (const outcome of ["success", "superseded", "unknown", "lost-ack", "disconnect", "timeout"] as const) {
+      const issued = await first.issueAfterAuthenticatedJoin("prefl123", "Transfer guest", 1);
+      assert.ok(issued);
+      const credential = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+      const originalOperationId = "original_" + issued.sessionId;
+      const transferOperationId = "transfer_" + issued.sessionId;
+      const original = await connectOwner();
+      if (outcome !== "unknown") {
+        assert.ok(await original.owner.admit({ credential, expectedGeneration: 0,
+          operationId: originalOperationId }));
+      }
+      if (outcome === "superseded") {
+        assert.ok(await second.advanceGeneration(credential, 1,
+          "competitor_" + issued.sessionId, "competitor_transport_1"));
+      }
+      let transferCalls = 0;
+      const transferCapacity = new ResumeCapacity(1);
+      const lateErrors: unknown[] = [];
+      const next = await connectOwner({ capacity: transferCapacity,
+        timeoutMs: outcome === "timeout" ? 200 : 5000,
+        onCleanupError: e => lateErrors.push(e),
+        store: { advanceGeneration: async () => assert.fail("no blind CAS"),
+          transferAppliedGeneration: async (...args) => {
+            transferCalls++;
+            const result = await second.transferAppliedGeneration(...args);
+            if (outcome === "lost-ack") throw Error("withheld transfer database acknowledgment");
+            return result;
+          } } });
+      const request = { credential, expectedGeneration: 0, originalOperationId, transferOperationId };
+      const held = outcome === "disconnect" || outcome === "timeout";
+      if (held) {
+        await a.query("BEGIN");
+        await a.query("SELECT id FROM room_resume_sessions WHERE id=$1 FOR UPDATE", [issued.sessionId]);
+      }
+      let flight: ReturnType<ResumeSocketOwner["transfer"]> | undefined;
+      try {
+        flight = next.owner.transfer(request);
+        check(next.owner.transfer(request) === flight);
+        check(await next.owner.admit({ credential, expectedGeneration: 1,
+          operationId: "blind_fresh_operation" }) === null);
+        if (held) {
+          await waitForBlockedSecond();
+          check(transferCapacity.acquire() === null);
+          const closing = outcome === "disconnect" ? next.owner.close() : undefined;
+          if (outcome === "timeout") {
+            check(await flight === null);
+            check(!next.socket.connected);
+            check(transferCapacity.acquire() === null);
+          }
+          check(members.currentBindingFor(next.socket, next.owner) === null);
+          await a.query("COMMIT");
+          await closing;
+        }
+        if (outcome === "lost-ack") {
+          await assert.rejects(flight, /withheld transfer/); checks++;
+        } else {
+          const binding = await flight;
+          if (outcome === "success") {
+            assert.ok(binding);
+            check(binding.generation === 2 && binding.transportId === next.owner.incarnation);
+            check(members.currentBindingFor(next.socket, next.owner) === binding);
+            check(members.currentBindingFor(original.socket, original.owner) === null);
+            check(!original.socket.connected);
+            check(next.owner.transfer(request) === flight);
+            const duplicate = await connectOwner();
+            check(await duplicate.owner.transfer(request) === null);
+            check(members.currentBindingFor(next.socket, next.owner) === binding);
+          } else check(binding === null);
+        }
+        if (outcome !== "success") {
+          check(members.currentBindingFor(next.socket, next.owner) === null);
+          check(await next.owner.transfer({ ...request, transferOperationId: "fresh_transfer_attempt" }) === null);
+        }
+        check(transferCalls === 1);
+        await next.owner.close();
+        const permit = transferCapacity.acquire(); check(!!permit); permit?.();
+        check(lateErrors.length === 0);
+        const stored = await first.lookup(credential);
+        check(stored?.generation === (outcome === "unknown" ? 0 : 2));
+      } finally {
+        if (held) await a.query("ROLLBACK");
+      }
+    }
+    console.log(JSON.stringify({ suite: "resume-transfer-admission-postgresql-loopback",
+      checks: checks - beforeTransfers, result: "PASS",
+      scope: "actual socket owners and atomic SQL transfer; no public browser readiness" }));
     const run = async (f: Awaited<ReturnType<typeof fixture>>, credential = f.credential) => {
       const grant = await preflightResumeUpload(f.socket, f.owner, members, second,
         preflightUploads, credential);
