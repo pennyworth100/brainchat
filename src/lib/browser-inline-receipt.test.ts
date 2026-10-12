@@ -10,7 +10,7 @@ const lease = { roomId: "candy986", username: "alice", sessionId: "11111111-1111
 async function fixture(kind: "message" | "image" = "message", overrideHash?: string) {
   const c = createBrowserResumeController(undefined, () => 1000), physical = {};
   const join = c.beginJoin(lease.roomId, lease.username, physical);
-  c.finishSync(physical, 1, c.accept(join, physical, lease));
+  finish(c, physical, 1, c.accept(join, physical, lease));
   const payload = kind === "message" ? "hello 🌍" : "data:image/png;base64,YQ==";
   const hash = await browserInlineHash(lease.roomId, lease.username, kind, payload);
   const op = c.beginOperation(kind, overrideHash ?? hash);
@@ -42,7 +42,7 @@ for (const kind of ["message", "image"] as const) {
     const f = await fixture(kind);
     f.c.disconnect(f.physical);
     const second = {}, ticket = f.c.beginResume(second);
-    f.c.finishSync(second, 2, f.c.accept(ticket, second, { ...lease, generation: 2 }));
+    finish(f.c, second, 2, f.c.accept(ticket, second, { ...lease, generation: 2 }));
     await assert.rejects(f.adapter.accept(f.reply), /mismatch/);
     const retry = createBrowserInlineReceiptAdapter(f.c, f.op, second, f.payload);
     assert.equal(retry.request.clientMessageId, f.adapter.request.clientMessageId);
@@ -53,7 +53,7 @@ test("async digest cannot cross explicit rejoin even on identical physical trans
   const f = await fixture();
   const pending = f.adapter.accept(f.reply);
   const join = f.c.beginJoin(lease.roomId, lease.username, f.physical);
-  f.c.finishSync(f.physical, 1, f.c.accept(join, f.physical, lease));
+  finish(f.c, f.physical, 1, f.c.accept(join, f.physical, lease));
   await assert.rejects(pending, /owner/);
 });
 test("returned content cannot settle an operation created with a different payload hash", async () => {
@@ -76,3 +76,10 @@ test("browser image canonicalization agrees with server including padding and bo
     assert.equal(canonicalBrowserInline("image", value), expected);
   }
 });
+
+type Controller = ReturnType<typeof createBrowserResumeController>;
+function finish(c: Controller, physical: object, generation: number, ticket: ReturnType<Controller["accept"]>) {
+  const adapter = c.snapshot(physical, ticket);
+  const completion = adapter.accept({ ...adapter.request, window: "newest-100-id-ascending", history: [], users: [] });
+  return c.finishSync(physical, generation, ticket, completion);
+}

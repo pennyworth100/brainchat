@@ -13,6 +13,7 @@ import { createBrowserInlineReceiptAdapter } from "../src/lib/browser-inline-rec
 import { ResumeStore } from "../src/lib/resume-store";
 import { ResumeBindings, type ResumeBinding } from "../src/lib/resume-bindings";
 import { ResumeOperationGate, ResumeUploadOperationGate } from "../src/lib/resume-operation";
+import { publishBrowserSnapshot } from "../src/lib/resume-browser-snapshot";
 import { ResumeHistoryReader } from "../src/lib/resume-history";
 import { ResumeMessageWriter } from "../src/lib/resume-message";
 import { ResumeImageWriter } from "../src/lib/resume-image";
@@ -50,6 +51,14 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
   try {
   for (const kind of ["message", "image", "file"] as const) {
     const c = createBrowserResumeController();
+    const finish = async (connection: Awaited<ReturnType<typeof connect>>, binding: ResumeBinding,
+      ticket: ReturnType<typeof c.accept>) => {
+      const adapter = c.snapshot(connection.client, ticket);
+      const wire = new Promise<unknown>(resolve => connection.client.once("fixture-snapshot", resolve));
+      check(await publishBrowserSnapshot(connection.socket, connection.owner, binding, members,
+        new ResumeHistoryReader(gate), adapter.request, value => connection.socket.emit("fixture-snapshot", value)));
+      return c.finishSync(connection.client, binding.generation, ticket, adapter.accept(await wire));
+    };
     const one = await connect(), first = one.client;
     const join = c.beginJoin("core333", "browser-core", first);
     const joinedWire = new Promise<BrowserLease>(resolve => first.once("fixture-lease", resolve));
@@ -62,7 +71,7 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
     check(members.legacyUploadBindingFor(one.socket, one.owner, "core333") === null);
     const joinSync = c.accept(join, first, envelope);
     check(Array.isArray(await new ResumeHistoryReader(gate).read(initial)));
-    c.finishSync(first, 1, joinSync);
+    await finish(one, initial, joinSync);
     const payload = kind === "message" ? [text] : kind === "image" ? [image] :
       [file.name, file.size, file.mime, file.sha256];
     const payloadHash = createHash("sha256").update(JSON.stringify(["core333", "browser-core", kind, ...payload])).digest("hex");
@@ -96,7 +105,7 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
     const resumeSync = c.accept(resume, second, await resumedWire);
     const history = await new ResumeHistoryReader(gate).read(binding);
     check(history?.some(value => (value as { id: number }).id === saved.message.id));
-    c.finishSync(second, 2, resumeSync);
+    await finish(two, binding, resumeSync);
     check(c.dispatch(operation, second).clientMessageId === operation.clientMessageId);
     const retried = await save(binding);
     check(!retried.inserted && retried.message.id === saved.message.id);
@@ -141,7 +150,7 @@ export async function checkBrowserResumeCore(database: PoolClient, operationPool
     check(c.status().phase === "syncing");
     assert.throws(() => c.beginOperation(kind, payloadHash), /synchronized/); checks++;
     check((await new ResumeHistoryReader(gate).read(transferred))?.some(value => (value as { id: number }).id === saved.message.id));
-    c.finishSync(fourth, 4, transferSync);
+    await finish(four, transferred, transferSync);
     check(c.status().phase === "ready");
     check(members.legacyUploadBindingFor(four.socket, four.owner, "core333") === null);
     check(c.dispatch(retained, fourth).clientMessageId === retained.clientMessageId);

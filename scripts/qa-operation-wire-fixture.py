@@ -33,10 +33,11 @@ try:
          "--auth-host=trust", "--encoding=UTF8", "--locale=C"]).check_returncode()
     run([pg / "pg_ctl", "-D", data, "-l", owned / "server.log", "-o",
          f"-h 127.0.0.1 -p {port} -k {sock}", "-w", "start"]).check_returncode()
-    test = run(["node", "--import", "tsx", "scripts/qa-operation-wire.ts"], timeout=40)
-    print(test.stdout, end="")
-    print(test.stderr, end="")
-    test.check_returncode()
+    for script in ["scripts/qa-operation-wire.ts", "scripts/qa-browser-snapshot-boundary.ts"]:
+        test = run(["node", "--import", "tsx", script], timeout=40)
+        print(test.stdout, end="")
+        print(test.stderr, end="")
+        test.check_returncode()
 finally:
     # Also handle partial/failed startup; pg_ctl consults this owned data directory.
     status = run([pg / "pg_ctl", "-D", data, "status"])
@@ -45,4 +46,3 @@ finally:
     final = run([pg / "pg_ctl", "-D", data, "status"])
     print(json.dumps(dict(cluster=str(owned), steps=steps), indent=2))
     assert final.returncode == 3, "Owned PostgreSQL still running or cleanup unverifiable"
-

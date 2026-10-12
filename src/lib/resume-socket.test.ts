@@ -11,7 +11,8 @@ test("private join projects actual owner lease, fences legacy before handoff, an
     issue: async () => ({ ...issuedJoin(), sessionId }),
     store: { advanceGeneration: async () => ({ ...identity(), sessionId }) } });
   t.after(() => owner.close());
-  const browser = createBrowserResumeController(() => "browser_operation_0001", () => 0);
+  let operationKey = 0;
+  const browser = createBrowserResumeController(() => "browser_operation_" + (++operationKey).toString().padStart(4, "0"), () => 0);
   const physical = {}, ticket = browser.beginJoin("candy986", "Alice", physical);
   let received: BrowserLease | undefined;
   assert.equal(await publishBrowserJoin(socket, owner, members, authenticatedJoin, lease => {
@@ -1868,4 +1869,54 @@ test("cleanup rejection is reported once and remains awaitable; closed socket ca
   const closedOwner = attachResumeSocket(other.socket, options());
   assert.equal(await closedOwner.admit(request()), null); await closedOwner.close();
   assert.equal(other.socket.listenerCount("disconnecting"), 0);
+});
+
+import { publishBrowserSnapshot } from "./resume-browser-snapshot";
+
+test("private snapshot binds request/session/generation before any read and rejects copied authorities", async t => {
+  const f = await syncFixture(t), other = await f.connect(); let reads = 0, acks = 0;
+  const reader = { read: async () => { reads++; return []; } };
+  const req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId,
+    generation: f.binding.generation, requestId: "snapshot_request_001" };
+  for (const change of [{ roomId: "apple123" }, { sessionId: "other" }, { generation: 2 }, { requestId: "bad" }]) {
+    assert.equal(await publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members, reader,
+      { ...req, ...change }, () => { acks++; }), false);
+  }
+  for (const [socket, owner, binding] of [[other.socket, f.owner, f.binding],
+    [f.socket, { ...f.owner }, f.binding], [f.socket, f.owner, { ...f.binding }]] as const) {
+    assert.equal(await publishBrowserSnapshot(socket, owner, binding, f.members, reader, req, () => { acks++; }), false);
+  }
+  assert.deepEqual([reads, acks], [0, 0]);
+});
+test("snapshot envelope captures original request and ignores probe/afterId, publishing full window", async t => {
+  const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let reads = 0;
+  const req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId, generation: f.binding.generation,
+    requestId: "snapshot_request_001", probeOnly: true, afterId: 999 };
+  const original = { roomId: req.roomId, sessionId: req.sessionId, generation: req.generation, requestId: req.requestId };
+  const replies: unknown[] = [];
+  const pending = publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => { reads++; return gate.promise; } }, req, value => replies.push(value));
+  req.requestId = "changed_request_001"; req.generation = 99;
+  gate.resolve([{ id: 1 }]);
+  assert.equal(await pending, true); assert.equal(reads, 1);
+  assert.deepEqual(replies, [{ ...original, window: "newest-100-id-ascending", history: [{ id: 1 }], users: ["Alice"] }]);
+});
+test("snapshot envelope never acknowledges a disconnected or expired reader after await", async t => {
+  for (const expire of [false, true]) {
+    const f = await syncFixture(t), gate = deferred<readonly unknown[]>(); let acks = 0;
+    const pending = publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members, { read: () => gate.promise },
+      { roomId: f.binding.roomId, sessionId: f.binding.sessionId, generation: f.binding.generation,
+        requestId: "snapshot_request_001" }, () => { acks++; });
+    if (expire) f.expire(); else f.socket.disconnect(true);
+    gate.resolve([]);
+    assert.equal(await pending, false); assert.equal(acks, 0);
+  }
+});
+test("snapshot denied history cannot become completion and handoff exceptions propagate", async t => {
+  const f = await syncFixture(t), req = { roomId: f.binding.roomId, sessionId: f.binding.sessionId,
+    generation: f.binding.generation, requestId: "snapshot_request_001" };
+  assert.equal(await publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => null }, req, () => assert.fail("no authorized history")), false);
+  await assert.rejects(publishBrowserSnapshot(f.socket, f.owner, f.binding, f.members,
+    { read: async () => [] }, req, () => { throw Error("snapshot handoff failed"); }), /handoff failed/);
 });

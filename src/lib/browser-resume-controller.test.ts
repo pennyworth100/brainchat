@@ -21,8 +21,8 @@ test("explicit transfer preserves original CAS, accepts only +2, and requires se
   c.disconnect(second);
   const sync = c.accept(transfer, third, { ...lease, generation: 3 });
   assert.throws(() => c.dispatch(pending, third), /synchronized/);
-  assert.throws(() => c.finishSync(second, 3, sync), /Stale/);
-  c.finishSync(third, 3, sync);
+  assert.throws(() => c.finishSync(second, 3, sync, undefined as never), /Stale/);
+  finish(c, third, 3, sync);
   assert.equal(c.dispatch(pending, third).clientMessageId, pending.clientMessageId);
   assert.equal(c.status().pending, 1);
 });
@@ -74,7 +74,7 @@ test("join loss, explicit owner replacement, and expiry cannot reuse CAS provena
   d.disconnect(next.first);
   const old = {}; d.beginResume(old); d.disconnect(old);
   const joinPhysical = {}, join = d.beginJoin("candy986", "alice", joinPhysical);
-  const sync = d.accept(join, joinPhysical, lease); d.finishSync(joinPhysical, 1, sync);
+  const sync = d.accept(join, joinPhysical, lease); finish(d, joinPhysical, 1, sync);
   d.disconnect(joinPhysical);
   assert.throws(() => d.beginTransfer({}), /provenance/);
 });
@@ -85,10 +85,10 @@ test("old history cannot activate a replacement join on the same physical connec
   const oldSync = c.accept(oldJoin, first, lease);
   const newJoin = c.beginJoin("candy986", "alice", first);
   const newSync = c.accept(newJoin, first, { ...lease, sessionId: "22222222-2222-4222-8222-222222222222" });
-  assert.throws(() => c.finishSync(first, 1, oldSync), /Stale/);
-  assert.throws(() => c.finishSync(first, 1, { ...newSync }), /Stale/);
+  assert.throws(() => c.finishSync(first, 1, oldSync, undefined as never), /Stale/);
+  assert.throws(() => c.finishSync(first, 1, { ...newSync }, undefined as never), /Stale/);
   assert.equal(c.status().phase, "syncing");
-  c.finishSync(first, 1, newSync);
+  finish(c, first, 1, newSync);
   assert.equal(c.status().phase, "ready");
 });
 const lease: BrowserLease = { roomId: "candy986", username: "alice",
@@ -100,7 +100,7 @@ function fixture(limit = 32) {
   const first = {};
   const ticket = controller.beginJoin("candy986", "alice", first);
   const sync = controller.accept(ticket, first, lease);
-  controller.finishSync(first, 1, sync);
+  finish(controller, first, 1, sync);
   return { controller, first, expire: () => { time = 5000; } };
 }
 test("join and resume require exact physical CAS then matching history synchronization", () => {
@@ -113,10 +113,10 @@ test("join and resume require exact physical CAS then matching history synchroni
   assert.equal(ticket.expectedGeneration, 1);
   assert.throws(() => c.accept({ ...ticket }, second, { ...lease, generation: 2 }), /Stale/);
   const sync = c.accept(ticket, second, { ...lease, generation: 2 });
-  assert.throws(() => c.finishSync(first, 2, sync), /Stale/);
-  assert.throws(() => c.finishSync(second, 1, sync), /Stale/);
+  assert.throws(() => c.finishSync(first, 2, sync, undefined as never), /Stale/);
+  assert.throws(() => c.finishSync(second, 1, sync, undefined as never), /Stale/);
   assert.throws(() => c.beginOperation("message", "a".repeat(64)), /synchronized/);
-  c.finishSync(second, 2, sync);
+  finish(c, second, 2, sync);
   c.disconnect(first);
   assert.equal(c.uploadAuthority(second, "socket-2").kind, "resume");
 });
@@ -128,7 +128,7 @@ for (const kind of ["message", "image", "file"] as const) {
     c.disconnect(first);
     const second = {}, ticket = c.beginResume(second);
     const sync = c.accept(ticket, second, { ...lease, generation: 2 });
-    c.finishSync(second, 2, sync);
+    finish(c, second, 2, sync);
     const retry = c.dispatch(operation, second);
     assert.equal(retry.clientMessageId, sent.clientMessageId);
     assert.equal(retry.sessionId, sent.sessionId);
@@ -145,7 +145,7 @@ for (const kind of ["message", "image", "file"] as const) {
     c.dispatch(operation, first);
     const ticket = c.beginJoin("candy986", "alice", first);
     const sync = c.accept(ticket, first, { ...lease, sessionId: "22222222-2222-4222-8222-222222222222" });
-    c.finishSync(first, 1, sync);
+    finish(c, first, 1, sync);
     assert.throws(() => c.dispatch(operation, first), /owner/);
     assert.throws(() => c.dispatch({ ...operation }, first), /owner/);
   });
@@ -190,3 +190,10 @@ test("malformed or changed credential and wrong CAS generation fail closed", () 
     assert.equal(c.status().phase, "blocked");
   }
 });
+
+type Controller = ReturnType<typeof createBrowserResumeController>;
+function finish(c: Controller, physical: object, generation: number, ticket: ReturnType<Controller["accept"]>) {
+  const adapter = c.snapshot(physical, ticket);
+  const completion = adapter.accept({ ...adapter.request, window: "newest-100-id-ascending", history: [], users: [] });
+  return c.finishSync(physical, generation, ticket, completion);
+}

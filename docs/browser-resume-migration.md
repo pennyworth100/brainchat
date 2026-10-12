@@ -126,3 +126,46 @@ Next: define and test full-sync snapshot/gap completion before public activation
 then authenticated persisted file-byte identity, capability negotiation and
 coherent page/all-producer/private-message integration. Physical byte/inode
 capacity and fresh fenced recovery/exact-image rollout remain release gates.
+
+## Validated bounded snapshot completion (same draft, October 12)
+
+The controller now creates a unique snapshot request after each accepted lease.
+Its adapter is bound to the exact physical connection and opaque sync ticket,
+with session/generation/room/request identifiers on the private wire envelope.
+Install its live callback before sending the request. The server envelope wraps
+the existing authorized full-window read and rechecks exact membership after
+the await; it never substitutes a local probe or an afterId query.
+
+finishSync requires the exact completion object produced by that adapter after
+validating the received envelope. Matching ticket/generation alone, bare handoff
+true, probe ACK, copied/foreign completion, replay, disconnect and late completion
+cannot make the controller ready. A 10-second deadline is checked synchronously
+at validation AND consumption, so a delayed timer does not admit a late ACK.
+Malformed data or count/byte overflow closes the adapter, preserving unresolved
+operations; completion failure blocks the controller.
+
+History is explicitly the newest 100 rows ordered by ID ascending, NOT complete
+offline history and NOT a commit watermark. Up to 100 pre-request/during-request
+live events (16 MiB projected UTF-8) merge with a snapshot capped at 32 MiB.
+Message ID/type/time, text/image content, local file URL/name/size/MIME and optional
+SHA-256 are validated. Exact duplicate live/snapshot rows deduplicate; conflicting
+IDs fail closed. Copied immutable projections strip unknown fields. Pending
+operation identity/payload ownership is never settled by seeing a history row.
+
+The private PostgreSQL fixture now delivers these envelopes across actual
+Socket.IO before READY for join, resume and original-CAS transfer. Unit regressions
+cover all media, lower-ID late-commit reconciliation, stale/copied/replayed/invalid
+completion, overflow, timeout and pending operation retention.
+
+Still NOT gap-free: a writer can commit without delivering a live event, and a
+lower allocated ID can commit after a higher one. Two reads do not create an
+atomic cut. Need an evidenced ALL-writer publication/reconciliation boundary,
+including commit-success/fanout-failure/restart, before public wiring. This module
+does not automatically request subsequent reconciliation or retain payload bytes
+across reload. Current file history can include sha256 while live file replies
+omit it; overlapping contradictory projections fail closed until the authenticated
+file-byte contract is made coherent. No file metadata substitutes for stored bytes.
+
+No public activation, schema/dependency/version change, PR20 integration or
+production deployment. Same 3.0.33 draft, with physical capacity and recovery gates
+unchanged.

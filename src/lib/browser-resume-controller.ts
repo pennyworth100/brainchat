@@ -1,5 +1,6 @@
 import { isValidRoomId } from "./room-id";
 import type { UploadAuthority } from "./upload-authority";
+import { createBrowserSnapshotWindow, type SnapshotCompletion } from "./browser-resume-snapshot";
 
 export type BrowserLease = Readonly<{
   roomId: string; username: string; sessionId: string; token: string;
@@ -10,7 +11,7 @@ type CasAttempt = Readonly<{ kind: "join" | "resume"; operationId: string; expec
 type TransferAttempt = Readonly<{ kind: "transfer"; originalOperationId: string; expectedGeneration: number;
   transferOperationId: string }>;
 type Attempt = CasAttempt | TransferAttempt;
-type SyncAttempt = Readonly<{ sessionId: string; generation: number }>;
+type SyncAttempt = Readonly<{ sessionId: string; generation: number; requestId: string }>;
 type Operation = Readonly<{ clientMessageId: string; kind: "message" | "image" | "file"; payloadHash: string }>;
 const validKey = (key: string) => /^[A-Za-z0-9_-]{16,128}$/.test(key);
 
@@ -30,6 +31,7 @@ export function createBrowserResumeController(
   let attempt: Attempt | null = null;
   let lostCas: { ticket: CasAttempt; physical: object } | null = null;
   let syncAttempt: SyncAttempt | null = null;
+  let snapshot: ReturnType<typeof createBrowserSnapshotWindow> | null = null;
   const pending = new Map<Operation, { sent: boolean }>();
   // Never recycle a key during this logical owner's lifetime, even after ACK.
   const usedKeys = new Set<string>();
@@ -70,12 +72,17 @@ export function createBrowserResumeController(
       (!lease || (value.sessionId === lease.sessionId && value.token === lease.token &&
         value.expiresAt === lease.expiresAt));
     if (!valid) { phase = "blocked"; throw Error("Invalid session acknowledgement"); }
+    let requestId: string;
+    try { requestId = freshKey(); }
+    catch (error) { phase = "blocked"; attempt = null; throw error; }
     lease = Object.freeze({ roomId, username, sessionId: value.sessionId, token: value.token,
       generation: value.generation, expiresAt: value.expiresAt });
     attempt = null;
     lostCas = null;
     phase = "syncing";
-    return syncAttempt = Object.freeze({ sessionId: lease.sessionId, generation: lease.generation });
+    syncAttempt = Object.freeze({ sessionId: lease.sessionId, generation: lease.generation, requestId });
+    snapshot = createBrowserSnapshotWindow({ roomId, ...syncAttempt }, now);
+    return syncAttempt;
   };
   return {
     beginJoin(nextRoom: string, nextUser: string, physical: object): CasAttempt {
@@ -83,6 +90,7 @@ export function createBrowserResumeController(
       // Explicit join is the ONLY way to discard an old logical owner. The UI
       // must keep its unresolved drafts separately; they are not transferable.
       roomId = nextRoom; username = nextUser; transport = physical;
+      snapshot?.cancel(); snapshot = null;
       lease = null; pending.clear(); usedKeys.clear(); phase = "joining";
       syncAttempt = null; lostCas = null;
       attempt = Object.freeze({ kind: "join", operationId: freshKey(), expectedGeneration: 0 });
@@ -92,6 +100,7 @@ export function createBrowserResumeController(
     disconnect(physical: object) {
       if (physical !== transport) return;
       transport = null;
+      snapshot?.cancel(); snapshot = null;
       syncAttempt = null;
       if (phase === "blocked" || phase === "uncertain") return;
       // Keep ORIGINAL CAS provenance, never a transfer receipt/provenance chain.
@@ -129,14 +138,27 @@ export function createBrowserResumeController(
       if (ticket !== attempt || physical !== transport) return;
       phase = "blocked"; attempt = null;
     },
-    finishSync(physical: object, generation: number, ticket: SyncAttempt) {
+    snapshot(physical: object, ticket: SyncAttempt) {
+      live();
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || !snapshot) {
+        throw Error("Stale history acknowledgement");
+      }
+      return snapshot.api;
+    },
+    finishSync(physical: object, generation: number, ticket: SyncAttempt, completion: SnapshotCompletion) {
       const current = live();
       if (ticket !== syncAttempt || physical !== transport || attempt ||
           phase !== "syncing" || generation !== current.generation) {
         throw Error("Stale history acknowledgement");
       }
-      syncAttempt = null;
+      let result: SnapshotCompletion;
+      try {
+        if (!snapshot) throw Error("Missing snapshot");
+        result = snapshot.consume(completion);
+      } catch (error) { phase = "blocked"; throw error; }
+      snapshot = null; syncAttempt = null;
       phase = "ready";
+      return result;
     },
     beginOperation(kind: Operation["kind"], payloadHash: string): Operation {
       ready();
