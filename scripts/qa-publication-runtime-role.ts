@@ -18,6 +18,10 @@ url.username = role; url.password = "";
 // Explicit temp-last is necessary for unqualified subscriber SQL, not just the trigger.
 const runtime = new Pool({ connectionString: url.href,
   options: `-c search_path=pg_catalog,${schema},pg_temp`, max: 1 });
+const cleanupRole = "publication_cleanup_qa";
+url.username = cleanupRole;
+const maintenance = new Pool({ connectionString: url.href,
+  options: `-c search_path=pg_catalog,${schema},pg_temp`, max: 1 });
 let checks = 0;
 const check = (value: unknown) => { assert.ok(value); checks++; };
 async function denied(sql: string) {
@@ -97,13 +101,77 @@ async function main() {
       check((await probe.query("SELECT message_id FROM resume_message_receipts WHERE client_message_id='role_message_1'")).rows[0].message_id === null);
     } finally { await probe.query("ROLLBACK"); probe.release(); }
     check((await runtime.query("SELECT content FROM messages WHERE id=$1", [first.value.id])).rows[0].content === "immutable first");
+    // Prove the existing expiry primitive actually recovers subscriber capacity.
+    // Cleanup has a separate real LOGIN; runtime must not inherit DELETE.
+    await admin.query(`CREATE ROLE ${cleanupRole} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
+    await admin.query(`GRANT USAGE ON SCHEMA ${schema} TO ${cleanupRole}`);
+    await admin.query(`GRANT SELECT,DELETE ON room_resume_sessions TO ${cleanupRole}`);
+    await admin.query(`GRANT UPDATE(id) ON room_resume_sessions TO ${cleanupRole}`);
+    check((await maintenance.query("SELECT current_user,session_user")).rows[0].session_user === cleanupRole);
+    const cleaner = new ResumeStore(maintenance);
+    await assert.rejects(store.cleanupExpired(1), e => (e as {code:string}).code === "42501"); checks++;
+    for (const sql of ["DELETE FROM messages", "DELETE FROM message_publication_pending",
+      "DELETE FROM publication_deliveries", "UPDATE room_resume_sessions SET expires_at=clock_timestamp()",
+      "TRUNCATE room_resume_sessions CASCADE"]) {
+      await assert.rejects(maintenance.query(sql), e => (e as {code:string}).code === "42501"); checks++;
+    }
+    const expiring: string[] = [];
+    for (let i = 0; i < 99; i++) {
+      const session = await store.issueAfterAuthenticatedJoin("role123", "Reader", 1); assert.ok(session);
+      expiring.push(session.sessionId);
+      await admin.query("INSERT INTO publication_subscribers VALUES ($1,$2)", [session.sessionId, session.expiresAt]);
+    }
+    const next = await store.issueAfterAuthenticatedJoin("role123", "Reader", 1); assert.ok(next);
+    const nextCredential = {roomId:next.roomId, sessionId:next.sessionId, token:next.token};
+    const nextIdentity = await store.advanceGeneration(nextCredential, 0, "next_operation_123456", "next_transport_123456"); assert.ok(nextIdentity);
+    const nextBinding = await bindings.activate(nextIdentity, "next_transport_123456", async () => {}, () => true); assert.ok(nextBinding);
+    await assert.rejects(journal.snapshot(nextBinding), /subscriber capacity/); checks++;
+    // Expired subscriber metadata ALONE is not authority to erase a live session.
+    await admin.query("UPDATE publication_subscribers SET expires_at=clock_timestamp()-interval '1 second' WHERE session_id=$1", [expiring[0]]);
+    check(await cleaner.cleanupExpired(100) === 0);
+    await assert.rejects(journal.snapshot(nextBinding), /subscriber capacity/); checks++;
+    // Populate cascading ACK/snapshot/write receipts for two truly expired parents.
+    await admin.query(`INSERT INTO publication_deliveries
+      SELECT id,$2,1,'expired_transport','00000000-0000-4000-8000-000000000001',clock_timestamp(),true
+      FROM room_resume_sessions WHERE id=ANY($1::text[])`, [expiring.slice(0,2),first.value.id]);
+    await admin.query(`INSERT INTO publication_snapshot_attempts
+      SELECT id,1,'expired_transport','00000000-0000-4000-8000-000000000001',ARRAY[$2::integer],clock_timestamp(),true
+      FROM room_resume_sessions WHERE id=ANY($1::text[])`, [expiring.slice(0,2),first.value.id]);
+    await admin.query(`INSERT INTO resume_message_receipts
+      SELECT id,'expired_key',repeat('a',64),$2 FROM room_resume_sessions WHERE id=ANY($1::text[])`, [expiring.slice(0,2),first.value.id]);
+    await admin.query("UPDATE room_resume_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE id=ANY($1::text[])", [expiring.slice(0,2)]);
+    const held = await admin.connect();
+    try {
+      await held.query("BEGIN");
+      await held.query("SELECT id FROM room_resume_sessions WHERE id=$1 FOR UPDATE", [expiring[0]]);
+      await maintenance.query("SET statement_timeout='2s'");
+      check(await cleaner.cleanupExpired(1) === 1); // skip locked parent, delete other
+      check(await cleaner.cleanupExpired(1) === 0);
+      check((await admin.query("SELECT 1 FROM room_resume_sessions WHERE id=$1", [expiring[0]])).rowCount === 1);
+      check((await journal.snapshot(nextBinding))?.messages.length === 2); // slot reclaimed
+    } finally { await held.query("ROLLBACK"); held.release(); }
+    check(await cleaner.cleanupExpired(1) === 1);
+    for (const table of ["publication_subscribers", "publication_deliveries", "publication_snapshot_attempts", "resume_message_receipts"]) {
+      check((await admin.query(`SELECT 1 FROM ${table} WHERE session_id=ANY($1::text[])`, [expiring.slice(0,2)])).rowCount === 0);
+    }
+    check((await admin.query("SELECT count(*)::int n FROM publication_subscribers")).rows[0].n === 99);
+    check((await journal.claim(binding))?.messages.length === 0); // original ACK provenance retained
+    const retainedRetry = await writer.saveOnceWithOutcome(binding, "role_message_2", "later committed");
+    check(retainedRetry.authorized && !retainedRetry.value.inserted && retainedRetry.value.message.id === second.value.id);
+    check((await admin.query("SELECT count(*)::int n FROM messages")).rows[0].n === 2);
+    check((await admin.query("SELECT count(*)::int n FROM message_publication_pending")).rows[0].n === 2);
+    check(await cleaner.cleanupExpired(100) === 0);
     console.log(JSON.stringify({status:"PASS", checks, actualRestrictedLogin:true,
       insertSnapshotClaimACK:true, tempShadowResistant:true, appendOnlyRuntime:true,
-      privilegedMutationNeedsTombstones:true, publicActivation:false,
+      privilegedMutationNeedsTombstones:true, expiredSubscriberCapacityRecovered:true,
+      separateCleanupLogin:true, boundedSkipLockedCleanup:true, liveACKAndRetryPreserved:true,
+      publicActivation:false,
       scope:"private role feasibility; not deployed grants, row-level tenant isolation or full server acceptance"}));
   } finally {
+    await maintenance.end();
     await runtime.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.query(`DROP ROLE IF EXISTS ${cleanupRole}`);
     await admin.query(`DROP ROLE IF EXISTS ${role}`);
     await admin.end();
   }
