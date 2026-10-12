@@ -17,7 +17,7 @@ with socket.socket() as probe:
     port = probe.getsockname()[1]
 # Never inherit managed credentials/connection routing; no DATABASE_URL fallback.
 env = {k: v for k, v in os.environ.items()
-       if not k.startswith("PG") and k not in ("DATABASE_URL", "RESUME_TEST_DATABASE_URL")}
+       if not k.startswith("PG") and k not in ("DATABASE_URL", "RESUME_TEST_DATABASE_URL", "OWNED_PUBLICATION_PROOF")}
 env.update(OWNED_PG_PORT=str(port),
            RESUME_TEST_DATABASE_URL=f"postgresql://dimle@127.0.0.1:{port}/postgres",
            NO_PROXY="127.0.0.1,localhost,::1")
@@ -27,6 +27,8 @@ with socket.socket() as probe:
 uploads = owned / "uploads"
 uploads.mkdir()
 env.update(OWNED_APP_PORT=str(app_port), OWNED_UPLOAD_DIR=str(uploads))
+if "--publication" in sys.argv:
+    env["OWNED_PUBLICATION_PROOF"] = "1"
 steps = []
 
 def run(args, timeout=45):
@@ -49,6 +51,28 @@ try:
     print(test.stdout, end="")
     print(test.stderr, end="")
     test.check_returncode()
+    if "--publication" in sys.argv:
+        # Server has settled and exited; crash/recover only this owned database.
+        # This is journal durability, NOT recovery of live production storage.
+        run([pg / "pg_ctl", "-D", data, "-m", "immediate", "-w", "stop"]).check_returncode()
+        run([pg / "pg_ctl", "-D", data, "-l", owned / "server.log", "-o",
+             f"-h 127.0.0.1 -p {port} -k {sock}", "-w", "start"]).check_returncode()
+        recovered = run(["node", "--input-type=module", "-e",
+                         """import assert from 'node:assert/strict'; import pg from 'pg';
+                         const url = new URL(process.env.RESUME_TEST_DATABASE_URL);
+                         assert.equal(url.hostname, '127.0.0.1');
+                         assert.equal(url.port, process.env.OWNED_PG_PORT);
+                         const db = new pg.Pool({connectionString: url.href});
+                         try { const result = await db.query(`SELECT count(*) > 0 AND
+                         count(*) = (SELECT count(*) FROM message_publication_pending) AND
+                         count(*) = (SELECT count(*) FROM messages m JOIN message_publication_pending p
+                           ON p.message_id=m.id AND p.room_id=m.room_id)
+                         AS recovered FROM messages`);
+                         assert.equal(result.rows[0].recovered, true); console.log('t');
+                         } finally { await db.end(); }"""])
+        recovered.check_returncode()
+        assert recovered.stdout.strip() == "t", "Actual producer journal recovery mismatch"
+        print("PUBLIC_PRODUCER_JOURNAL_RECOVERY_PASS: nonempty exact same-room journal survives immediate DB stop/restart")
 finally:
     # Also handle partial/failed startup; pg_ctl consults this owned data directory.
     status = run([pg / "pg_ctl", "-D", data, "status"])

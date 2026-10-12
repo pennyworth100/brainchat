@@ -141,6 +141,11 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
         run: python3 scripts/qa-upload-ledger-tls-fixture.py --server
 
+      - name: Actual public producers retain journal work through post-commit failure
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py --publication
+
       - name: Concurrent startup migrations and SIGKILL lock release (owned PostgreSQL)
         env:
           PG_BIN: /usr/lib/postgresql/16/bin
