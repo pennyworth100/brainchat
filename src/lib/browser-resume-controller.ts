@@ -1,4 +1,5 @@
 import { isValidRoomId } from "./room-id";
+import { createBrowserPublicationPump, type PublicationClock } from "./browser-publication-pump";
 import { createBrowserPublicationJournal } from "./browser-publication-journal";
 import type { UploadAuthority } from "./upload-authority";
 import { createBrowserSnapshotWindow, type SnapshotCompletion } from "./browser-resume-snapshot";
@@ -38,6 +39,9 @@ export function createBrowserResumeController(
   let snapshot: ReturnType<typeof createBrowserSnapshotWindow> | null = null;
   let publication: ReturnType<typeof createBrowserPublicationSnapshot> | null = null;
   let journal: ReturnType<typeof createBrowserPublicationJournal> | null = null;
+  let pump: ReturnType<typeof createBrowserPublicationPump> | null = null;
+  const stopPolling = () => { pump?.cancel(); pump = null; };
+  const block = () => { stopPolling(); phase = "blocked"; };
   const pending = new Map<Operation, { sent: boolean }>();
   // Never recycle a key during this logical owner's lifetime, even after ACK.
   const usedKeys = new Set<string>();
@@ -50,13 +54,14 @@ export function createBrowserResumeController(
   };
   const live = () => {
     if (!lease || lease.expiresAt <= now()) {
-      phase = "blocked";
+      block();
       throw Error("Session expired");
     }
     return lease;
   };
   const ready = () => {
     const current = live();
+    if (phase === "ready" && syncProtocol === "publication-cut" && !pump?.live()) block();
     if (phase !== "ready" || !transport) throw Error("Session is not synchronized");
     return current;
   };
@@ -77,10 +82,10 @@ export function createBrowserResumeController(
       Number.isFinite(value.expiresAt) && value.expiresAt > now() &&
       (!lease || (value.sessionId === lease.sessionId && value.token === lease.token &&
         value.expiresAt === lease.expiresAt));
-    if (!valid) { phase = "blocked"; throw Error("Invalid session acknowledgement"); }
+    if (!valid) { block(); throw Error("Invalid session acknowledgement"); }
     let requestId: string;
     try { requestId = freshKey(); }
-    catch (error) { phase = "blocked"; attempt = null; throw error; }
+    catch (error) { block(); attempt = null; throw error; }
     lease = Object.freeze({ roomId, username, sessionId: value.sessionId, token: value.token,
       generation: value.generation, expiresAt: value.expiresAt });
     attempt = null;
@@ -97,6 +102,7 @@ export function createBrowserResumeController(
       // Explicit join is the ONLY way to discard an old logical owner. The UI
       // must keep its unresolved drafts separately; they are not transferable.
       roomId = nextRoom; username = nextUser; transport = physical;
+      stopPolling();
       snapshot?.cancel(); snapshot = null;
       publication?.cancel(); publication = null;
       lease = null; pending.clear(); usedKeys.clear(); phase = "joining";
@@ -108,6 +114,7 @@ export function createBrowserResumeController(
     accept,
     disconnect(physical: object) {
       if (physical !== transport) return;
+      stopPolling();
       transport = null;
       journal?.cancel(); journal = null;
       snapshot?.cancel(); snapshot = null;
@@ -147,7 +154,7 @@ export function createBrowserResumeController(
     },
     reject(ticket: Attempt, physical: object) {
       if (ticket !== attempt || physical !== transport) return;
-      phase = "blocked"; attempt = null;
+      block(); attempt = null;
     },
     publicationSnapshot(physical: object, ticket: SyncAttempt) {
       live();
@@ -167,7 +174,7 @@ export function createBrowserResumeController(
         // Remain syncing. No public READY path until durable ACK confirmation,
         // empty-cut semantics and continued journal reconciliation are composed.
         return staged;
-      } catch (error) { phase = "blocked"; throw error; }
+      } catch (error) { block(); throw error; }
     },
     publicationAck(physical: object, ticket: SyncAttempt) {
       if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
@@ -179,7 +186,7 @@ export function createBrowserResumeController(
         // The same immutable request/ID set may be retried after confirmation loss.
         // This does not extend its original deadline or claim delivery.
         return publication.retryAck();
-      } catch (error) { phase = "blocked"; throw error; }
+      } catch (error) { block(); throw error; }
     },
     confirmPublication(physical: object, ticket: SyncAttempt, value: unknown) {
       if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
@@ -194,7 +201,7 @@ export function createBrowserResumeController(
         // A settled cut is NOT a continuing journal subscription. Never grant
         // READY here or discard pending payload/operation ownership.
         return result;
-      } catch (error) { phase = "blocked"; throw error; }
+      } catch (error) { block(); throw error; }
     },
     snapshot(physical: object, ticket: SyncAttempt) {
       live();
@@ -204,14 +211,34 @@ export function createBrowserResumeController(
       return snapshot.api;
     },
     receivePublication(physical: object, ticket: SyncAttempt, value: unknown) {
-      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" || attempt) {
+      if (physical !== transport || ticket !== syncAttempt ||
+          (phase !== "syncing" && phase !== "ready") || attempt) {
         throw Error("Stale journal batch");
       }
       live();
       try {
+        if (pump && !pump.live()) throw Error("Publication lifetime expired");
         if (!journal) throw Error("Missing confirmed publication journal");
         return journal.receive(value);
-      } catch (error) { phase = "blocked"; throw error; }
+      } catch (error) { block(); throw error; }
+    },
+    startPublication(physical: object, ticket: SyncAttempt,
+      poll: (signal: AbortSignal) => Promise<boolean>, clock?: PublicationClock) {
+      const current = live();
+      if (physical !== transport || ticket !== syncAttempt || phase !== "syncing" ||
+          attempt || !journal || pump) throw Error("Publication lifetime requires confirmed cut");
+      const owned = () => physical === transport && ticket === syncAttempt &&
+        (phase === "syncing" || phase === "ready");
+      pump = createBrowserPublicationPump({ expiresAt: current.expiresAt, clock, poll,
+        synchronized: () => {
+          if (!owned()) return;
+          live();
+          // READY means a confirmed cut plus a live reconciliation owner, NOT
+          // an empty/drained journal, exactly-once delivery or reload durability.
+          phase = "ready";
+        },
+        failed: () => { if (owned()) { block(); journal?.cancel(); } },
+      });
     },
     finishSync(physical: object, generation: number, ticket: SyncAttempt, completion: SnapshotCompletion) {
       const current = live();
@@ -223,7 +250,7 @@ export function createBrowserResumeController(
       try {
         if (!snapshot) throw Error("Missing snapshot");
         result = snapshot.consume(completion);
-      } catch (error) { phase = "blocked"; throw error; }
+      } catch (error) { block(); throw error; }
       snapshot = null; syncAttempt = null;
       phase = "ready";
       return result;

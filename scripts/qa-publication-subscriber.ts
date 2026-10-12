@@ -217,12 +217,44 @@ async function requestBoundConfirmation() {
         check((await journal.claim(physical.binding))?.messages.length === 0);
         physical.client.removeAllListeners("publication-batch");
       }
+      // Compose the confirmed full/empty cut with an actual continuing lifetime.
+      // A successful empty poll is not a drained-cut proof.
+      let notify!: () => void, polls = 0;
+      let completed = new Promise<void>(resolve => { notify = resolve; });
+      controller.startPublication(physical.client, sync, async signal => {
+        check(!signal.aborted);
+        const result = await reconcileBrowserPublication(physical.socket, physical.owner,
+          physical.binding, members, journal, request);
+        polls++; notify(); return result;
+      });
+      check(controller.status().phase === "syncing");
+      await completed; await new Promise<void>(resolve => setImmediate(resolve));
+      check(controller.status().phase === "ready" && polls === 1);
+      const pending = controller.beginOperation("message", "a".repeat(64));
+      check(controller.dispatch(pending, physical.client).generation === physical.binding.generation);
+      let projected = 0;
+      physical.client.on("publication-batch", (value, ack) => {
+        check(controller.status().phase === "ready");
+        const result = controller.receivePublication(physical.client, sync, value);
+        projected = result.ack.ids.length; ack(result.ack);
+      });
+      completed = new Promise<void>(resolve => { notify = resolve; });
+      check((await writer.save(physical.binding, "after private READY")).authorized);
+      await completed; await new Promise<void>(resolve => setImmediate(resolve));
+      check(projected === 1 && polls === 2 && controller.status().phase === "ready");
+      controller.disconnect(physical.client);
+      check(controller.status().phase === "offline" && controller.status().pending === 1);
+      assert.throws(() => controller.dispatch(pending, physical.client), /synchronized/); checks++;
+      physical.client.removeAllListeners("publication-batch");
+      // Each case owns this room; do not turn the next full-cut seed into two rows.
+      await db.query("DELETE FROM messages WHERE room_id='conf123'");
     }
     console.log(JSON.stringify({phase:"request-bound-confirmation",fullAndEmpty:true,
       actualSocketDelivery:true,lostConfirmationRetry:true,durableBeforeConfirmation:true,
-      laterCommitRetained:true,actualControllerConfirmation:true,controllerRemainsSyncing:true,
+      laterCommitRetained:true,actualControllerConfirmation:true,beforeLifetimeRemainsSyncing:true,
       continuingJournal:true,lateLowerCommit:true,lostBatchACKDeduplicated:true,allMediaProjection:true,
-      scope:"private request-bound journal/controller; no READY, browser reload or public file-byte proof"}));
+      privateReadyLifetime:true,readyReceivesLaterCommit:true,disconnectRevokesAuthority:true,
+      scope:"private request-bound journal/controller; no rendered browser, reload durability or public file-byte proof"}));
   } finally {
     await lowTx.query("ROLLBACK"); lowTx.release();
     await physical.owner.close(); physical.client.disconnect();
