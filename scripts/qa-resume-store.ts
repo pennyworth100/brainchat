@@ -168,6 +168,101 @@ try {
   check(await first.advanceGeneration({ roomId: expired.roomId, sessionId: expired.sessionId, token: expired.token }, 0, opA, socketA) === null);
   const unchanged = (await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [cas.sessionId])).rows[0];
   check(unchanged.generation === 3);
+
+  // Atomic transfer never trusts an earlier own-applied observation.
+  const transferOp = "transfer_operation_123", transferTransport = "transfer_transport_123";
+  const transferFixture = async () => {
+    const issued = await first.issueAfterAuthenticatedJoin("candy986", "Transfer Guest", 2);
+    assert.ok(issued);
+    const c = { roomId: issued.roomId, sessionId: issued.sessionId, token: issued.token };
+    assert.ok(await first.advanceGeneration(c, 0, opA, socketA));
+    return c;
+  };
+  const transferred = await transferFixture();
+  const originalExpiry = (await first.lookup(transferred))!.expiresAt.getTime();
+  check(await first.operationOutcome(transferred, 0, opA) === "own-applied");
+  check(await second.transferAppliedGeneration(transferred, 0, opB, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration(transferred, 1, opA, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration({ ...transferred, token: randomBytes(32).toString("base64url") }, 0, opA, transferOp, transferTransport) === null);
+  check(await second.transferAppliedGeneration({ ...transferred, roomId: "spoon651" }, 0, opA, transferOp, transferTransport) === null);
+  const transferResult = await second.transferAppliedGeneration(transferred, 0, opA, transferOp, transferTransport);
+  check(transferResult?.generation === 2);
+  check(transferResult?.expiresAt.getTime() === originalExpiry);
+  check(await first.transferAppliedGeneration(transferred, 0, opA, transferOp, transferTransport) === null);
+  check(await first.advanceGeneration(transferred, 0, opA, socketA) === null);
+  const afterTransfer = (await a.query("SELECT generation, last_operation_id, last_transport_id FROM room_resume_sessions WHERE id = $1", [transferred.sessionId])).rows[0];
+  check(afterTransfer.generation === 2 && afterTransfer.last_operation_id === transferOp && afterTransfer.last_transport_id === transferTransport);
+  const unproven = await first.issueAfterAuthenticatedJoin("candy986", "Unknown Transfer", 2);
+  assert.ok(unproven);
+  check(await first.transferAppliedGeneration(unproven, 0, opA, transferOp, transferTransport) === null);
+
+  // Actual independent client waits; recheck provenance/revocation/expiry after
+  // the competing mutation commits, not merely before taking the row lock.
+  for (const mode of ["successor", "revoked", "expired", "clock-expired"] as const) {
+    const c = await transferFixture();
+    check(await second.operationOutcome(c, 0, opA) === "own-applied");
+    if (mode === "clock-expired") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '5 seconds' WHERE id = $1", [c.sessionId]);
+    await a.query("BEGIN");
+    await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [c.sessionId]);
+    const pendingTransfer = second.transferAppliedGeneration(c, 0, opA, transferOp, transferTransport);
+    await waitForBlockedSecond();
+    if (mode === "successor") check((await first.advanceGeneration(c, 1, opB, socketB))?.generation === 2);
+    if (mode === "revoked") await a.query("UPDATE room_resume_sessions SET revoked_at = clock_timestamp() WHERE id = $1", [c.sessionId]);
+    if (mode === "expired") await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() WHERE id = $1", [c.sessionId]);
+    if (mode === "clock-expired") await a.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (expires_at - clock_timestamp()))) + 0.05) FROM room_resume_sessions WHERE id = $1", [c.sessionId]);
+    await a.query("COMMIT");
+    check(await pendingTransfer === null);
+    const row = (await a.query("SELECT generation, last_operation_id FROM room_resume_sessions WHERE id = $1", [c.sessionId])).rows[0];
+    check(row.generation === (mode === "successor" ? 2 : 1));
+    check(row.last_operation_id === (mode === "successor" ? opB : opA));
+  }
+  const contendedTransfer = await transferFixture();
+  await a.query("BEGIN");
+  check((await first.transferAppliedGeneration(contendedTransfer, 0, opA, transferOp, transferTransport))?.generation === 2);
+  const losingTransfer = second.transferAppliedGeneration(contendedTransfer, 0, opA, "other_transfer_123", "other_transport_123");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await losingTransfer === null);
+  check((await first.lookup(contendedTransfer))?.generation === 2);
+
+  // Policy wins room lock first: even a previously proven operation is denied.
+  const transferPolicy = await transferFixture();
+  await a.query("BEGIN");
+  await a.query("UPDATE rooms SET auth_version = 99 WHERE id = 'candy986'");
+  const deniedTransfer = second.transferAppliedGeneration(transferPolicy, 0, opA, transferOp, transferTransport);
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  check(await deniedTransfer === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [transferPolicy.sessionId])).rows[0].generation === 1);
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'candy986'");
+  // Transfer wins first: SHARE holds policy updater until transfer commit.
+  const transferFirst = await transferFixture();
+  await a.query("BEGIN");
+  check((await first.transferAppliedGeneration(transferFirst, 0, opA, transferOp, transferTransport))?.generation === 2);
+  const policyAfterTransfer = b.query("UPDATE rooms SET auth_version = 99 WHERE id = 'candy986'");
+  await waitForBlockedSecond();
+  await a.query("COMMIT");
+  await policyAfterTransfer;
+  check(await first.lookup(transferFirst) === null);
+  await a.query("UPDATE rooms SET auth_version = 2 WHERE id = 'candy986'");
+
+
+  const clockCas = await first.issueAfterAuthenticatedJoin("candy986", "Clock CAS", 2);
+  assert.ok(clockCas);
+  await a.query("UPDATE room_resume_sessions SET expires_at = clock_timestamp() + interval '5 seconds' WHERE id = $1", [clockCas.sessionId]);
+  await a.query("BEGIN");
+  await a.query("SELECT id FROM room_resume_sessions WHERE id = $1 FOR UPDATE", [clockCas.sessionId]);
+  const clockPendingCas = second.advanceGeneration(clockCas, 0, opA, socketA);
+  await waitForBlockedSecond();
+  await a.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (expires_at - clock_timestamp()))) + 0.05) FROM room_resume_sessions WHERE id = $1", [clockCas.sessionId]);
+  await a.query("COMMIT");
+  check(await clockPendingCas === null);
+  check((await a.query("SELECT generation FROM room_resume_sessions WHERE id = $1", [clockCas.sessionId])).rows[0].generation === 0);
+  const maximumTransfer = await transferFixture();
+  await a.query("UPDATE room_resume_sessions SET generation = 2147483646 WHERE id = $1", [maximumTransfer.sessionId]);
+  check((await first.transferAppliedGeneration(maximumTransfer, 2147483645, opA, transferOp, transferTransport))?.generation === 2147483647);
+  check(await first.transferAppliedGeneration(maximumTransfer, 2147483646, transferOp, opB, socketB) === null);
+
   // Force a session-row lock wait, then revoke before the pending CAS can run.
   const locked = await first.issueAfterAuthenticatedJoin("candy986", "Locked Guest", 2);
   assert.ok(locked);
@@ -1173,8 +1268,9 @@ try {
 }
 }
 
-main().catch(() => {
+main().catch((error: unknown) => {
   // Do not dump database errors/parameters or bearer values into CI logs.
   console.error("Resume persistence PostgreSQL checks FAILED");
+  if (error instanceof Error) console.error(error.stack?.split("\n").filter(line => /^\s+at /.test(line)).join("\n"));
   process.exitCode = 1;
 });

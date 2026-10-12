@@ -4,6 +4,30 @@ import { randomBytes } from "node:crypto";
 import { hashResumeToken, ResumeStore } from "./resume-store";
 import { claimRoomPolicy } from "./room-policy";
 
+test("atomic transfer rejects malformed or aliased operations before SQL and propagates uncertainty", async () => {
+  let calls = 0;
+  const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);
+  const credential = { roomId: "candy986", sessionId: "b4b7467b-978a-4323-b151-0de94c57d598", token: randomBytes(32).toString("base64url") };
+  const original = "original_operation_123", transfer = "transfer_operation_123", transport = "server_transport_123";
+  for (const generation of [-1, 0.5, NaN, Infinity, 2_147_483_646, 2_147_483_647]) {
+    assert.equal(await store.transferAppliedGeneration(credential, generation, original, transfer, transport), null);
+  }
+  for (const bad of ["", "short", "!".repeat(16), "x".repeat(129), null]) {
+    assert.equal(await store.transferAppliedGeneration(credential, 0, bad as string, transfer, transport), null);
+    assert.equal(await store.transferAppliedGeneration(credential, 0, original, bad as string, transport), null);
+    assert.equal(await store.transferAppliedGeneration(credential, 0, original, transfer, bad as string), null);
+  }
+  for (const bad of [null, { ...credential, token: "bad" }, { ...credential, roomId: "wrong" }]) {
+    assert.equal(await store.transferAppliedGeneration(bad as typeof credential, 0, original, transfer, transport), null);
+  }
+  assert.equal(await store.transferAppliedGeneration(credential, 0, original, original, transport), null);
+  assert.equal(calls, 0);
+  await assert.rejects(store.transferAppliedGeneration(credential, 0, original, transfer, transport), /offline/);
+  await assert.rejects(store.transferAppliedGeneration(credential, 2_147_483_645, original, transfer, transport), /offline/);
+  assert.equal(calls, 2);
+});
+
+
 test("operation outcome rejects malformed requests and propagates database uncertainty", async () => {
   let calls = 0;
   const store = new ResumeStore({ query: async () => { calls++; throw new Error("offline"); } } as never);

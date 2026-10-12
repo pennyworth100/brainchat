@@ -137,26 +137,67 @@ export class ResumeStore {
         typeof transportId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(transportId)) return null;
     const tokenHash = hashResumeToken(credential.token);
     if (!tokenHash) return null;
-    // Room share lock serializes with policy changes/deletion. UPDATE rechecks
-    // the session predicate after any competing updater commits (READ COMMITTED).
+    // Room share lock serializes with policy changes/deletion. Explicitly lock
+    // the session BEFORE wall-clock expiry, including unchanged-row lock waits.
     // Only one bounded operation receipt per session, expiring with the session.
     const result = await this.database.query<ResumeIdentity>(`
       WITH authorized_room AS MATERIALIZED (
         SELECT id, auth_version FROM rooms WHERE id = $3 FOR SHARE
+      ), locked_session AS MATERIALIZED (
+        SELECT s.* FROM room_resume_sessions s JOIN authorized_room r ON r.id = s.room_id
+        WHERE s.id = $1 AND s.token_hash = $2 AND s.auth_version = r.auth_version
+        FOR UPDATE OF s
       )
       UPDATE room_resume_sessions s
-      SET generation = CASE WHEN s.generation = $4 THEN s.generation + 1 ELSE s.generation END,
+      SET generation = CASE WHEN l.generation = $4 THEN l.generation + 1 ELSE l.generation END,
           last_operation_id = $5, last_transport_id = $6
-      FROM authorized_room r
-      WHERE s.id = $1 AND s.token_hash = $2 AND s.room_id = r.id
-        AND s.revoked_at IS NULL AND s.expires_at > clock_timestamp()
-        AND s.auth_version = r.auth_version
-        AND ((s.generation = $4 AND s.last_operation_id IS DISTINCT FROM $5)
-          OR (s.generation = $4 + 1 AND s.last_operation_id = $5 AND s.last_transport_id = $6))
+      FROM locked_session l
+      WHERE s.id = l.id AND l.revoked_at IS NULL AND l.expires_at > clock_timestamp()
+        AND ((l.generation = $4 AND l.last_operation_id IS DISTINCT FROM $5)
+          OR (l.generation = $4 + 1 AND l.last_operation_id = $5 AND l.last_transport_id = $6))
       RETURNING s.id AS "sessionId", s.room_id AS "roomId", s.username,
         s.auth_version AS "authVersion", s.generation,
         s.issued_at AS "issuedAt", s.expires_at AS "expiresAt"
     `, [credential.sessionId, tokenHash, credential.roomId, expectedGeneration, operationId, transportId]);
+    return result.rows[0] ?? null;
+  }
+
+  // Private, single-use transfer of a proven original CAS to a new transport.
+  // No prior observation is trusted: provenance and policy are checked in the
+  // mutation after lock waits. A concurrent successor always defeats transfer.
+  // This deliberately has NO retry-success branch: one retained receipt cannot
+  // authenticate both original and transfer provenance on a repeated request.
+  // Lost transfer ACK remains uncertain; never replace it with a blind fresh CAS.
+  // transportId is server-owned. Success is persistence, NOT socket membership.
+  // Lock in a materialized CTE before evaluating wall-clock expiry: an UPDATE
+  // predicate alone may be evaluated BEFORE an unchanged row's lock wait.
+  async transferAppliedGeneration(credential: ResumeCredential, expectedGeneration: number,
+    originalOperationId: string, transferOperationId: string, transportId: string): Promise<ResumeIdentity | null> {
+    if (!validCredential(credential) || !Number.isInteger(expectedGeneration) ||
+        expectedGeneration < 0 || expectedGeneration > 2_147_483_645 ||
+        [originalOperationId, transferOperationId, transportId].some(value =>
+          typeof value !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(value)) ||
+        originalOperationId === transferOperationId) return null;
+    const tokenHash = hashResumeToken(credential.token);
+    if (!tokenHash) return null;
+    const result = await this.database.query<ResumeIdentity>(`
+      WITH authorized_room AS MATERIALIZED (
+        SELECT id, auth_version FROM rooms WHERE id = $3 FOR SHARE
+      ), locked_session AS MATERIALIZED (
+        SELECT s.* FROM room_resume_sessions s JOIN authorized_room r ON r.id = s.room_id
+        WHERE s.id = $1 AND s.token_hash = $2 AND s.auth_version = r.auth_version
+        FOR UPDATE OF s
+      )
+      UPDATE room_resume_sessions s
+      SET generation = s.generation + 1, last_operation_id = $6, last_transport_id = $7
+      FROM locked_session l
+      WHERE s.id = l.id AND l.revoked_at IS NULL AND l.expires_at > clock_timestamp()
+        AND l.generation = $4 + 1 AND l.last_operation_id = $5
+      RETURNING s.id AS "sessionId", s.room_id AS "roomId", s.username,
+        s.auth_version AS "authVersion", s.generation,
+        s.issued_at AS "issuedAt", s.expires_at AS "expiresAt"
+    `, [credential.sessionId, tokenHash, credential.roomId, expectedGeneration,
+      originalOperationId, transferOperationId, transportId]);
     return result.rows[0] ?? null;
   }
 
