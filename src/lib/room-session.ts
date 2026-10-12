@@ -1,4 +1,5 @@
 import type { Socket } from "socket.io-client";
+import type { UploadAuthority } from "./upload-authority";
 import { transientJoinDelay, type JoinErrorDetails } from "./join-error";
 
 export type ConnectionState = "idle" | "reconnecting" | "syncing" | "ready" | "error";
@@ -227,6 +228,13 @@ export function createRoomSession(
       }
       restart();
       return whenReady();
+    },
+    // The public server still issues legacy joins only. Do not synthesize bearer
+    // authority until reconnect, sync, text, image AND file paths migrate together.
+    uploadAuthority(roomId: string, socketId: string): UploadAuthority | null {
+      if (disposed || !credentials || credentials.roomId !== roomId ||
+          state !== "ready" || !socket.connected || socket.id !== socketId) return null;
+      return Object.freeze({ kind: "legacy", roomId, socketId });
     },
     isReady: () => state === "ready" && socket.connected,
     canRetryText: () => state === "ready" && socket.connected && textOperationKeys,

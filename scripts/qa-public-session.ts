@@ -202,6 +202,7 @@ async function main() {
     // Real client retries exactly once only after the actual pre-body marker.
     let retryRequests = 0, retryReconnects = 0;
     const retryResult = await uploadRoomFile(new File(["retry-proof"], "retry.txt"), created.roomId, {
+      uploadAuthority: (roomId, socketId) => ({ kind: "legacy", roomId, socketId }),
       sync: async () => "stale-socket",
       reconnect: async () => { retryReconnects++; return a.id!; },
     }, async (url, options) => { retryRequests++; return fetch(base + url, options); });
@@ -251,6 +252,26 @@ async function main() {
       "a valid credential is bound to its exact server-owned session, not another room member");
     assert.equal((await upload(a.id!, created.roomId, { ...credentialHeaders, "content-encoding": "gzip" })).status, 400);
     assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    // The real browser uploader sends the complete bearer/key envelope, but
+    // actual server composition is still unavailable. No downgrade or replay.
+    let strictBrowserRequests = 0;
+    await assert.rejects(uploadRoomFile(new File(["private-browser"], "private.txt", { type: "text/plain" }),
+      created.roomId, {
+        sync: async () => a.id!,
+        reconnect: async () => assert.fail("strict browser must not password-rejoin"),
+        uploadAuthority: (roomId, socketId) => ({ kind: "resume", roomId, socketId,
+          sessionId: first.id, token }),
+      }, async (path, options) => {
+        strictBrowserRequests++;
+        const headers = options!.headers as Record<string, string>;
+        assert.equal(headers["x-resume-session-id"], first.id);
+        assert.equal(headers["x-resume-token"], token);
+        assert.match(headers["x-client-message-id"], /^[a-f0-9-]{36}$/);
+        return fetch(base + path, options);
+      }), /not available yet/);
+    assert.equal(strictBrowserRequests, 1);
+    assert.deepEqual(await fs.readdir(process.env.OWNED_UPLOAD_DIR!), credentialBefore);
+    console.log("PUBLIC_BROWSER_UPLOAD_AUTHORITY_PASS: real fetch bearer/key envelope; unavailable composition denies once; no reconnect, downgrade or filesystem mutation");
     const messageCountBefore = (await db.query("SELECT count(*)::int AS n FROM messages")).rows[0].n;
     // A valid credential must not admit the legacy writer when the physical
     // resource pipeline is unprovisioned. Headers only: no body to parse.
