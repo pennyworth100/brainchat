@@ -202,6 +202,11 @@ jobs:
       - name: Durable browser lease journal (real IndexedDB)
         run: node scripts/qa-browser-lease-journal.mjs
 
+      - name: Private negotiated lost-ACK reload recovery (owned PostgreSQL and rendered browser)
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/qa-public-session-fixture.py --private-browser
+
       - name: Rendered mobile-viewport and desktop browser acceptance
         run: node scripts/qa-rendered-browser.mjs
 
