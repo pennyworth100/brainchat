@@ -1,10 +1,10 @@
-import { browserLeaseJournal, type LeaseChange, type LeaseCheckpoint } from "./browser-lease-journal";
+import { browserLeaseJournal, type LeaseChange, type LeaseCheckpoint, type LeaseMutation } from "./browser-lease-journal";
 import { createBrowserResumeController, type BrowserLease } from "./browser-resume-controller";
 
 type Core = ReturnType<typeof createBrowserResumeController>;
 type Ticket = Parameters<Core["accept"]>[0];
 export type LeaseStorage = (scope: string,
-  mutation?: { expectedRevision: string | null; change: LeaseChange }) => Promise<LeaseCheckpoint | undefined>;
+  mutation?: LeaseMutation) => Promise<LeaseCheckpoint | undefined>;
 
 /**
  * PRIVATE composition seam. Caller must use one object per physical socket
@@ -19,6 +19,7 @@ export async function createBrowserDurableResume(scope: string, storage: LeaseSt
   if (saved) core.restore(saved);
   let busy = false, failed = false, epoch = 0;
   let active: object | null = null;
+  let joining: Ticket | null = null;
   const persist = async (change: LeaseChange) => {
     const next = await storage(scope, { expectedRevision: saved?.revision ?? null, change });
     if (!next) throw Error("Missing committed session");
@@ -51,7 +52,19 @@ export async function createBrowserDurableResume(scope: string, storage: LeaseSt
       const ticket = core.beginJoin(roomId, username, physical);
       active = physical;
       await persist({ kind: "join", roomId, username, operationId: ticket.operationId });
+      joining = ticket;
       return ticket;
+    }),
+    joinNotIssued: (ticket: Ticket, physical: object, response: unknown) => ordered(physical, async () => {
+      const r = response as Record<string, unknown> | null;
+      if (active !== physical || joining !== ticket || ticket.kind !== "join" ||
+          !r || r.protocol !== "durable-session-v1" || r.outcome !== "join-not-issued" ||
+          r.operationId !== ticket.operationId || r.roomId !== saved?.roomId ||
+          r.username !== saved?.username) throw Error("Unverified join rejection");
+      const next = await storage(scope, { expectedRevision: saved!.revision,
+        change: { kind: "join-not-issued", operationId: ticket.operationId } });
+      if (next) throw Error("Join rejection was not committed");
+      saved = undefined; joining = null; core.reject(ticket, physical);
     }),
     beginResume: (physical: object) => begin("resume", physical),
     beginTransfer: (physical: object) => begin("transfer", physical),

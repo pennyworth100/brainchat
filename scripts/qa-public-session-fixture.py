@@ -43,7 +43,8 @@ try:
          "--auth-host=trust", "--encoding=UTF8", "--locale=C"]).check_returncode()
     run([pg / "pg_ctl", "-D", data, "-l", owned / "server.log", "-o",
          f"-h 127.0.0.1 -p {port} -k {sock}", "-w", "start"]).check_returncode()
-    script = ("scripts/qa-private-browser-reload.cjs" if "--private-browser" in sys.argv else
+    script = ("scripts/qa-public-browser-reload.cjs" if "--public-browser" in sys.argv else
+              "scripts/qa-private-browser-reload.cjs" if "--private-browser" in sys.argv else
               "scripts/qa-server-database-authorities.ts" if "--database-authorities" in sys.argv else
               "scripts/qa-public-upload-outcome.ts" if "--upload-outcome" in sys.argv else
               "scripts/qa-process-shutdown.ts" if "--shutdown" in sys.argv else

@@ -10,7 +10,7 @@ const origin = new URL(base);
 assert.equal(origin.protocol, 'http:');
 assert.equal(origin.hostname, '127.0.0.1', 'Owned loopback application only');
 assert.equal(origin.username + origin.password, '');
-const browser = await chromium.launch();
+const browser = await chromium.launch(process.env.QA_CHROMIUM_PATH ? { executablePath: process.env.QA_CHROMIUM_PATH } : {});
 const errors = [];
 const joins = [];
 const sent = [];
