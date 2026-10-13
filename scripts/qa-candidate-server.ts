@@ -32,6 +32,16 @@ async function main() {
       await migrator.query("SELECT set_config($1,$2,false),set_config($3,$4,false)",
         ["dimle.cutover_runtime","candidate_runtime","dimle.cutover_maintenance","candidate_maintenance"]);
       const grantSql = await readFile("scripts/production/grant-publication-roles.sql","utf8");
+      const first = (await migrator.query("SELECT id,hash,created_at FROM drizzle.__drizzle_migrations ORDER BY id LIMIT 1")).rows[0];
+      for (const column of ["hash","created_at"] as const) {
+        await migrator.query(`UPDATE drizzle.__drizzle_migrations SET ${column}=$1 WHERE id=$2`,
+          [column === "hash" ? "wrong" : String(BigInt(first.created_at)+1n),first.id]);
+        await assert.rejects(migrator.query(grantSql), /Exact release migration history required/);
+        await migrator.query("ROLLBACK");
+        assert.equal((await migrator.query("SELECT has_table_privilege($1,$2,$3) AS allowed",
+          ["candidate_runtime","messages","INSERT"])).rows[0].allowed,false);
+        await migrator.query(`UPDATE drizzle.__drizzle_migrations SET ${column}=$1 WHERE id=$2`,[first[column],first.id]);
+      }
       // One dirty column grant must reject the entire plan without partial grants.
       await migrator.query("GRANT SELECT(used_rows) ON message_write_budget TO candidate_runtime");
       await assert.rejects(migrator.query(grantSql), /preexisting application privileges/);
@@ -116,6 +126,7 @@ async function main() {
     console.log(JSON.stringify({status:"PASS",actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
       invalidCARejectedBeforeMigration:true,badPasswordRejectedBeforeMigration:true,elevatedRoleRejectedBeforeMigration:true,
       foreignDatabaseRejectedBeforeMigration:true,budgetColumnGrantRejectedBeforeMigration:true,
+      exactGrantHistory:true,wrongHashAndTimestampRefusedBeforeGrants:true,
       roomCreated:true,oneSettledShutdown:true,noRemainingCandidateBackends:true,
       scramAuthentication:true,offlineProductionInstaller:true,offlineRoleGrants:true,dirtyColumnGrantRefused:true,publicGrantRefused:true,inheritingRoleRefused:true,runtimeMessageClosed:true,grantReplayRefused:true,closedBudgetPreserved:true,limitations:"owned TLS+SCRAM cluster; not managed-provider ACL/TLS attestation"}));
   } finally { if (child && child.exitCode===null) child.kill("SIGKILL"); await admin.end(); }

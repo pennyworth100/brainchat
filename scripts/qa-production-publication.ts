@@ -20,7 +20,44 @@ async function rejected(code?: string) {
 }
 try {
   await migrateDatabase(pool);
+  const history = (await pool.query("SELECT id,hash,created_at FROM drizzle.__drizzle_migrations ORDER BY id")).rows;
+  // Same row count is NOT compatibility: changed hash/time, missing history,
+  // and duplicate rows must fail before any publication object is created.
+  for (const mutation of [
+    "UPDATE drizzle.__drizzle_migrations SET hash='wrong' WHERE id=(SELECT min(id) FROM drizzle.__drizzle_migrations)",
+    "UPDATE drizzle.__drizzle_migrations SET created_at=created_at+1 WHERE id=(SELECT min(id) FROM drizzle.__drizzle_migrations)",
+    "DELETE FROM drizzle.__drizzle_migrations WHERE id=(SELECT max(id) FROM drizzle.__drizzle_migrations)",
+    "INSERT INTO drizzle.__drizzle_migrations(hash,created_at) SELECT hash,created_at FROM drizzle.__drizzle_migrations LIMIT 1",
+  ]) {
+    await pool.query(mutation);
+    await assert.rejects(installer.query(sql), /Exact release migration history required/);
+    await installer.query("ROLLBACK");
+    for (const table of tables)
+      assert.equal((await pool.query("SELECT to_regclass($1) AS n", ["public."+table])).rows[0].n,null);
+    await pool.query("DELETE FROM drizzle.__drizzle_migrations");
+    for (const row of history) await pool.query("INSERT INTO drizzle.__drizzle_migrations(id,hash,created_at) VALUES ($1,$2,$3)", [row.id,row.hash,row.created_at]);
+  }
   await pool.query("INSERT INTO rooms(id) VALUES ('cutover')");
+  // A committed drift arriving during lock wait must not be hidden by an
+  // inherited REPEATABLE READ snapshot taken earlier in the transaction.
+  await installer.query("SET default_transaction_isolation = 'repeatable read'");
+  await writer.query("BEGIN");
+  await writer.query("UPDATE drizzle.__drizzle_migrations SET hash='concurrent-drift' WHERE id=$1",[history[0].id]);
+  const historyPid = (await installer.query("SELECT pg_backend_pid() AS id")).rows[0].id;
+  const driftRejected = assert.rejects(installer.query(sql), /Exact release migration history required/);
+  let historyBlocked = false;
+  for (let i=0; i<100; i++) {
+    if ((await pool.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",[historyPid])).rows[0]?.wait_event_type === "Lock") {
+      historyBlocked = true; break;
+    }
+    await new Promise(r=>setTimeout(r,10));
+  }
+  assert.ok(historyBlocked,"installer must wait for in-flight history edits");
+  await writer.query("COMMIT");
+  await driftRejected;
+  await installer.query("ROLLBACK");
+  assert.equal((await pool.query("SELECT to_regclass('public.message_write_budget') AS n")).rows[0].n,null);
+  await pool.query("UPDATE drizzle.__drizzle_migrations SET hash=$1 WHERE id=$2",[history[0].hash,history[0].id]);
   await pool.query("INSERT INTO messages(room_id,username,content) VALUES ('cutover','old','before')");
   // A partial/preexisting installation must not reset budgets or leave half a schema.
   await pool.query("CREATE TABLE publication_admission(id integer PRIMARY KEY); INSERT INTO publication_admission VALUES (77)");
@@ -75,6 +112,7 @@ try {
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n,11);
   console.log(JSON.stringify({status:"PASS",tables:6,backfilled:2,closed:true,oldWriterWait:true,
     partialRollback:true,nonOwnerRefused:true,ambientGrantsRefused:true,replayRefused:true,runtimeQuotaDenied:true,
+    concurrentHistoryDriftRefused:true,exactMigrationHistory:true,wrongHashRefused:true,wrongTimestampRefused:true,missingHistoryRefused:true,duplicateHistoryRefused:true,
     startupMigrationsUnchanged:11,productionApplied:false}));
 } finally {
   await writer.query("ROLLBACK").catch(()=>{});

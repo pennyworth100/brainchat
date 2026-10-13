@@ -1,4 +1,4 @@
-# Offline publication schema installation (3.0.38)
+# Offline publication schema installation (3.0.39)
 
 `scripts/production/install-publication-closed.sql` is an explicit **owner-only
 cutover installer**, not an application startup migration. No production
@@ -18,6 +18,15 @@ installation or activation is implied by its inclusion in the release.
   procedure; it deliberately fails instead of overwriting existing state.
 
 ## Guarantees and limits
+
+Both offline transactions now require the exact eleven release migration
+SHA-256 hashes and timestamps, comparing both directions with `EXCEPT ALL`.
+Missing, duplicate or changed history is refused before schema/grant mutation;
+a table lock protects the history check until commit. Updating this release
+baseline requires deliberate review and real PostgreSQL acceptance. This is
+history verification, **not** independent attestation that nobody altered live
+schema objects after migration. Full catalog/schema integrity verification and
+the production startup composition remain required.
 
 The transaction acquires the shared migration advisory namespace and locks
 rooms, messages and resume sessions against concurrent mutation. The existing

@@ -21,6 +21,31 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'Publication installer requires the existing table owner';
   END IF;
+  -- Exact release history, not a row-count proxy for compatibility. The shared
+  -- advisory lock coordinates migration tools; this lock also fences SQL edits.
+  LOCK TABLE drizzle.__drizzle_migrations IN SHARE MODE;
+  IF EXISTS (
+    WITH expected(hash,created_at) AS (VALUES
+      ('913a9faea74504034f6a01494735b1defa0e897bca5931b49d0c275058175673', 1773719287776::bigint),
+      ('590e22ddc593733f18561d8f518a0370728f9e93adc91eb01693b5f696165713', 1790964448488::bigint),
+      ('9d565c00dc53b87a1297fe8c484f5409045d32f8c1fe2ce70469c440cb496b39', 1790964590623::bigint),
+      ('c9c819dd363ebcebd0a8c82f2ff11995a3bdb7e8776b070cf17abd973553d5ec', 1791428478021::bigint),
+      ('3d125e3a93ff3d523a6035e583f769acd842b710919abc86509f92950acd1fba', 1791497873756::bigint),
+      ('23cd023887f7fdeb3ca304bd2a794bde4a079beed692e60ed2458c35abc8aab5', 1791499083632::bigint),
+      ('2bf24e48f7016de8651ad23c0cea3c0247f12d5e76ea46b49658ea134cc7edfd', 1791505380692::bigint),
+      ('854baac20541606365f9bfce15584b100b9f183c854afd99e7b503dd6ec7f27f', 1791506670335::bigint),
+      ('33a4d66ae0f1e228f601d41dbdd93eb10fcd44769488cc171a10c71f5accdfc5', 1791564893022::bigint),
+      ('8838d2eacc7cdd4e6f9eb701a72db374dc696c81f4d436c85d30eb983c257e8d', 1791612755512::bigint),
+      ('3182b2d5e66728bf27111f0351ce9e5c9a83fd17bc69bb6390425a272850efe6', 1791702805970::bigint)
+    ), actual AS (SELECT hash,created_at FROM drizzle.__drizzle_migrations)
+    SELECT 1 FROM (
+      (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+      UNION ALL
+      (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+    ) AS mismatch
+  ) THEN
+    RAISE EXCEPTION $reason$Exact release migration history required$reason$;
+  END IF;
 END
 $$;
 CREATE TABLE public.message_write_budget (
