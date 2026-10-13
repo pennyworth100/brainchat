@@ -17,6 +17,7 @@ import { ResumeSessionScheduler } from "./src/lib/resume-session-scheduler";
 import { installProcessShutdown } from "./src/lib/process-shutdown";
 import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
 import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
+import { SettledServerStartupError } from "./src/lib/server-startup-error";
 import { consumeJoinLimits } from "./src/lib/join-rate-limits";
 import { prepareDatabaseStartup, type MigrationAuthorities, type PreinstalledAuthorities } from "./src/lib/db/database-startup";
 import { db, pool } from "./src/lib/db";
@@ -242,7 +243,11 @@ export async function main(options: Readonly<{
   // Runtime-only path. A trusted release composition must supply its verifier;
   // no CLI/env activation or successful production preflight is implied.
   preinstalledAuthorities?: PreinstalledAuthorities;
+  // Trusted composition: recheck the SAME activation lease after all async
+  // preparation, immediately before binding HTTP. Not an environment switch.
+  beforeListen?: () => Promise<void>;
 }> = {}) {
+  const beforeListen = options.beforeListen;
   if (options.privateBrowserResume && !(options.databaseAuthorities?.publicationTables ||
       options.preinstalledAuthorities?.publicationTables)) {
     throw Error("Private browser protocol requires isolated publication authorities");
@@ -970,6 +975,7 @@ export async function main(options: Readonly<{
     return handle(req, res);
   });
 
+  await beforeListen?.();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(PORT, () => { server.off("error", reject); resolve(); });
@@ -982,7 +988,7 @@ export async function main(options: Readonly<{
     await strictFiles.close();
     await new Promise<void>(resolve => io.close(() => resolve()));
     await app.close();
-    throw error;
+    throw new SettledServerStartupError(error);
   }
 }
 

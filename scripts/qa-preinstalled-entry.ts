@@ -28,12 +28,19 @@ async function start() {
       verify: async () => {
         console.log("Fixture preflight pending");
         const decision = await new Promise(resolve => process.once("message", resolve));
-        assert.ok(decision === "verify" || decision === "lose-lease", "fixture verification rejected");
+        assert.ok(decision === "verify" || decision === "lose-lease" || decision === "late-gate" ||
+          decision === "late-loss", "fixture verification rejected");
         let checks = 0;
         return { assertHeld: async () => {
           // Deliberate fixture lease loss AFTER actual identity checks.
           checks++;
           assert.ok(decision !== "lose-lease" || checks < 2, "fixture lease lost");
+          assert.ok(decision !== "late-loss" || checks < 4, "fixture final lease lost");
+          if (decision === "late-gate" && checks === 3) {
+            console.log("Fixture before-listen pending");
+            assert.equal(await new Promise(resolve => process.once("message", resolve)), "continue",
+              "fixture before-listen rejected");
+          }
         } };
       },
     });

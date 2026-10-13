@@ -200,6 +200,34 @@ async function main() {
       await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
       await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
       assert.ok(!leaseLost.output().includes("Running database migrations"));
+      // The initial gate passed, but Next/provider preparation is not a lease.
+      // Hold the ACTUAL before-listen boundary; no HTTP port may be bound.
+      for (const mode of ["reject", "drift", "late-loss"] as const) {
+        const lateEnv = {...runtimeEnv, UPLOAD_DIR: dir+"/late-"+mode};
+        const late = launch(lateEnv, "scripts/qa-preinstalled-entry.ts");
+        await until(() => late.output().includes("Fixture preflight pending"));
+        child!.send(mode === "late-loss" ? "late-loss" : "late-gate");
+        if (mode !== "late-loss") {
+          await until(() => late.output().includes("Fixture before-listen pending"));
+          await access(lateEnv.UPLOAD_DIR);
+          await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
+        }
+        if (mode === "drift") await audit.query("GRANT USAGE ON SCHEMA drizzle TO candidate_runtime");
+        try {
+          if (mode !== "late-loss") child!.send(mode === "reject" ? "reject" : "continue");
+          // A retained pool would keep the child alive: require actual exit,
+          // no force-kill, as well as zero remaining authority backends.
+          await until(() => child!.exitCode !== null);
+          assert.equal(await late.exited, 1);
+          assert.ok(!late.output().includes("Dimle running"));
+          await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
+          await until(async () => !(await audit.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate' AND usename IN ('candidate_runtime','candidate_maintenance')")).rowCount);
+          assert.deepEqual((await audit.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows, history);
+          assert.deepEqual((await audit.query("SELECT * FROM message_write_budget")).rows, budget);
+        } finally {
+          if (mode === "drift") await audit.query("REVOKE USAGE ON SCHEMA drizzle FROM candidate_runtime");
+        }
+      }
       const preinstalled = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
       await until(() => preinstalled.output().includes("Fixture preflight pending"));
       await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
@@ -221,6 +249,9 @@ async function main() {
       preinstalledRuntime:true,actualProductionRuntimeModule:true,noMigratorCredentials:true,
       productionIdentityDriftAfterGateRejected:true,productionStopPromiseRetained:true,
       activationLeaseLossAfterIdentityBlocksFilesystemAndListener:true,
+      finalLeaseGatePendingBlocksListener:true,finalLeaseRejectionSettlesStartup:true,
+      privilegeDriftDuringFinalGateRejected:true,leaseLossAfterFinalIdentitiesRejected:true,
+      lateFailureClosesAuthorityPoolsAfterSettlement:true,
       pendingVerifierBlocksFilesystemAndListener:true,rejectedVerifierBlocksStartup:true,
       runtimeHasNoHistoryOrDDLPrivileges:true,historyAndClosedBudgetUnchanged:true,
       actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
