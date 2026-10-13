@@ -2,6 +2,9 @@
 -- Requires independently checked whole-catalog fingerprint/owners/ACLs first.
 -- Set dimle.cutover_runtime/maintenance on a real restricted owner connection.
 -- Snapshot evidence ONLY: no persistent DDL fence, TLS or runtime startup proof.
+-- FENCED mode is read-only too: caller retains the operator session lock and
+-- temporarily uses SET SESSION AUTHORIZATION to the NOLOGIN restricted owner.
+-- This mode never reopens a role and is NOT authorization to activate.
 -- Foreign DB CONNECT and PUBLIC/inherited/column privileges are effective checks.
 BEGIN READ ONLY;
 -- No durable DDL fence is claimed; this audit does not authorize activation.
@@ -14,10 +17,14 @@ DO $$
 DECLARE
   runtime_name text := current_setting('dimle.cutover_runtime', true);
   maintenance_name text := current_setting('dimle.cutover_maintenance', true);
+  audit_state text := COALESCE(NULLIF(current_setting('dimle.cutover_state', true), ''), 'LOGIN');
   target text;
   target_oid oid;
   obj record; privilege text; expected boolean; actual boolean; column_name text;
 BEGIN
+  IF audit_state NOT IN ('LOGIN','FENCED') THEN
+    RAISE EXCEPTION 'Adoption state invalid';
+  END IF;
   IF runtime_name IS NULL OR maintenance_name IS NULL OR runtime_name = maintenance_name
      OR current_user IN (runtime_name, maintenance_name) THEN
     RAISE EXCEPTION 'Distinct explicit cutover roles required';
@@ -27,6 +34,16 @@ BEGIN
       AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls OR r.rolinherit)
       AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=r.oid)) THEN
     RAISE EXCEPTION 'Restricted database owner required';
+  END IF;
+  IF audit_state='FENCED' AND (
+      NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
+        AND pid=pg_backend_pid() AND granted AND mode='ExclusiveLock'
+        AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+        AND classid=1145654604 AND objid=2 AND objsubid=2)
+      OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=current_user
+        AND NOT rolcanlogin AND rolvaliduntil>clock_timestamp()
+        AND rolvaliduntil<=clock_timestamp()+interval '24 hours')) THEN
+    RAISE EXCEPTION 'Adoption fenced owner/session lock required';
   END IF;
   -- Exact release history, not a row-count proxy for compatibility. The shared
   -- advisory lock coordinates participating migration tools only.
@@ -63,8 +80,10 @@ BEGIN
     RAISE EXCEPTION 'Closed publication budget required';
   END IF;
   FOREACH target IN ARRAY ARRAY[runtime_name,maintenance_name] LOOP
-    SELECT oid INTO target_oid FROM pg_roles WHERE rolname=target AND rolcanlogin
+    SELECT oid INTO target_oid FROM pg_roles WHERE rolname=target
+      AND rolcanlogin=(audit_state='LOGIN')
       AND rolvaliduntil > clock_timestamp()
+      AND (audit_state<>'FENCED' OR rolvaliduntil<=clock_timestamp()+interval '24 hours')
       AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit);
     IF target_oid IS NULL OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=target_oid OR roleid=target_oid)
       OR EXISTS(SELECT 1 FROM pg_database WHERE datdba=target_oid)
