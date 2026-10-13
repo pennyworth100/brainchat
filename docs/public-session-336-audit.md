@@ -21,7 +21,7 @@ Reports: workspace artifacts/dimle/public336-*-verified.json and public336-audit
 Initial extended attachment harness failed because its request counter watched /upload instead of /api/upload. Failure retained in public336-public-browser-final.json. Corrected test additionally awaits actual HTTP503 and passes byte/ID/draft/no-replay checks.
 
 ## Material remaining gates — do not activate production
-1. Public recovery UX parity needs completion: a rejected initial password join currently leaves a conservative lease-less join intent, so corrected-password retry needs a proven non-issuance/authentication path (never discard an uncertain issued session). Existing private behavior must not become a public lockout.
+1. Wrong-password retry is now fixed and proven (below). Other explicit pre-issuance refusals (rate limit, unclaimed/missing room, validation) still need the same reviewed non-issuance treatment; generic failures and missing ACK must remain uncertain.
 2. Durable join/resume presence notifications need review: server's durable publishJoin deliberately omits the legacy presence broadcast and publishedBinding handling. Verify multi-user online counts/leave and DM after resume before activation.
 3. Verify this exact public integration on managed Railway. This report is LOCAL evidence, not managed, physical iPhone or Safari acceptance.
 4. Strict physical upload/download provider remains unprovisioned. Disabled provider HTTP503 is not a successful attachment path or storage-capacity proof.
@@ -29,3 +29,12 @@ Initial extended attachment harness failed because its request counter watched /
 After those technical gates PASS, perform the already-authorized production cutover without another GO request.
 No production deployment, restart, data mutation, or provider-support message was performed by this patch.
 
+## 2026-10-12 follow-up: wrong-password recovery and CI fixture repair
+
+- Exact physical socket ACK binds protocol, room, username and original join operation ID. Server emits it only in the wrong-password branch before session issuance.
+- Only an exact, lease-less join intent can be cleared, under its original IndexedDB revision CAS and strict transaction completion. Issued, stale, mismatched or uncertain owners cannot be discarded. No pending payload is touched.
+- Actual built public Chrome/PostgreSQL test: wrong password leaves zero sessions and returns the password form; corrected password produces exactly one session. Dropped rejection ACK retains byte-identical journal after reload, and a corrected password cannot silently replace that uncertain owner.
+- Ten real public browser scenarios PASS, retaining the original one-send/one-row/one-receipt lost-message-ACK proof. Thirteen actual IndexedDB scenarios PASS, including deletion transaction abort and stale-revision protection. Fourteen controlled legacy outbox scenarios and five actual legacy rendered scenarios PASS.
+- 1077 application + 5 plugin tests, build and typecheck PASS; production dependency audit reports zero vulnerabilities.
+- Prior head cbe4b54 CI was NOT green: both verify jobs failed in the controlled legacy outbox fixture, which lacked the new capability endpoint. Fixture now explicitly advertises legacy and proves IndexedDB denial blocks even the authentication send (not only upload). Product downgrade protections were not relaxed.
+- Retained initial local failures: ambiguous Wrong password locator; old outbox assertion expected a post-join warning despite the new pre-join storage gate. Corrected assertions pass. Evidence: workspace artifacts/dimle/public336-rejection-{browser-final,journal-verified,outbox-verified,legacy,tests,build,typecheck,audit}.json. New-head CI must be evaluated separately.

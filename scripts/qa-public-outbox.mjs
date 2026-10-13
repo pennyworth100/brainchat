@@ -8,11 +8,14 @@ import { chromium, expect } from "@playwright/test";
 
 const app = next({ dev: false, hostname: "127.0.0.1", dir: process.cwd() });
 await app.prepare();
-let uploads = 0, sends = 0;
+let uploads = 0, sends = 0, joins = 0;
 let failPreflightFor = "";
 let releaseAck;
 const server = createServer((req, res) => {
-  if (req.url === "/api/upload") {
+  if (req.url === "/api/browser-session-mode") {
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify({ mode: "legacy" })); // This fixture implements only the legacy wire.
+  } else if (req.url === "/api/upload") {
     uploads++;
     req.resume();
     req.on("end", () => { res.writeHead(503, { "content-type": "application/json" });
@@ -24,6 +27,7 @@ io.on("connection", socket => {
   let username = "";
   const snapshot = () => ({ history: [], users: [username] });
   socket.on("join-room", data => {
+    joins++;
     username = data.username;
     if (failPreflightFor === username) {
       failPreflightFor = "";
@@ -131,6 +135,7 @@ try {
 
 
   const deniedContext = await browser.newContext();
+  const joinsBeforeDenied = joins;
   await deniedContext.addInitScript(() => {
     IDBFactory.prototype.open = () => { throw new DOMException("Denied", "SecurityError"); };
   });
@@ -140,11 +145,11 @@ try {
   await denied.getByLabel("Username", { exact: true }).fill("Denied");
   await denied.getByLabel("Room password (if any)", { exact: true }).fill("fixture-only");
   await denied.getByRole("button", { name: "Join Chat", exact: true }).click();
-  await expect(denied.getByRole("alert", { name: "Delivery status" })).toContainText("Sending is blocked");
+  await expect(denied.getByRole("status")).toHaveText("Denied");
+  await expect(denied.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
   await denied.locator("input[type=file]").setInputFiles({ name: "denied.png", mimeType: "image/png", buffer: bytes });
-  await expect(denied.getByText(/Upload failed: denied.png.*Nothing was sent/)).toBeVisible();
-  assert.equal(uploads, 1);
-  checks.push("denied IndexedDB fails closed before upload");
+  assert.equal(uploads, 1); assert.equal(joins, joinsBeforeDenied);
+  checks.push("denied IndexedDB now fails closed before legacy authentication and upload; no downgrade without saved-owner check");
   await deniedContext.close();
 
   const quotaContext = await browser.newContext();

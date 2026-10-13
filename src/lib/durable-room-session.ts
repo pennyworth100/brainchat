@@ -50,6 +50,7 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
   const connect = async () => {
     if (disposed || busy || !credentials) throw Error("Session is unavailable or busy");
     busy = true;
+    let joinNotIssued = false;
     try {
       fail(); socket.disconnect(); callbacks.onState("reconnecting");
       const owner = {}, c = { ...credentials };
@@ -78,7 +79,12 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
       let ticket: Parameters<typeof next.accept>[0], response: any;
       if (phase === "empty") {
         ticket = await next.beginJoin(c.roomId, c.username, owner);
-        response = await rpc("join-room", c, owner);
+        response = await rpc("join-room", { ...c, operationId: ticket.operationId }, owner);
+        if (response?.outcome === "join-not-issued") {
+          await next.joinNotIssued(ticket, owner, response);
+          joinNotIssued = true;
+          throw Error(typeof response.error === "string" ? response.error : "Join rejected");
+        }
       } else {
         const attempt = phase === "offline" ? await next.beginResume(owner) : await next.beginTransfer(owner);
         ticket = attempt.ticket;
@@ -119,7 +125,7 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
       return socket.id!;
     } catch (error) {
       fail(); socket.disconnect();
-      if (!disposed) callbacks.onError(error instanceof Error ? error.message : "Session unavailable", false);
+      if (!disposed) callbacks.onError(error instanceof Error ? error.message : "Session unavailable", joinNotIssued);
       throw error;
     } finally { busy = false; }
   };

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBrowserDurableResume as create, type LeaseStorage } from "./browser-durable-resume";
-import { advanceLeaseCheckpoint as advance, type LeaseCheckpoint } from "./browser-lease-journal";
+import { advanceLeaseCheckpoint as advance, assertUnissuedJoin, type LeaseCheckpoint } from "./browser-lease-journal";
 import { createBrowserResumeController } from "./browser-resume-controller";
 const id = () => crypto.randomUUID();
 const lease = { roomId: "proof123", username: "Owner", sessionId: id(),
@@ -13,7 +13,9 @@ function disk() {
     if (mutation) {
       await gate;
       if (fail) throw Error("Disk unavailable");
-      row = advance(row, mutation.expectedRevision, mutation.change, id(), 1000);
+      if (mutation.change.kind === "join-not-issued") {
+        assertUnissuedJoin(row, mutation.expectedRevision, mutation.change.operationId); row = undefined;
+      } else row = advance(row, mutation.expectedRevision, mutation.change, id(), 1000);
     }
     return structuredClone(row);
   };
@@ -21,6 +23,24 @@ function disk() {
     gate: (value: Promise<void> | undefined) => { gate = value; },
     open: () => create("owner", storage, id, () => 1000) };
 }
+test("only exact live non-issuance ACK clears intent; uncertain and issued owners survive", async () => {
+  for (const mode of ["exact", "wrong-key", "stale", "issued", "disk-fail"] as const) {
+    const d = disk(), c = await d.open(), p = {}, ticket = await c.beginJoin(lease.roomId, lease.username, p);
+    const response = { protocol: "durable-session-v1", outcome: "join-not-issued", roomId: lease.roomId,
+      username: lease.username, operationId: ticket.kind === "join" ? ticket.operationId : "" };
+    if (mode === "wrong-key") response.operationId = id();
+    if (mode === "issued") await c.accept(ticket, p, lease);
+    if (mode === "disk-fail") d.fail();
+    const before = d.row();
+    if (mode === "exact") {
+      await c.joinNotIssued(ticket, p, response); assert.equal(d.row(), undefined);
+      await (await d.open()).beginJoin(lease.roomId, lease.username, {});
+    } else {
+      await assert.rejects(c.joinNotIssued(ticket, mode === "stale" ? {} : p, response));
+      assert.deepEqual(d.row(), before);
+    }
+  }
+});
 async function joined(d: ReturnType<typeof disk>) {
   const c = await d.open(), physical = {};
   const ticket = await c.beginJoin(lease.roomId, lease.username, physical);

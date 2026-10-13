@@ -9,6 +9,15 @@ export type LeaseChange =
   | { kind: "join"; roomId: string; username: string; operationId: string }
   | { kind: "resume" | "transfer"; operationId: string }
   | { kind: "accept"; lease: BrowserLease };
+export type LeaseMutation = { expectedRevision: string | null; change: LeaseChange |
+  { kind: "join-not-issued"; operationId: string } };
+export function assertUnissuedJoin(current: LeaseCheckpoint | undefined, expectedRevision: string | null,
+  operationId: string) {
+  if (current) validateLeaseCheckpoint(current);
+  if (!current || current.revision !== expectedRevision || current.lease !== null ||
+      current.attempt?.kind !== "join" || current.attempt.operationId !== operationId)
+    throw Error("Cannot clear an uncertain or different session");
+}
 const key = (value: unknown): value is string =>
   typeof value === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(value);
 const generation = (n: number) => Number.isSafeInteger(n) && n >= 1 && n <= 2_147_483_647;
@@ -82,11 +91,12 @@ export function advanceLeaseCheckpoint(current: LeaseCheckpoint | undefined, exp
  * PRIVATE migration primitive. Commit BEFORE any transport effect; resolve ONLY
  * on strict transaction completion. An interrupted resume remains uncertain and
  * may only enter one explicit server transfer, never another automatic resume.
- * No deletion, expiry extension, token invention, payload settlement or replay.
+ * Only exact server-confirmed non-issuance can clear a lease-less join intent.
+ * No issued-lease deletion, expiry extension, token invention, payload settlement or replay.
  * Same-origin storage is not an authentication or cloned-tab security boundary.
  */
 export async function browserLeaseJournal(scope: string,
-  mutation?: { expectedRevision: string | null; change: LeaseChange },
+  mutation?: LeaseMutation,
   factory: IDBFactory = indexedDB, now = Date.now): Promise<LeaseCheckpoint | undefined> {
   if (!scope || scope.length > 1024) throw Error("Invalid local owner scope");
   // Snapshot caller input before the first await; later edits cannot change admission.
@@ -111,6 +121,10 @@ export async function browserLeaseJournal(scope: string,
           result = request.result;
           if (result) validateLeaseCheckpoint(result);
           if (!input) return;
+          if (input.change.kind === "join-not-issued") {
+            assertUnissuedJoin(result, input.expectedRevision, input.change.operationId);
+            store.delete(scope); result = undefined; return;
+          }
           const next = advanceLeaseCheckpoint(result, input.expectedRevision, input.change, crypto.randomUUID(), now());
           const put = () => { result = next; store.put(next, scope); };
           if (result) put();

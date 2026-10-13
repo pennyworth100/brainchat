@@ -751,11 +751,13 @@ export async function main(options: Readonly<{
         username,
         password,
         creationToken,
+        operationId,
       }: {
         roomId: string;
         username: string;
         password?: string;
         creationToken?: string;
+        operationId?: string;
       }, ack?: (value: unknown) => void) => {
         if (privateBrowser && typeof ack !== "function") return;
         if (typeof rawRoomId !== "string" || !rawRoomId || !username) return;
@@ -802,6 +804,12 @@ export async function main(options: Readonly<{
             room.passwordHash &&
             !(await verifyPassword(room.passwordHash, password || ""))
           ) {
+            // Exact rejection only before owner issuance; generic failures stay uncertain.
+            if (privateBrowser && typeof operationId === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(operationId)) {
+              ack!({ protocol: PRIVATE_BROWSER_PROTOCOL, outcome: "join-not-issued",
+                roomId, username, operationId, error: "Wrong password" });
+              return;
+            }
             socket.emit("join-error", "Wrong password");
             return;
           }

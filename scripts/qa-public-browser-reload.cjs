@@ -37,6 +37,15 @@ async function main() {
   const page=await context.newPage();page.on("pageerror",e=>errors.push(e.message));
   await page.goto(base+"/room?id=wire335");
   await page.getByLabel("Username",{exact:true}).fill("OriginalOwner");
+  await page.getByLabel("Room password (if any)",{exact:true}).fill("wrong-password");
+  await page.getByRole("button",{name:"Join Chat"}).click();
+  await expect(page.getByRole("status")).toHaveText("Wrong password",{timeout:10000});
+  await expect(page.getByRole("button",{name:"Join Chat"})).toBeVisible();
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions")).rows[0].n,0);
+  const journalCount=await page.evaluate(async()=>{const db=await new Promise((resolve,reject)=>{const r=indexedDB.open("dimle-browser-lease-v1",1);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});try{return await new Promise((resolve,reject)=>{const r=db.transaction("leases").objectStore("leases").count();r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}finally{db.close()}});
+  assert.equal(journalCount,0);
+  checks.push("wrong password exact non-issuance ACK clears initial intent; zero sessions; corrected-password form restored");
+  await page.getByLabel("Username",{exact:true}).fill("OriginalOwner");
   await page.getByLabel("Room password (if any)",{exact:true}).fill("private-fixture-password");
   await page.getByRole("button",{name:"Join Chat"}).click();
   await expect(page.getByRole("status")).toContainText("online",{timeout:15000});
@@ -103,6 +112,34 @@ async function main() {
   assert.deepEqual(await savedAttachment(),beforeAttachment);
   assert.equal(sends,1);assert.equal(uploads,1);
   checks.push("server capability downgrade refuses password fallback; original session and UNKNOWN bytes unchanged");
+  // Losing a refusal ACK must NOT authorize password retry or erase provenance.
+  const uncertain=await browser.newContext(); let refused=0;
+  await uncertain.routeWebSocket("**/*",ws=>{
+    const upstream=ws.connectToServer(); ws.onMessage(data=>upstream.send(data));
+    upstream.onMessage(data=>{if(String(data).includes('"join-not-issued"')){refused++;return}ws.send(data)});
+  });
+  const uncertainPage=await uncertain.newPage();
+  const uncertainJournal=()=>uncertainPage.evaluate(async()=>{
+    const db=await new Promise((resolve,reject)=>{const r=indexedDB.open("dimle-browser-lease-v1",1);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});
+    try{return await new Promise((resolve,reject)=>{const r=db.transaction("leases").objectStore("leases").getAll();r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}finally{db.close()}
+  });
+  await uncertainPage.goto(base+"/room?id=wire335");
+  await uncertainPage.getByLabel("Username",{exact:true}).fill("UncertainOwner");
+  await uncertainPage.getByLabel("Room password (if any)",{exact:true}).fill("wrong-password");
+  await uncertainPage.getByRole("button",{name:"Join Chat"}).click();
+  await expect(uncertainPage.getByRole("button",{name:"Retry",exact:true})).toBeVisible({timeout:10000});
+  assert.equal(refused,1);
+  const retained=await uncertainJournal(); assert.equal(retained.length,1);assert.equal(retained[0].lease,null);
+  await uncertainPage.reload();
+  await uncertainPage.getByLabel("Username",{exact:true}).fill("UncertainOwner");
+  await uncertainPage.getByLabel("Room password (if any)",{exact:true}).fill("private-fixture-password");
+  await uncertainPage.getByRole("button",{name:"Join Chat"}).click();
+  await expect(uncertainPage.getByRole("button",{name:"Retry",exact:true})).toBeVisible({timeout:10000});
+  assert.deepEqual(await uncertainJournal(),retained);
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions")).rows[0].n,1);
+  assert.equal(refused,1);
+  checks.push("lost non-issuance ACK retains exact lease-less journal across reload; corrected password cannot issue replacement");
+  await uncertain.close();
   const bad=await browser.newContext(),badpage=await bad.newPage();
   await badpage.addInitScript(()=>{const put=IDBObjectStore.prototype.put;IDBObjectStore.prototype.put=function(...args){const result=put.apply(this,args);this.transaction.abort();return result}});
   await badpage.goto(base+"/room?id=wire335");

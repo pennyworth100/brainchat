@@ -172,6 +172,29 @@ try {
   assert.equal(abortedComposition.effects, 0); assert.equal(abortedComposition.row, undefined);
   assert.equal(abortedComposition.status.persistenceFailed, true);
   checks.push("composed actual IndexedDB abort prevents admission and fences in-memory controller");
+  const rejected = await composedPage.evaluate(async () => {
+    const c = await durableAPI.createBrowserDurableResume("refusal"), p = {};
+    const ticket = await c.beginJoin("proof123", "Owner", p);
+    const before = await leaseAPI.browserLeaseJournal("refusal");
+    const response = { protocol: "durable-session-v1", outcome: "join-not-issued",
+      roomId: "proof123", username: "Owner", operationId: ticket.operationId };
+    const original = IDBObjectStore.prototype.delete;
+    IDBObjectStore.prototype.delete = function(...args) {
+      const request = original.apply(this,args); this.transaction.abort(); return request;
+    };
+    let denied = false;
+    try { await c.joinNotIssued(ticket,p,response); } catch { denied = true; }
+    finally { IDBObjectStore.prototype.delete = original; }
+    const after = await leaseAPI.browserLeaseJournal("refusal");
+    let stale = false;
+    try { await leaseAPI.browserLeaseJournal("refusal",{expectedRevision:crypto.randomUUID(),
+      change:{kind:"join-not-issued",operationId:ticket.operationId}}); } catch { stale = true; }
+    const afterStale = await leaseAPI.browserLeaseJournal("refusal");
+    return { denied, before, after, stale, afterStale };
+  });
+  assert.equal(rejected.denied,true); assert.equal(rejected.stale,true);
+  assert.deepEqual(rejected.after,rejected.before); assert.deepEqual(rejected.afterStale,rejected.before);
+  checks.push("actual non-issuance journal deletion abort and stale-revision CAS preserve exact original intent");
   await secondContext.close();
   console.log(JSON.stringify({ result: "PASS", browser: browser.version(), checks }, null, 2));
 } finally {
