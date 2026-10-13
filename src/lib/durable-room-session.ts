@@ -14,7 +14,14 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
   let physical: object | null = null, scope: string | null = null, original: BrowserLease | null = null;
   let controller: Awaited<ReturnType<typeof createBrowserDurableResume>> | null = null;
   let syncTicket: Awaited<ReturnType<Awaited<ReturnType<typeof createBrowserDurableResume>>["accept"]>> | null = null;
-  let users: string[] = [];
+  let users: string[] | null = null;
+  // Publication batches contain message deltas, not a new presence snapshot.
+  // Retain live presence rather than restoring the original join's user list.
+  const presence = (value: string[]) => {
+    if (!disposed && physical && socket.connected && Array.isArray(value) &&
+        value.every(user => typeof user === "string")) users = [...value];
+  };
+  socket.on("user-list", presence);
   let queue: Promise<unknown> = Promise.resolve();
   const guard = () => {
     if (disposed || !physical || !controller || !socket.connected || !socket.id || !original)
@@ -42,7 +49,7 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
     try {
       if (!physical || !controller || !syncTicket || typeof ack !== "function") throw Error("Stale publication");
       const result = controller.receivePublication(physical, syncTicket, value);
-      callbacks.onSnapshot({ history: [...result.history] as ChatMessage[], users });
+      callbacks.onSnapshot({ history: [...result.history] as ChatMessage[], users: users ?? [] });
       ack(result.ack);
     } catch { fail(); socket.disconnect(); }
   };
@@ -55,6 +62,7 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
       fail(); socket.disconnect(); callbacks.onState("reconnecting");
       const owner = {}, c = { ...credentials };
       physical = owner;
+      users = null;
       const localScope = publicOwnerScope(tab, c.roomId, c.username);
       // Credentialless pre-upgrade work is never imported into a new owner.
       if (await publicOutbox(localScope, "read"))
@@ -118,9 +126,9 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
         await new Promise(resolve => setTimeout(resolve, 10));
       }
       guard();
-      users = [...confirmed.users];
+      users ??= [...confirmed.users];
       delete credentials!.password; delete credentials!.creationToken;
-      callbacks.onSnapshot({ history: [...confirmed.history] as ChatMessage[], users: [...confirmed.users] });
+      callbacks.onSnapshot({ history: [...confirmed.history] as ChatMessage[], users: [...users] });
       callbacks.onJoined(); callbacks.onState("ready");
       return socket.id!;
     } catch (error) {
@@ -174,6 +182,7 @@ export function createDurableRoomSession(socket: Socket, callbacks: Callbacks,
     dispose() {
       disposed = true; clearInterval(timer); fail(); socket.disconnect();
       socket.off("disconnect", fail); socket.off("publication-batch", publication);
+      socket.off("user-list", presence);
     },
   };
   return session;

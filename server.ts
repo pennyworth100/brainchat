@@ -747,7 +747,21 @@ export async function main(options: Readonly<{
     });
 
     lifecycle.own(owner);
-    registerPrivateBrowserWire(socket, privateBrowser, owner, resumeMembers, publication, textReceipts, lifecycle);
+    registerPrivateBrowserWire(socket, privateBrowser, owner, resumeMembers, publication, textReceipts, lifecycle,
+      binding => {
+        // Presence follows the confirmed durable publication cut, including
+        // resume/transfer. An old physical owner cannot publish for its successor.
+        if (!resumeMembers.isCurrent(binding, binding.roomId)) return;
+        const firstPublication = publishedBinding !== binding;
+        publishedBinding = binding;
+        currentRoom = binding.roomId;
+        if (firstPublication) resumeMembers.broadcastExcept(binding, binding.roomId,
+          "system-message", `${binding.username} joined`);
+        if (!resumeMembers.isCurrent(binding, binding.roomId)) return;
+        const presence = resumeMembers.presence(binding.roomId);
+        resumeMembers.broadcast(binding.roomId, "user-count", presence.count);
+        resumeMembers.broadcast(binding.roomId, "user-list", presence.users.map(user => user.username));
+      });
     socket.on(
       "join-room",
       lifecycle.socket(async ({

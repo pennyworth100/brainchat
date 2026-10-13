@@ -201,6 +201,55 @@ async function main() {
    assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions WHERE room_id='gone336'")).rows[0].n,0);
    checks.push("real socket validation, missing-room and PostgreSQL rate-limit refusals bind exact operation; zero owners");
   }
+  // Two real rendered users: live presence must survive publication batches,
+  // resume, DM acknowledgement and the resumed physical owner's departure.
+  await db.query("INSERT INTO rooms(id) VALUES ('live336')");
+  const aliceContext=await browser.newContext(), bobContext=await browser.newContext();
+  const alice=await aliceContext.newPage(), bob=await bobContext.newPage();
+  for(const [p,name] of [[alice,"AlicePresence"],[bob,"BobPresence"]]) {
+    p.on("pageerror",e=>errors.push(e.message));
+    await p.goto(base+"/room?id=live336");
+    await p.getByLabel("Username",{exact:true}).fill(name);
+    await p.getByRole("button",{name:"Join Chat"}).click();
+    await expect(p.getByRole("status")).toContainText("online",{timeout:15000});
+  }
+  for(const p of [alice,bob]) await expect(p.getByRole("status")).toContainText("2 online");
+  await expect(alice.getByText("BobPresence joined",{exact:true})).toHaveCount(1);
+  await bob.getByLabel("Message",{exact:true}).fill("presence-publication-delta");
+  await bob.getByRole("button",{name:"Send",exact:true}).click();
+  await expect(alice.getByText("presence-publication-delta",{exact:true})).toBeVisible({timeout:10000});
+  await expect(alice.getByRole("status")).toContainText("2 online");
+  await alice.getByRole("status").click();
+  await expect(alice.getByRole("banner").getByText("BobPresence",{exact:true})).toBeVisible();
+  checks.push("two rendered durable users receive live join/count/list; publication delta cannot restore stale presence");
+  const aliceBefore=(await db.query("SELECT id,generation FROM room_resume_sessions WHERE room_id='live336' AND username='AlicePresence'")).rows;
+  await alice.reload();
+  await alice.getByLabel("Username",{exact:true}).fill("AlicePresence");
+  await alice.getByRole("button",{name:"Join Chat"}).click();
+  for(const p of [alice,bob]) await expect(p.getByRole("status")).toContainText("2 online",{timeout:15000});
+  assert.deepEqual((await db.query("SELECT id,generation FROM room_resume_sessions WHERE room_id='live336' AND username='AlicePresence'")).rows,
+    [{id:aliceBefore[0].id,generation:aliceBefore[0].generation+1}]);
+  await bob.getByRole("status").click();
+  await bob.getByRole("banner").getByText("AlicePresence",{exact:true}).click();
+  await bob.getByPlaceholder("Message AlicePresence…").fill("dm-to-resumed-owner");
+  await bob.getByPlaceholder("Message AlicePresence…").press("Enter");
+  await expect(bob.getByPlaceholder("Message AlicePresence…")).toHaveValue("",{timeout:10000});
+  // Incoming DM starts minimized; open the existing peer window via participants.
+  await alice.getByRole("status").click();
+  await alice.getByRole("banner").getByText("BobPresence",{exact:true}).click();
+  // The bubble includes a nested sender label, so its full text is not just the payload.
+  await expect(alice.getByText("dm-to-resumed-owner")).toHaveCount(1);
+  await alice.getByPlaceholder("Message BobPresence…").fill("dm-from-resumed-owner");
+  await alice.getByPlaceholder("Message BobPresence…").press("Enter");
+  await expect(alice.getByPlaceholder("Message BobPresence…")).toHaveValue("",{timeout:10000});
+  await expect(bob.getByText("dm-from-resumed-owner")).toHaveCount(1);
+  checks.push("same logical session resumes generation+1; bidirectional rendered DM ACKs reach exact resumed owner once");
+  const leaves=await bob.getByText("AlicePresence left",{exact:true}).count();
+  await aliceContext.close();
+  await expect(bob.getByRole("status")).toContainText("1 online");
+  await expect(bob.getByText("AlicePresence left",{exact:true})).toHaveCount(leaves+1);
+  checks.push("resumed owner departure publishes one leave and exact remaining count");
+  await bobContext.close();
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({result:"PASS",scope:"PUBLIC room rendered Chrome + actual local PostgreSQL; not managed or physical-device acceptance",checks,wireSends:sends,lostACKs:dropped,preservedMessageId:saved[0].id,browser:browser.version()}));
  }catch(e){console.error(e);console.error("server diagnostics:",logs);throw e}

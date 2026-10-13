@@ -22,7 +22,7 @@ Initial extended attachment harness failed because its request counter watched /
 
 ## Material remaining gates — do not activate production
 1. Explicit pre-issuance refusals are now covered (below). Generic failures and missing ACK remain uncertain; no reset of a saved owner is authorized.
-2. Durable join/resume presence notifications need review: server's durable publishJoin deliberately omits the legacy presence broadcast and publishedBinding handling. Verify multi-user online counts/leave and DM after resume before activation.
+2. Durable join/resume presence and bidirectional DM after resume are now locally verified (below); managed acceptance still required.
 3. Verify this exact public integration on managed Railway. This report is LOCAL evidence, not managed, physical iPhone or Safari acceptance.
 4. Strict physical upload/download provider remains unprovisioned. Disabled provider HTTP503 is not a successful attachment path or storage-capacity proof.
 5. Production entry needs explicit runtime/migration/maintenance authorities and provider composition, stacked release integration, final CI/audit, and a fresh all-old-writers-fenced paired database/uploads backup plus rollback proof.
@@ -47,3 +47,13 @@ No production deployment, restart, data mutation, or provider-support message wa
 - Thirteen public scenarios preserve the original one-send/one-row/one-receipt, draft and attachment-UNKNOWN recovery proofs. Five legacy scenarios, 1077 application plus 5 plugin tests, build/typecheck and zero-vulnerability production audit are required for this head.
 - Exact-head reports and hashes: workspace artifacts/dimle/public336-refusals-*.json. The older shared rejection-{tests,build,typecheck,legacy,audit}.json paths were refreshed during the initial follow-up run; their older manifest hashes are historical and must not be used as proof of this head. The retained browser-final/journal-verified/outbox-verified reports are unchanged.
 - Previous head 45bd869 had all six CI checks PASS. Evaluate the new pushed head separately; no managed or production acceptance is claimed.
+
+## 2026-10-12 follow-up: durable presence and resumed direct messages
+
+- Exact current membership publishes presence only after the durable publication cut is acknowledged, for initial join, resume and transfer. The physical owner records its published binding for departure; displaced owners cannot announce a live successor as departed. Repeated snapshot ACKs do not duplicate join notices.
+- The public adapter retains live user-list updates across message publication batches, preventing a later message from restoring the initial stale participant list. A fresh physical connection clears that projection; owner/lease and publication authorization remain unchanged.
+- Sixteen real public Chrome/PostgreSQL scenarios PASS. New two-user proof covers join/count/participant-list, presence retained after a real message publication, reload retaining the same logical session with generation+1, bidirectional DM recipient ACKs exactly once after resume, and one leave notice plus remaining count after the resumed owner closes.
+- Prior actual lost-message-ACK proof remains one send, one original row, one receipt, newer draft retained. Attachment UNKNOWN retains exact bytes/key without replay; actual HTTP503 is still a material blocker, not successful strict storage.
+- 1077 application plus 5 plugin tests, build/typecheck, five legacy rendered scenarios and production audit (zero vulnerabilities) PASS. Reports: workspace artifacts/dimle/public336-presence-{tests,build,typecheck,browser-verified,legacy,audit}.json; publication manifest binds report hashes to the pushed head.
+- Two initial browser harness failures are retained as presence-browser.json and presence-browser-final.json: participant text also matched a message author; exact DM payload text omitted the nested sender label. Scoped participant controls and payload substring assertions now pass; no product gate was relaxed.
+- Previous head 936dccf has six CI checks PASS. New-head CI must be consumed independently. No managed deployment, production mutation, or successful physical attachment provider acceptance is claimed.

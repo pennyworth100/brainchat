@@ -8,6 +8,7 @@ import { publishBrowserResume, publishBrowserTransfer } from "./resume-browser-h
 import { createBrowserPublicationExchange, reconcileBrowserPublication } from "./resume-browser-snapshot";
 import type { SnapshotRequest } from "./browser-resume-snapshot";
 import { ResumeCapacity } from "./resume-capacity";
+import type { ResumeBinding } from "./resume-bindings";
 
 export const PRIVATE_BROWSER_PROTOCOL = "durable-session-v1";
 export function privateBrowserNegotiated(socket: Socket, enabled: boolean) {
@@ -21,7 +22,8 @@ const installed = new WeakSet<Socket>();
 // physical owner as text/image/DM/upload; no new session or generation fallback.
 export function registerPrivateBrowserWire(socket: Socket, enabled: boolean,
   owner: ResumeSocketOwner, members: ResumeMemberships, publication: ResumePublication,
-  receipts: ResumeTextReceiptReader, lifecycle: ServerLifecycle) {
+  receipts: ResumeTextReceiptReader, lifecycle: ServerLifecycle,
+  onPublished?: (binding: ResumeBinding) => void) {
   if (!privateBrowserNegotiated(socket, enabled)) return false;
   if (installed.has(socket)) throw Error("Private protocol already registered");
   installed.add(socket);
@@ -62,8 +64,11 @@ export function registerPrivateBrowserWire(socket: Socket, enabled: boolean,
   });
   register("private-snapshot-ack", async (reply, ack) => {
     if (!exchange || !await exchange.acknowledge(reply, value => {
+      const binding = members.currentBindingFor(socket, owner);
+      if (!binding) throw Error("Publication owner changed");
       confirmed = exchange!.request;
       ack(value);
+      onPublished?.(binding);
     })) ack({ outcome: "unknown" });
   });
   register("private-publication-poll", async (request, ack) => {
