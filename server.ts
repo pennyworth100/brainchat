@@ -706,6 +706,10 @@ export async function main(options: Readonly<{
     };
     let currentRoom: string | null = null;
     let publishedBinding: ResumeBinding | null = null;
+    // Once issuance might have started, this physical owner can NEVER prove
+    // non-issuance (including concurrent authentication or a lost join ACK).
+    let joinIssuanceStarted = false;
+    let privateJoinAttempted = false;
     const privateBrowser = privateBrowserNegotiated(socket, options.privateBrowserResume === true);
     // Normal authenticated joins now use the real durable/session owner. Do not
     // expose credentials or register resume until ALL protected paths migrate.
@@ -760,18 +764,34 @@ export async function main(options: Readonly<{
         operationId?: string;
       }, ack?: (value: unknown) => void) => {
         if (privateBrowser && typeof ack !== "function") return;
+        // Public retry always creates a fresh physical socket. Fence before any
+        // await: a concurrent successful authentication must not race a refusal.
+        if (privateBrowser) {
+          if (privateJoinAttempted) { ack!({ outcome: "unknown" }); return; }
+          privateJoinAttempted = true;
+        }
+        const refuse = (error: string, details?: JoinErrorDetails) => {
+          if (privateBrowser) {
+            if (!joinIssuanceStarted && typeof rawRoomId === "string" &&
+                typeof username === "string" && typeof operationId === "string" &&
+                /^[A-Za-z0-9_-]{16,128}$/.test(operationId)) {
+              ack!({ protocol: PRIVATE_BROWSER_PROTOCOL, outcome: "join-not-issued",
+                roomId: normalizeRoomId(rawRoomId), username, operationId, error, ...details });
+            } else ack!({ outcome: "unknown" });
+          } else socket.emit("join-error", error, details);
+        };
         if (typeof rawRoomId !== "string" || !rawRoomId || !username) return;
         if (!isValidRoomId(rawRoomId)) {
-          socket.emit("join-error", "Invalid room ID");
+          refuse("Invalid room ID");
           return;
         }
         const roomId = normalizeRoomId(rawRoomId);
         if (typeof username !== "string" || username.length > MAX_USERNAME_LENGTH) {
-          socket.emit("join-error", "Username is too long");
+          refuse("Username is too long");
           return;
         }
         if ((password?.length ?? 0) > MAX_PASSWORD_LENGTH) {
-          socket.emit("join-error", "Password is too long");
+          refuse("Password is too long");
           return;
         }
         try {
@@ -780,7 +800,7 @@ export async function main(options: Readonly<{
 
           let room = await getRoom(roomId);
           if (!room) {
-            socket.emit("join-error", "Room not found");
+            refuse("Room not found");
             return;
           }
 
@@ -789,14 +809,14 @@ export async function main(options: Readonly<{
               ? hashCreationToken(creationToken)
               : "";
             if (!safeEqual(room.creationTokenHash, providedTokenHash)) {
-              socket.emit("join-error", "Room is not ready yet");
+              refuse("Room is not ready yet");
               return;
             }
 
             const passwordHash = password ? await hashPassword(password) : null;
             const claimed = await claimRoomPolicy(pool, roomId, room.creationTokenHash, passwordHash);
             if (!claimed) {
-              socket.emit("join-error", "Room was already claimed");
+              refuse("Room was already claimed");
               return;
             }
             room = { ...room, ...claimed };
@@ -804,18 +824,13 @@ export async function main(options: Readonly<{
             room.passwordHash &&
             !(await verifyPassword(room.passwordHash, password || ""))
           ) {
-            // Exact rejection only before owner issuance; generic failures stay uncertain.
-            if (privateBrowser && typeof operationId === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(operationId)) {
-              ack!({ protocol: PRIVATE_BROWSER_PROTOCOL, outcome: "join-not-issued",
-                roomId, username, operationId, error: "Wrong password" });
-              return;
-            }
-            socket.emit("join-error", "Wrong password");
+            refuse("Wrong password");
             return;
           }
           if (!socket.connected) return;
           // This client has one active room. Do not leave stale memberships.
           if (currentRoom && currentRoom !== roomId) return;
+          joinIssuanceStarted = true;
           if (privateBrowser) {
             const sent = await publishBrowserJoin(socket, owner, resumeMembers,
               { roomId, username, authVersion: room.authVersion }, lease => ack!({
@@ -828,8 +843,8 @@ export async function main(options: Readonly<{
           if (!joined || !resumeMembers.isCurrent(joined.binding, roomId)) return;
           resumeMembers.send(joined.binding, roomId, "room-info", { hasPassword: !!room.passwordHash });
         } catch (err) {
-          if (typeof err === "object" && err && "msBeforeNext" in err) {
-            socket.emit("join-error", "Too many attempts. Try again later.", {
+          if (!joinIssuanceStarted && typeof err === "object" && err && "msBeforeNext" in err) {
+            refuse("Too many attempts. Try again later.", {
               code: "RATE_LIMITED", retryAfterMs: Number(err.msBeforeNext),
             } satisfies JoinErrorDetails);
             return;

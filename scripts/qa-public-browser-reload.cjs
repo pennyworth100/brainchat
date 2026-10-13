@@ -154,14 +154,53 @@ async function main() {
   const intruder=io(base,{transports:["websocket"],reconnection:false,auth:{dimleProtocol:"durable-session-v1"}});
   await once(intruder,"connect");
   try {
-   const joined=await intruder.timeout(3000).emitWithAck("join-room",{roomId:"wire335",username:"OriginalOwner",password:"private-fixture-password"});
+   const [joined,concurrent]=await Promise.all([
+    intruder.timeout(3000).emitWithAck("join-room",{roomId:"wire335",username:"OriginalOwner",password:"private-fixture-password"}),
+    intruder.timeout(3000).emitWithAck("join-room",{roomId:"wire335",username:"OriginalOwner",password:"wrong-password",operationId:"concurrent-refusal-0001"})]);
+   assert.deepEqual(concurrent,{outcome:"unknown"});
    assert.notEqual(joined.lease.sessionId,original[0].id);
+   const afterIssued=await intruder.timeout(3000).emitWithAck("join-room",{roomId:"wire335",username:"OriginalOwner",password:"wrong-password",operationId:"after-issued-refusal-0001"});
+   assert.deepEqual(afterIssued,{outcome:"unknown"});
+   checks.push("concurrent authentication and issued physical owner cannot assert non-issuance after lost or repeated join ACK");
    const key=(await db.query("SELECT client_message_id FROM resume_message_receipts WHERE session_id=$1",[original[0].id])).rows[0].client_message_id;
    const denied=await intruder.timeout(3000).emitWithAck("private-text-receipt",{roomId:"wire335",sessionId:original[0].id,type:"message",clientMessageId:key,message:"lost-ack-wire335"});
    assert.deepEqual(denied,{outcome:"unknown"});
    assert.deepEqual((await db.query("SELECT id,content FROM messages")).rows,saved);
    checks.push("same room/password/name new owner cannot resolve original receipt; DB payload unchanged");
   } finally {intruder.disconnect()}
+  const refusalContext=await browser.newContext(), refusalPage=await refusalContext.newPage();
+  await db.query("INSERT INTO rooms(id,creation_token_hash) VALUES ('wait336','unclaimed-fixture-token')");
+  await refusalPage.goto(base+"/room?id=wait336");
+  await refusalPage.getByLabel("Username",{exact:true}).fill("WaitingOwner");
+  await refusalPage.getByRole("button",{name:"Join Chat"}).click();
+  await expect(refusalPage.getByRole("status")).toHaveText("Room is not ready yet",{timeout:10000});
+  await expect(refusalPage.getByRole("button",{name:"Join Chat"})).toBeVisible();
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions WHERE room_id='wait336'")).rows[0].n,0);
+  await db.query("UPDATE rooms SET creation_token_hash=NULL WHERE id='wait336'");
+  await refusalPage.getByRole("button",{name:"Join Chat"}).click();
+  await expect(refusalPage.getByRole("status")).toContainText("online",{timeout:15000});
+  assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions WHERE room_id='wait336'")).rows[0].n,1);
+  checks.push("actual unclaimed-room refusal returns form; after room becomes ready retry issues exactly one owner");
+  await refusalContext.close();
+  {
+   const cases=[{roomId:"not-valid",username:"Refused",error:"Invalid room ID"},
+    {roomId:"gone336",username:"x".repeat(101),error:"Username is too long"},
+    {roomId:"gone336",username:"Refused",password:"x".repeat(1001),error:"Password is too long"},
+    ...Array.from({length:9},(_,i)=>({roomId:"gone336",username:"Refused",error:i<8?"Room not found":"Too many attempts. Try again later."}))];
+   for(const [i,input] of cases.entries()){
+    const refusedSocket=io(base,{transports:["websocket"],reconnection:false,auth:{dimleProtocol:"durable-session-v1"}});
+    await once(refusedSocket,"connect");
+    try {
+    const {error,...credentials}=input, operationId="exact-refusal-operation-"+i;
+    const answer=await refusedSocket.timeout(3000).emitWithAck("join-room",{...credentials,operationId});
+    assert.equal(answer.outcome,"join-not-issued");assert.equal(answer.error,error);
+    assert.equal(answer.operationId,operationId);assert.equal(answer.roomId,input.roomId);assert.equal(answer.username,input.username);
+    if(i===cases.length-1){assert.equal(answer.code,"RATE_LIMITED");assert(answer.retryAfterMs>0)}
+    } finally {refusedSocket.disconnect()}
+   }
+   assert.equal((await db.query("SELECT count(*)::int AS n FROM room_resume_sessions WHERE room_id='gone336'")).rows[0].n,0);
+   checks.push("real socket validation, missing-room and PostgreSQL rate-limit refusals bind exact operation; zero owners");
+  }
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({result:"PASS",scope:"PUBLIC room rendered Chrome + actual local PostgreSQL; not managed or physical-device acceptance",checks,wireSends:sends,lostACKs:dropped,preservedMessageId:saved[0].id,browser:browser.version()}));
  }catch(e){console.error(e);console.error("server diagnostics:",logs);throw e}

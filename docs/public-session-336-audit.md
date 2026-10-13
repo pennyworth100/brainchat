@@ -21,7 +21,7 @@ Reports: workspace artifacts/dimle/public336-*-verified.json and public336-audit
 Initial extended attachment harness failed because its request counter watched /upload instead of /api/upload. Failure retained in public336-public-browser-final.json. Corrected test additionally awaits actual HTTP503 and passes byte/ID/draft/no-replay checks.
 
 ## Material remaining gates — do not activate production
-1. Wrong-password retry is now fixed and proven (below). Other explicit pre-issuance refusals (rate limit, unclaimed/missing room, validation) still need the same reviewed non-issuance treatment; generic failures and missing ACK must remain uncertain.
+1. Explicit pre-issuance refusals are now covered (below). Generic failures and missing ACK remain uncertain; no reset of a saved owner is authorized.
 2. Durable join/resume presence notifications need review: server's durable publishJoin deliberately omits the legacy presence broadcast and publishedBinding handling. Verify multi-user online counts/leave and DM after resume before activation.
 3. Verify this exact public integration on managed Railway. This report is LOCAL evidence, not managed, physical iPhone or Safari acceptance.
 4. Strict physical upload/download provider remains unprovisioned. Disabled provider HTTP503 is not a successful attachment path or storage-capacity proof.
@@ -38,3 +38,12 @@ No production deployment, restart, data mutation, or provider-support message wa
 - 1077 application + 5 plugin tests, build and typecheck PASS; production dependency audit reports zero vulnerabilities.
 - Prior head cbe4b54 CI was NOT green: both verify jobs failed in the controlled legacy outbox fixture, which lacked the new capability endpoint. Fixture now explicitly advertises legacy and proves IndexedDB denial blocks even the authentication send (not only upload). Product downgrade protections were not relaxed.
 - Retained initial local failures: ambiguous Wrong password locator; old outbox assertion expected a post-join warning despite the new pre-join storage gate. Corrected assertions pass. Evidence: workspace artifacts/dimle/public336-rejection-{browser-final,journal-verified,outbox-verified,legacy,tests,build,typecheck,audit}.json. New-head CI must be evaluated separately.
+
+## 2026-10-12 follow-up: complete explicit refusals and concurrency fence
+
+- Validation, missing room, unclaimed/claim-lost room, wrong password and authentication rate limits use exact non-issuance ACKs. Generic errors and uncertain issuance never do.
+- A negotiated physical socket accepts only one initial join attempt, fenced synchronously before any authentication await. Concurrent/repeated joins return UNKNOWN, so an ongoing successful authentication cannot race a second request's false non-issuance claim. Public retries already reconnect with a fresh physical owner. Legacy clients retain their existing protocol.
+- Actual Chrome/PostgreSQL acceptance adds unclaimed-room refusal followed by room readiness and exactly one issued session; real wire validation/missing-room/rate-limit refusals with exact operation binding and zero sessions; concurrent and post-issuance wrong-password requests returning UNKNOWN.
+- Thirteen public scenarios preserve the original one-send/one-row/one-receipt, draft and attachment-UNKNOWN recovery proofs. Five legacy scenarios, 1077 application plus 5 plugin tests, build/typecheck and zero-vulnerability production audit are required for this head.
+- Exact-head reports and hashes: workspace artifacts/dimle/public336-refusals-*.json. The older shared rejection-{tests,build,typecheck,legacy,audit}.json paths were refreshed during the initial follow-up run; their older manifest hashes are historical and must not be used as proof of this head. The retained browser-final/journal-verified/outbox-verified reports are unchanged.
+- Previous head 45bd869 had all six CI checks PASS. Evaluate the new pushed head separately; no managed or production acceptance is claimed.
