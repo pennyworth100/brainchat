@@ -5,18 +5,40 @@ import { Server } from "socket.io";
 import { io, type Socket } from "socket.io-client";
 import { registerPrivateMessages } from "./private-message";
 import { sendPrivateMessage } from "./private-message-client";
+import { EventEmitter } from "node:events";
+import type { Pool, PoolClient } from "pg";
+import { ResumeBindings, type ResumeBinding } from "./resume-bindings";
+import { ResumeMemberships } from "./resume-membership";
+import { attachResumeSocket } from "./resume-socket";
+import { ResumeOperationGate } from "./resume-operation";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function fixture(t: TestContext) {
   const httpServer = http.createServer();
   const server = new Server(httpServer);
-  const users = new Map<string, Map<string, string>>();
-  server.on("connection", socket => {
+  const bindings = new ResumeBindings();
+  const members = new ResumeMemberships(bindings);
+  const identities = new Map<string, ResumeBinding>();
+  const revoked = new Set<string>();
+  const gate = new ResumeOperationGate({ connect: async () => {
+    const events = new EventEmitter();
+    return { on: events.on.bind(events), removeListener: events.removeListener.bind(events),
+      query: async (sql: string, args?: string[]) => ({ rowCount:
+        sql.includes("SELECT s.id") && revoked.has(args![0]) ? 0 : 1 }), release: () => {},
+    } as unknown as PoolClient;
+  } } as Pick<Pool, "connect">, bindings);
+  server.on("connection", async socket => {
     const room = String(socket.handshake.auth.room || "qa");
-    socket.join(room);
-    if (!users.has(room)) users.set(room, new Map());
-    users.get(room)!.set(socket.id, String(socket.handshake.auth.name));
-    registerPrivateMessages(server, socket, users, 80);
+    const owner = attachResumeSocket(socket, { bindings, store: { advanceGeneration: async () => null },
+      prepare: async () => async () => {}, onCleanupError: () => {} });
+    const binding = await bindings.activate({ sessionId: socket.id, roomId: room,
+      username: String(socket.handshake.auth.name), authVersion: 1, generation: 1,
+      issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+    }, owner.incarnation, async () => {}, () => socket.connected);
+    assert.ok(binding);
+    assert.ok(members.install(socket, owner, binding));
+    identities.set(socket.id, binding);
+    registerPrivateMessages(socket, owner, members, gate, 80);
   });
   await new Promise<void>(resolve => httpServer.listen(0, "127.0.0.1", resolve));
   const clients: Socket[] = [];
@@ -34,7 +56,9 @@ async function fixture(t: TestContext) {
   sender.on("private-message-sent", data => sent.push(data));
   outsider.on("private-message", data => leaked.push(data));
   const send = (toUsername = "Mobile") => sendPrivateMessage(sender, { roomId: "qa", toUsername, message: "keep this draft" }, 500);
-  return { server, users, connect, sender, recipient, outsider, sent, leaked, send };
+  const invalidate = (socket: Socket) => bindings.detach(identities.get(socket.id!)!);
+  const revoke = (socket: Socket) => revoked.add(identities.get(socket.id!)!.sessionId);
+  return { server, members, invalidate, revoke, connect, sender, recipient, outsider, sent, leaked, send };
 }
 
 test("DM success requires receiver ACK; duplicate ACK cannot duplicate sent event; outsiders isolated", async t => {
@@ -86,11 +110,11 @@ test("resumed ghost and genuine namesakes both fail closed without fanout or evi
   await assert.rejects(f.send(), /More than one session/);
   assert.equal(deliveries, 0);
   assert.equal(f.sent.length, 0);
-  assert.equal(f.users.get("qa")!.size, 3);
+  assert.equal(f.members.presence("qa").count, 3);
   assert.equal(f.recipient.connected && namesake.connected, true);
   // Once normal heartbeat cleanup removes the old membership, retry is safe
   // for this rejected (never emitted) send, without routing to a new identity.
-  f.users.get("qa")!.delete(f.recipient.id!);
+  f.invalidate(f.recipient);
   await f.send();
   assert.equal(deliveries, 1);
 });
@@ -113,3 +137,30 @@ test("sender-side timeout stays uncertain and disconnected send is never buffere
   await assert.rejects(f.send(), /has not been sent/);
   assert.equal(f.sender.sendBuffer.length, 0);
 });
+
+for (const endpoint of ["sender", "recipient"] as const) {
+  test(`durably revoked ${endpoint} cannot emit a private payload`, async t => {
+    const f = await fixture(t);
+    let deliveries = 0;
+    f.recipient.on("private-message", (_data, ack) => { deliveries++; ack({ received: true }); });
+    f.revoke(f[endpoint]);
+    await assert.rejects(f.send(), /Rejoin/);
+    assert.equal(deliveries, 0);
+    assert.equal(f.sent.length, 0);
+  });
+  for (const change of ["invalidate", "revoke"] as const) {
+    test(`${endpoint} ${change} during recipient ACK cannot report sent or replay`, async t => {
+      const f = await fixture(t);
+      let deliveries = 0;
+      f.recipient.on("private-message", (_data, ack) => {
+        deliveries++;
+        f[change](f[endpoint]);
+        ack({ received: true });
+      });
+      await assert.rejects(f.send(), /Delivery not confirmed/);
+      assert.equal(deliveries, 1);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.leaked.length, 0);
+    });
+  }
+}
