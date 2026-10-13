@@ -1,4 +1,4 @@
-# Offline publication schema installation (3.0.39)
+# Offline publication schema installation (3.0.40)
 
 `scripts/production/install-publication-closed.sql` is an explicit **owner-only
 cutover installer**, not an application startup migration. No production
@@ -25,8 +25,43 @@ Missing, duplicate or changed history is refused before schema/grant mutation;
 a table lock protects the history check until commit. Updating this release
 baseline requires deliberate review and real PostgreSQL acceptance. This is
 history verification, **not** independent attestation that nobody altered live
-schema objects after migration. Full catalog/schema integrity verification and
-the production startup composition remain required.
+schema objects after migration. The production startup composition remains required.
+
+## Independent offline schema fingerprint (3.0.40)
+
+`scripts/production/catalog-fingerprint.py` compares a read-only whole-database
+`pg_dump --schema-only --no-owner --no-privileges` fingerprint to an explicitly
+supplied release SHA-256. Build the reference independently in an owned disposable
+database from the reviewed migrations (and CLOSED installer at the installed
+phase). Use the same PostgreSQL server and dump versions and extension baseline.
+Never obtain the expected hash by blessing the managed target's current schema.
+No universal reference hash is bundled: the PostgreSQL 16 and 18 baselines differ.
+
+Supply the URL only through `DIMLE_CATALOG_DATABASE_URL` and invoke with
+`--pg-bin`, `--ca-file`, and `--expected-sha256`. CLI connections require
+`verify-full`; query-string connection overrides and missing roots are rejected.
+It emits only a hash/byte count on success and a sanitized failure otherwise.
+The only normalized dump content is the paired random psql restriction nonce.
+Definitions, disabled triggers, RLS, defaults, indexes, functions and unexpected
+schemas remain in the comparison. Failed/partial reads cannot become PASS.
+
+This is **not** an ACL/role/ownership or migration-history attestation, data
+backup, physical-capacity proof, or an atomic startup gate. Its schema-only
+coverage is the definitions exported by pg_dump, not system catalogs or the
+internal definitions of extension-owned objects; those require independent
+trusted server/extension provenance. It must not be called full catalog proof.
+An explicit URL username, port and database are required; libpq receives decoded
+connection fields in its environment, never a credential-bearing command line.
+GSS encryption fallback is disabled so non-fixture connections require TLS.
+Its schema-only
+snapshot does not close a check/use race: all DDL authorities must remain fenced
+through activation. Explicit production integration, target-specific reference
+generation and actual managed comparison are still unfinished. Do not replace
+the existing separate role/history checks with this fingerprint.
+
+The owned PostgreSQL fixture now verifies unchanged-history drift for disabled
+admission triggers, missing indexes, added columns, changed SECURITY DEFINER,
+extra schemas and enabled RLS, with exact restoration and repeated-dump equality.
 
 The transaction acquires the shared migration advisory namespace and locks
 rooms, messages and resume sessions against concurrent mutation. The existing

@@ -18,6 +18,7 @@ with socket.socket() as probe:
 env = {k: v for k, v in os.environ.items()
        if not k.startswith("PG") and k not in ("DATABASE_URL", "RESUME_TEST_DATABASE_URL")}
 env.update(OWNED_PG_PORT=str(port),
+           CATALOG_PG_BIN=os.environ.get("PG_CLIENT_BIN", str(pg)),
            RESUME_TEST_DATABASE_URL=f"postgresql://dimle@127.0.0.1:{port}/postgres")
 steps = []
 
@@ -38,6 +39,7 @@ try:
         print(test.stdout, end="")
         print(test.stderr, end="")
         test.check_returncode()
+    run(["python3", "scripts/qa-production-catalog.py"], timeout=60).check_returncode()
 finally:
     # Also handle partial/failed startup; pg_ctl consults this owned data directory.
     status = run([pg / "pg_ctl", "-D", data, "status"])
