@@ -76,6 +76,8 @@ export async function createBrowserDurableResume(scope: string, storage: LeaseSt
     confirmPublication: core.confirmPublication,
     receivePublication: core.receivePublication,
     startPublication: core.startPublication,
+    // Readiness/expiry/physical-owner guard for the private text-only driver.
+    authority: core.uploadAuthority,
     status: () => ({ ...core.status(), persistenceFailed: failed }),
   };
 }

@@ -48,7 +48,8 @@ async function start() {
     }
     const { main } = await import("./server");
     startupEntered = true;
-    const runtime = await main({databaseAuthorities:{migrations,maintenance,publicationTables:true}});
+    const runtime = await main({privateBrowserResume:true,
+      databaseAuthorities:{migrations,maintenance,publicationTables:true}});
     installProcessShutdown(process, async () => {
       const report = await runtime.lifecycle.stopAndSettle();
       await runtime.settleStrictUploads();
