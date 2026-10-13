@@ -40,6 +40,7 @@ try:
         print(test.stderr, end="")
         test.check_returncode()
     run(["python3", "scripts/qa-production-catalog.py"], timeout=60).check_returncode()
+    run(["node", "--import", "tsx", "scripts/qa-production-adoption.ts"], timeout=60).check_returncode()
 finally:
     # Also handle partial/failed startup; pg_ctl consults this owned data directory.
     status = run([pg / "pg_ctl", "-D", data, "status"])
