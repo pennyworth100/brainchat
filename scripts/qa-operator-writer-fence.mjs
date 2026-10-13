@@ -62,7 +62,40 @@ try {
  assert.equal(result.state,"FENCED");assert.equal(result.activationAuthorized,false);checks++;
  assert.equal((await op.query("SELECT count(*)::int n FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()")).rows[0].n,0);checks++;
  assert.equal((await op.query("SELECT count(*)::int n FROM public.messages")).rows[0].n,0);checks++;
+ await result.assertHeld();checks++;
+ assert.equal(result.backend.pid,(await op.query("SELECT pg_backend_pid() pid")).rows[0].pid);checks++;
+ await op.query("ALTER ROLE fence_runtime LOGIN");
+ await assert.rejects(result.assertHeld(),/verification failed/);checks++;
+ await op.query("ALTER ROLE fence_runtime NOLOGIN");
+ await assert.rejects(result.assertHeld(),/handle invalid/);checks++;
+ const lockHandle=await acquireWriterFence(op,manifest);
+ await op.query("SELECT pg_advisory_unlock_all()");
+ await assert.rejects(lockHandle.assertHeld(),/session lock lost/);checks++;
+ await op.query("SELECT pg_advisory_lock(1145654604,2)");
+ await assert.rejects(lockHandle.assertHeld(),/handle invalid/);checks++;
+ const expiryHandle=await acquireWriterFence(op,manifest);
+ await op.query("ALTER ROLE fence_runtime VALID UNTIL '2000-01-01'");
+ await assert.rejects(expiryHandle.assertHeld(),/principal mismatch/);checks++;
+ await op.query('ALTER ROLE fence_runtime VALID UNTIL '+"'"+expiry+"'");
+ const busyHandle=await acquireWriterFence(op,manifest);
+ const extra=await connect();
+ await assert.rejects(busyHandle.assertHeld(),/verification failed/);checks++;
+ await extra.end();
+ const concurrentHandle=await acquireWriterFence(op,manifest);
+ const concurrent=await Promise.allSettled([concurrentHandle.assertHeld(),concurrentHandle.assertHeld()]);
+ assert.ok(concurrent.every(r=>r.status==='rejected'));checks++;
+ const swappedHandle=await acquireWriterFence(op,manifest);
+ await op.query("SELECT pg_advisory_unlock_all()");
+ const replacement=await connect();
+ await replacement.query("SELECT pg_advisory_lock(1145654604,2)");
+ // Actual replacement backend owns the same lock; no fake result rows.
+ const originalQuery=op.query;
+ op.query=replacement.query.bind(replacement);
+ try {await assert.rejects(swappedHandle.assertHeld(),/original backend/);checks++;}
+ finally {op.query=originalQuery;await replacement.end();}
+ const endedHandle=await acquireWriterFence(op,manifest);
  await op.end();
+ await assert.rejects(endedHandle.assertHeld(),/handle invalid/);checks++;
  await assert.rejects(connect("fence_owner"),e=>e.code==="28000");checks++;
  const verifier=await connect();
  await verifier.query(`CREATE ROLE fence_reader LOGIN NOINHERIT VALID UNTIL $$${expiry}$$;

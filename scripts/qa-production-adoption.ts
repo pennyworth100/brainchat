@@ -85,6 +85,8 @@ async function main() {
     try {
       const result=await acquireAndAuditWriterFence(operator,manifest);
       assert.equal(result.adoption,'PASS');assert.equal(result.activationAuthorized,false);fencedChecks++;
+      await result.assertHeld();fencedChecks++;
+      assert.equal(result.backend.pid,(await operator.query('SELECT pg_backend_pid() pid')).rows[0].pid);fencedChecks++;
       assert.equal((await operator.query('SELECT current_user,session_user')).rows[0].session_user,'dimle');fencedChecks++;
       assert.equal((await operator.query("SELECT count(*)::int n FROM pg_roles WHERE rolname=ANY($1) AND rolcanlogin",[[manifest.owner.name,manifest.runtime.name,manifest.maintenance.name]])).rows[0].n,0);fencedChecks++;
       const state=await operator.query(`SELECT jsonb_build_object('budget',(SELECT to_jsonb(b) FROM message_write_budget b),
@@ -114,6 +116,7 @@ async function main() {
       await auditAsOwner('FENCED');fencedChecks++;
       // FENCED is not a string-only bypass: require the same operator lock.
       await operator.query('SELECT pg_advisory_unlock_all()');
+      await assert.rejects(result.assertHeld(),/session lock lost/);fencedChecks++;
       await operator.query('SET SESSION AUTHORIZATION adoption_owner');
       await operator.query("SELECT set_config('dimle.cutover_runtime','adoption_runtime',false),set_config('dimle.cutover_maintenance','adoption_maintenance',false),set_config('dimle.cutover_state','FENCED',false)");
       await assert.rejects(operator.query(sql),/session lock required/);fencedChecks++;

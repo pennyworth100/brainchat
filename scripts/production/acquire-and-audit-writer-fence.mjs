@@ -10,6 +10,7 @@ export async function acquireAndAuditWriterFence(client, manifest) {
   const pinned = structuredClone(manifest);
   const sql = await readFile(new URL('./adopt-publication-roles.sql', import.meta.url), 'utf8');
   const fence = await acquireWriterFence(client, pinned);
+  await fence.assertHeld();
   // acquireWriterFence validates names before any interpolation. Authentication
   // remains the same dedicated superuser connection: RESET restores it, never
   // an owner LOGIN or a second connection that would lose the session lock.
@@ -25,6 +26,7 @@ export async function acquireAndAuditWriterFence(client, manifest) {
     await client.query('RESET SESSION AUTHORIZATION');
     await client.query("RESET dimle.cutover_runtime; RESET dimle.cutover_maintenance; RESET dimle.cutover_state");
   }
+  await fence.assertHeld();
   return Object.freeze({...fence, adoption:'PASS',
     adoptionSQLSHA256:createHash('sha256').update(sql).digest('hex'), activationAuthorized:false});
 }

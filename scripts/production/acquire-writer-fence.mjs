@@ -23,6 +23,9 @@ export async function acquireWriterFence(client, manifest) {
   // Session-scoped: another participating operator must not interleave.
   const lock = await client.query("SELECT pg_try_advisory_lock(1145654604, 2) AS acquired");
   if (lock.rows[0]?.acquired !== true) throw Error("Fence operator busy");
+  const backend = (await client.query(`SELECT pg_backend_pid() AS pid,
+    backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()`)).rows[0];
+  if (!backend?.pid || !backend.backend_start) throw Error("Fence backend identity unavailable");
   async function identity() {
     const result = await client.query(`SELECT current_database() AS database,current_user,session_user,
       (SELECT system_identifier::text FROM pg_control_system()) AS system,
@@ -83,12 +86,40 @@ export async function acquireWriterFence(client, manifest) {
       AND datname=current_database()`, [s.pid,s.backend_start,s.usename]);
     if (stopped.rowCount && stopped.rows[0].stopped !== true) throw Error("Writer drain failed");
   }
-  await identity();
-  await background();
-  if ((await client.query("SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin", [names])).rowCount ||
-      (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND (usename IS DISTINCT FROM $1 OR backend_type<>$2)", [reader?.name ?? null,"client backend"])).rowCount)
-    throw Error("Fence verification failed");
+  // A receipt is not a transferable activation token. Fresh checks must use
+  // this exact dedicated backend, never silently acquire a replacement lock.
+  // Any observed failure permanently poisons this handle. Trusted callers must
+  // not release/reacquire locks or multiplex this client between assertions.
+  let invalid = false, checking = false;
+  const invalidate = () => { invalid = true; };
+  client.once("error", invalidate);
+  client.once("end", invalidate);
+  async function assertHeld() {
+    if (invalid || checking) { invalid = true; throw Error("Fence handle invalid"); }
+    checking = true;
+    try {
+      const current = (await client.query(`SELECT pg_backend_pid() AS pid,
+        backend_start::text, EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
+          AND pid=pg_backend_pid() AND granted AND mode='ExclusiveLock'
+          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+          AND classid=1145654604 AND objid=2 AND objsubid=2) AS held
+        FROM pg_stat_activity WHERE pid=pg_backend_pid()`)).rows[0];
+      if (current?.pid !== backend.pid || current.backend_start !== backend.backend_start || current.held !== true)
+        throw Error("Fence original backend/session lock lost");
+      await identity();
+      await background();
+      if ((await client.query("SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin", [names])).rowCount ||
+          (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND (usename IS DISTINCT FROM $1 OR backend_type<>$2)", [reader?.name ?? null,"client backend"])).rowCount)
+        throw Error("Fence verification failed");
+      if (invalid) throw Error("Fence handle invalid");
+    } catch (error) {
+      invalid = true;
+      throw error;
+    } finally { checking = false; }
+  }
+  await assertHeld();
   return Object.freeze({state:"FENCED",database,systemIdentifier,roles:roles.map(r=>({...r})),
     reader:reader ? Object.freeze({...reader}) : null,
-    drained:sessions.filter(s=>s.usename!==reader?.name).length,activationAuthorized:false});
+    drained:sessions.filter(s=>s.usename!==reader?.name).length,
+    backend:Object.freeze({...backend}),assertHeld,activationAuthorized:false});
 }
