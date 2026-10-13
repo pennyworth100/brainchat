@@ -150,7 +150,9 @@ export async function acquireWriterFence(client, manifest) {
   async function closeAdmission() {
     if (checking || transitioning) throw Error("Activation operation busy");
     transitioning = true;
-    try { await contain(); } finally { transitioning = false; }
+    try { await contain(); }
+    catch (error) { phase = "CONTAINMENT_UNCONFIRMED"; throw error; }
+    finally { transitioning = false; }
   }
   // Explicit operator action only. These are trusted live verifiers, NOT booleans,
   // saved receipts or user-supplied hooks. The controller must implement all three
@@ -189,7 +191,10 @@ export async function acquireWriterFence(client, manifest) {
       invalid = true;
       if (opening) {
         try { await contain(); }
-        catch (containmentError) { throw new AggregateError([error,containmentError],"Activation failed; containment UNCONFIRMED"); }
+        catch (containmentError) {
+          phase = "CONTAINMENT_UNCONFIRMED";
+          throw new AggregateError([error,containmentError],"Activation failed; containment UNCONFIRMED");
+        }
       }
       // A lost session can make COMMIT ambiguous. Never claim closed admission
       // or silently reconnect/reacquire. Controller must stop its runtime and

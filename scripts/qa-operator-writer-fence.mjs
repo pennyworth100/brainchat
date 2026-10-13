@@ -238,6 +238,7 @@ try {
      injected=true;await query("SELECT pg_advisory_unlock_all()");throw Error("fixture post-commit lock lost");
    }return result;};
    await assert.rejects(f.beginActivation(gates(c)),/containment UNCONFIRMED/);
+   assert.equal(f.state,"CONTAINMENT_UNCONFIRMED");
    c.query=query;
    assert.equal((await c.query("SELECT count(*)::int n FROM pg_roles WHERE rolname IN ('fence_runtime','fence_maint') AND rolcanlogin")).rows[0].n,2);
    await assert.rejects(f.assertHeld(),/invalid/);
