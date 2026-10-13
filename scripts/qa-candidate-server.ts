@@ -16,6 +16,7 @@ async function main() {
   const config = {host:"127.0.0.1",port:manifest.port,user:"dimle",database:"postgres",ssl:{ca,rejectUnauthorized:true}};
   const admin = new Pool(config);
   let child: ChildProcess | undefined;
+  let lastChildOutput = () => "";
   try {
     await admin.query(`SET password_encryption='scram-sha-256';
       CREATE ROLE candidate_migrator LOGIN NOINHERIT PASSWORD 'fixture-only';
@@ -89,6 +90,7 @@ async function main() {
       child = spawn(process.execPath,["--import","tsx",entry],{env:{...env,...overrides},stdio:["ignore","pipe","pipe","ipc"]});
       child!.stdout!.on("data",chunk=>{output+=chunk;}); child!.stderr!.on("data",chunk=>{output+=chunk;});
       const exited = new Promise<number|null>(resolve=>child!.once("exit",resolve));
+      lastChildOutput = () => output;
       return {output:()=>output,exited};
     };
     const until = async (fn:()=>boolean|Promise<boolean>) => {
@@ -178,6 +180,26 @@ async function main() {
       assert.equal(await rejected.exited, 1);
       await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
       assert.ok(!rejected.output().includes("Running database migrations"));
+      // A successful controller callback cannot substitute for the actual
+      // production launcher identity check. Reject a privilege change made
+      // while that callback is pending, before creating files or listening.
+      const drifted = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
+      await until(() => drifted.output().includes("Fixture preflight pending"));
+      await audit.query("GRANT USAGE ON SCHEMA drizzle TO candidate_runtime");
+      try {
+        child!.send("verify");
+        assert.equal(await drifted.exited, 1);
+        await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
+        await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
+        assert.ok(!drifted.output().includes("Running database migrations"));
+      } finally { await audit.query("REVOKE USAGE ON SCHEMA drizzle FROM candidate_runtime"); }
+      const leaseLost = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
+      await until(() => leaseLost.output().includes("Fixture preflight pending"));
+      child!.send("lose-lease");
+      assert.equal(await leaseLost.exited, 1);
+      await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
+      await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
+      assert.ok(!leaseLost.output().includes("Running database migrations"));
       const preinstalled = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
       await until(() => preinstalled.output().includes("Fixture preflight pending"));
       await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
@@ -196,7 +218,9 @@ async function main() {
     await until(async()=>!(await admin.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate'")).rowCount);
     console.log(JSON.stringify({status:"PASS",productionConfigurationAndIdentity:true,identityEscalationsRejected:9,
       productionTransportFailuresRejected:4,
-      preinstalledRuntime:true,noMigratorCredentials:true,
+      preinstalledRuntime:true,actualProductionRuntimeModule:true,noMigratorCredentials:true,
+      productionIdentityDriftAfterGateRejected:true,productionStopPromiseRetained:true,
+      activationLeaseLossAfterIdentityBlocksFilesystemAndListener:true,
       pendingVerifierBlocksFilesystemAndListener:true,rejectedVerifierBlocksStartup:true,
       runtimeHasNoHistoryOrDDLPrivileges:true,historyAndClosedBudgetUnchanged:true,
       actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
@@ -205,6 +229,9 @@ async function main() {
       exactGrantHistory:true,wrongHashAndTimestampRefusedBeforeGrants:true,
       roomCreated:true,oneSettledShutdown:true,noRemainingCandidateBackends:true,
       scramAuthentication:true,offlineProductionInstaller:true,offlineRoleGrants:true,dirtyColumnGrantRefused:true,publicGrantRefused:true,inheritingRoleRefused:true,runtimeMessageClosed:true,grantReplayRefused:true,closedBudgetPreserved:true,limitations:"owned TLS+SCRAM cluster; not managed-provider ACL/TLS attestation"}));
+  } catch (error) {
+    console.error("Last owned fixture child output:", lastChildOutput());
+    throw error;
   } finally { if (child && child.exitCode===null) child.kill("SIGKILL"); await admin.end(); }
 }
 void main().catch(error=>{console.error(error);process.exitCode=1;});
