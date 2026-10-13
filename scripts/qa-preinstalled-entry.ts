@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { Pool } from "pg";
 import { configureCandidateRuntime } from "../src/lib/db/candidate-runtime";
 import { installProcessShutdown } from "../src/lib/process-shutdown";
+import { productionConfiguration } from "../src/lib/db/production-configuration";
+import { verifyProductionDatabaseIdentities } from "../src/lib/db/production-identity";
 
 async function start() {
   const dir = process.env.LEDGER_TLS_FIXTURE!;
@@ -11,15 +13,17 @@ async function start() {
   assert.equal(manifest.kind, "owned-disposable-tls-v1");
   assert.ok(process.send, "fixture requires IPC owner");
   const ca = readFileSync(dir + "/server.crt", "utf8");
-  const configs = ["RUNTIME", "MAINTENANCE"].map(key => {
+  for (const key of ["RUNTIME", "MAINTENANCE"]) {
     const url = new URL(process.env["DIMLE_CANDIDATE_" + key + "_URL"]!);
     assert.equal(url.hostname, "127.0.0.1");
     assert.equal(url.port, String(manifest.port));
     assert.equal(url.pathname, "/candidate");
     assert.equal(url.search, "");
-    return { connectionString: url.href, ssl: { ca, rejectUnauthorized: true },
-      options: "-c search_path=pg_catalog,public,pg_temp", max: 2 };
-  });
+  }
+  const {configs,roles,database} = productionConfiguration({
+    DIMLE_PRODUCTION_RUNTIME_URL: process.env.DIMLE_CANDIDATE_RUNTIME_URL,
+    DIMLE_PRODUCTION_MAINTENANCE_URL: process.env.DIMLE_CANDIDATE_MAINTENANCE_URL,
+  }, ca);
   configureCandidateRuntime(configs[0]);
   const { pool } = await import("../src/lib/db");
   const maintenance = new Pool(configs[1]);
@@ -31,6 +35,7 @@ async function start() {
         console.log("Fixture preflight pending");
         const decision = await new Promise(resolve => process.once("message", resolve));
         assert.equal(decision, "verify", "fixture verification rejected");
+        await verifyProductionDatabaseIdentities([pool,maintenance],roles,database);
         for (const [i, p] of [pool, maintenance].entries()) {
           const row = (await p.query(`SELECT current_user,session_user,
             (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()) AS tls,

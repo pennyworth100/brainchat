@@ -5,6 +5,8 @@ import { createServer } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { Pool } from "pg";
 import { migrateDatabase } from "../src/lib/db/startup-migrations";
+import { productionConfiguration } from "../src/lib/db/production-configuration";
+import { verifyProductionDatabaseIdentities } from "../src/lib/db/production-identity";
 
 async function main() {
   const dir = process.env.LEDGER_TLS_FIXTURE!;
@@ -127,6 +129,45 @@ async function main() {
     try {
       const history = (await audit.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows;
       const budget = (await audit.query("SELECT * FROM message_write_budget")).rows;
+      await admin.query("ALTER ROLE candidate_runtime VALID UNTIL '2099-01-01'; ALTER ROLE candidate_maintenance VALID UNTIL '2099-01-01'");
+      const production = productionConfiguration({
+        DIMLE_PRODUCTION_RUNTIME_URL: env.DIMLE_CANDIDATE_RUNTIME_URL,
+        DIMLE_PRODUCTION_MAINTENANCE_URL: env.DIMLE_CANDIDATE_MAINTENANCE_URL,
+      },ca);
+      const identityPools = production.configs.map(c => new Pool(c));
+      const verifyIdentity = () => verifyProductionDatabaseIdentities(identityPools,production.roles,production.database);
+      try {
+        await verifyIdentity();
+        await assert.rejects(verifyProductionDatabaseIdentities(identityPools,[...production.roles].reverse(),production.database));
+        await assert.rejects(verifyProductionDatabaseIdentities(identityPools,production.roles,"wrong_database"));
+        const badLogin = new URL(production.configs[0].connectionString!);
+        badLogin.password = "wrong-production-fixture-password";
+        for (const overrides of [
+          {ssl: false}, {ssl: {ca, rejectUnauthorized: false}},
+          {ssl: {ca: rootCertificates.join("\n"), rejectUnauthorized: true}},
+          {connectionString: badLogin.href},
+        ]) {
+          const badPool = new Pool({...production.configs[0],...overrides});
+          try {
+            await assert.rejects(verifyProductionDatabaseIdentities([badPool,identityPools[1]],production.roles,production.database),
+              (e: Error) => e.message === "Production database identity preflight rejected");
+          } finally { await badPool.end(); }
+        }
+        for (const [change, restore] of [
+          ["ALTER ROLE candidate_runtime VALID UNTIL '2000-01-01'", "ALTER ROLE candidate_runtime VALID UNTIL '2099-01-01'"],
+          ["ALTER ROLE candidate_runtime VALID UNTIL 'infinity'", "ALTER ROLE candidate_runtime VALID UNTIL '2099-01-01'"],
+          ["ALTER ROLE candidate_maintenance INHERIT", "ALTER ROLE candidate_maintenance NOINHERIT"],
+          ["GRANT candidate_runtime TO candidate_maintenance", "REVOKE candidate_runtime FROM candidate_maintenance"],
+          ["GRANT CONNECT ON DATABASE postgres TO candidate_runtime", "REVOKE CONNECT ON DATABASE postgres FROM candidate_runtime"],
+          ["GRANT USAGE ON SCHEMA drizzle TO candidate_runtime", "REVOKE USAGE ON SCHEMA drizzle FROM candidate_runtime"],
+          ["GRANT SELECT(used_rows) ON message_write_budget TO candidate_runtime", "REVOKE SELECT(used_rows) ON message_write_budget FROM candidate_runtime"],
+        ]) {
+          await audit.query(change);
+          try { await assert.rejects(verifyIdentity(), /Production database identity preflight rejected/); }
+          finally { await audit.query(restore); }
+          await verifyIdentity();
+        }
+      } finally { await Promise.all(identityPools.map(p => p.end())); }
       const runtimeEnv = { UPLOAD_DIR: dir+"/preinstalled-uploads",
         DIMLE_CANDIDATE_MIGRATION_URL: "invalid://unavailable-owner-credentials" };
       const rejected = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
@@ -153,7 +194,9 @@ async function main() {
       assert.equal((preinstalled.output().match(/Preinstalled fixture shutdown settled/g)||[]).length, 1);
     } finally { await audit.end(); }
     await until(async()=>!(await admin.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate'")).rowCount);
-    console.log(JSON.stringify({status:"PASS",preinstalledRuntime:true,noMigratorCredentials:true,
+    console.log(JSON.stringify({status:"PASS",productionConfigurationAndIdentity:true,identityEscalationsRejected:9,
+      productionTransportFailuresRejected:4,
+      preinstalledRuntime:true,noMigratorCredentials:true,
       pendingVerifierBlocksFilesystemAndListener:true,rejectedVerifierBlocksStartup:true,
       runtimeHasNoHistoryOrDDLPrivileges:true,historyAndClosedBudgetUnchanged:true,
       actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
