@@ -1,4 +1,5 @@
 import { isValidRoomId } from "./room-id";
+import { validateLeaseCheckpoint, type LeaseCheckpoint } from "./browser-lease-journal";
 import { createBrowserPublicationPump, type PublicationClock } from "./browser-publication-pump";
 import { createBrowserPublicationJournal } from "./browser-publication-journal";
 import type { UploadAuthority } from "./upload-authority";
@@ -97,6 +98,24 @@ export function createBrowserResumeController(
     return syncAttempt;
   };
   return {
+    /** Import only into a fresh controller. Storage is not authenticated READY. */
+    restore(saved: LeaseCheckpoint) {
+      if (phase !== "empty" || roomId || transport || lease) throw Error("Controller already owned");
+      const row = structuredClone(saved);
+      validateLeaseCheckpoint(row);
+      roomId = row.roomId; username = row.username;
+      lease = row.lease && Object.freeze(row.lease);
+      const a = row.attempt;
+      if (a) {
+        usedKeys.add(a.operationId);
+        if (a.originalOperationId) usedKeys.add(a.originalOperationId);
+      }
+      // A previous document has no reusable physical incarnation. A pending
+      // original resume permits ONE explicit transfer; join/transfer loss does not.
+      lostCas = a?.kind === "resume" ? { ticket: Object.freeze({ kind: "resume",
+        operationId: a.operationId, expectedGeneration: a.expectedGeneration }), physical: {} } : null;
+      phase = lease && lease.expiresAt <= now() ? "blocked" : a ? "uncertain" : "offline";
+    },
     beginJoin(nextRoom: string, nextUser: string, physical: object): CasAttempt {
       if (!isValidRoomId(nextRoom) || !nextUser.trim() || nextUser.length > 64) throw Error("Invalid room owner");
       // Explicit join is the ONLY way to discard an old logical owner. The UI

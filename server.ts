@@ -42,6 +42,10 @@ import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./src/lib/resume
 import { ResumeHistoryReader } from "./src/lib/resume-history";
 import { syncResumeSocket } from "./src/lib/resume-sync";
 import { ResumeMessageWriter } from "./src/lib/resume-message";
+import { ResumeTextReceiptReader } from "./src/lib/resume-text-receipt";
+import { ResumePublication } from "./src/lib/resume-publication";
+import { privateBrowserNegotiated, registerPrivateBrowserWire, PRIVATE_BROWSER_PROTOCOL } from "./src/lib/private-browser-wire";
+import { publishBrowserJoin } from "./src/lib/resume-browser-handshake";
 import { ResumeImageWriter } from "./src/lib/resume-image";
 import { createOwnedStrictUploadService, type OwnedStrictUploadConfiguration } from "./src/lib/owned-strict-upload-service";
 import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
@@ -231,12 +235,16 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 export async function main(options: Readonly<{
+  privateBrowserResume?: boolean;
   strictUploads?: OwnedStrictUploadConfiguration;
   // Private composition only. Caller owns these pools and closes them AFTER
   // lifecycle settlement. No environment toggle or public activation.
   databaseAuthorities?: Readonly<{ migrations: Pool; maintenance: Pool; publicationTables: boolean }>;
 }> = {}) {
   const authorities = options.databaseAuthorities && { ...options.databaseAuthorities };
+  if (options.privateBrowserResume && !authorities?.publicationTables) {
+    throw Error("Private browser protocol requires isolated publication authorities");
+  }
   if (authorities && (authorities.migrations === pool || authorities.maintenance === pool ||
       authorities.migrations === authorities.maintenance)) {
     throw Error("Database authorities require three distinct pools");
@@ -253,6 +261,10 @@ export async function main(options: Readonly<{
   await app.prepare();
 
   const expressApp = express();
+  expressApp.use("/candidate-recovery", (_req, res, next) => {
+    if (!options.privateBrowserResume) { res.sendStatus(404); return; }
+    next();
+  });
   const trustProxyHops = parseInt(process.env.TRUST_PROXY_HOPS || "0", 10);
   if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);
@@ -267,6 +279,8 @@ export async function main(options: Readonly<{
   const uploadGate = new ResumeUploadOperationGate(pool, uploadAdmissions);
   const resumeHistory = new ResumeHistoryReader(resumeGate);
   const resumeText = new ResumeMessageWriter(resumeGate);
+  const textReceipts = new ResumeTextReceiptReader(resumeGate);
+  const publication = new ResumePublication(resumeGate);
   const resumeImage = new ResumeImageWriter(resumeGate);
   // Paired writer/reader use one pool and root. No production physical provider
   // yet: null provisioning keeps both disabled without a legacy fallback.
@@ -688,6 +702,7 @@ export async function main(options: Readonly<{
     };
     let currentRoom: string | null = null;
     let publishedBinding: ResumeBinding | null = null;
+    const privateBrowser = privateBrowserNegotiated(socket, options.privateBrowserResume === true);
     // Normal authenticated joins now use the real durable/session owner. Do not
     // expose credentials or register resume until ALL protected paths migrate.
     const owner = attachResumeSocket(socket, {
@@ -699,6 +714,11 @@ export async function main(options: Readonly<{
       publishJoin: async (binding, live) => {
         const roomId = binding.roomId;
         const current = () => live() && resumeMembers.isCurrent(binding, roomId);
+        if (privateBrowser) {
+          if (!current()) return false;
+          currentRoom = roomId;
+          return true; // no legacy snapshot: exact publication cut follows durable lease ACK
+        }
         const history = await resumeHistory.read(binding);
         if (history === null || !current()) return false;
         currentRoom = roomId;
@@ -719,6 +739,7 @@ export async function main(options: Readonly<{
     });
 
     lifecycle.own(owner);
+    registerPrivateBrowserWire(socket, privateBrowser, owner, resumeMembers, publication, textReceipts, lifecycle);
     socket.on(
       "join-room",
       lifecycle.socket(async ({
@@ -731,7 +752,8 @@ export async function main(options: Readonly<{
         username: string;
         password?: string;
         creationToken?: string;
-      }) => {
+      }, ack?: (value: unknown) => void) => {
+        if (privateBrowser && typeof ack !== "function") return;
         if (typeof rawRoomId !== "string" || !rawRoomId || !username) return;
         if (!isValidRoomId(rawRoomId)) {
           socket.emit("join-error", "Invalid room ID");
@@ -782,6 +804,14 @@ export async function main(options: Readonly<{
           if (!socket.connected) return;
           // This client has one active room. Do not leave stale memberships.
           if (currentRoom && currentRoom !== roomId) return;
+          if (privateBrowser) {
+            const sent = await publishBrowserJoin(socket, owner, resumeMembers,
+              { roomId, username, authVersion: room.authVersion }, lease => ack!({
+                protocol: PRIVATE_BROWSER_PROTOCOL, lease,
+              }));
+            if (!sent && socket.connected) ack!({ outcome: "unknown" });
+            return;
+          }
           const joined = await owner.join({ roomId, username, authVersion: room.authVersion });
           if (!joined || !resumeMembers.isCurrent(joined.binding, roomId)) return;
           resumeMembers.send(joined.binding, roomId, "room-info", { hasPassword: !!room.passwordHash });

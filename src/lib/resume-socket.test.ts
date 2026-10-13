@@ -1,5 +1,85 @@
 import assert from "node:assert/strict";
 
+import { registerPrivateBrowserWire, PRIVATE_BROWSER_PROTOCOL } from "./private-browser-wire";
+import type { ResumePublication } from "./resume-publication";
+import type { ResumeTextReceiptReader } from "./resume-text-receipt";
+import { ServerLifecycle } from "./server-lifecycle";
+
+test("private actual socket protocol is absent without BOTH candidate enablement and negotiation", async t => {
+  const f = await syncFixture(t);
+  const life = new ServerLifecycle({ stopAndSettle: async () => {} }, { settle: async () => {} });
+  for (const enabled of [false, true]) {
+    assert.equal(registerPrivateBrowserWire(f.socket, enabled, f.owner, f.members,
+      {} as ResumePublication, {} as ResumeTextReceiptReader, life), false);
+  }
+  assert.equal(f.socket.listenerCount("private-session"), 0);
+  f.socket.handshake.auth.dimleProtocol = PRIVATE_BROWSER_PROTOCOL;
+  assert.equal(registerPrivateBrowserWire(f.socket, false, f.owner, f.members,
+    {} as ResumePublication, {} as ResumeTextReceiptReader, life), false);
+});
+
+test("private real socket resume -> exact cut ACK -> poll; receipt is separate and never sends", async t => {
+  const f = await fixture(t), { socket, client } = await f.connect(), opts = options();
+  socket.handshake.auth.dimleProtocol = PRIVATE_BROWSER_PROTOCOL;
+  const members = new ResumeMemberships(opts.bindings);
+  const owner = attachResumeSocket(socket, { ...opts, memberships: members });
+  t.after(() => owner.close());
+  let cutAcks = 0, reads = 0;
+  const store = {
+    snapshot: async (binding: ResumeBinding) => publicationCut(binding),
+    acknowledgeSnapshot: async (_b: ResumeBinding, cut: PublicationSnapshot, ack: any) => {
+      cutAcks++; assert.deepEqual(ack.ids, cut.messages.map(row => row.id)); return true;
+    },
+    claim: async (binding: ResumeBinding) => ({ ...publicationCut(binding), messages: [] }),
+  } as unknown as ResumePublication;
+  const reader = { read: async () => { reads++; return null; } } as unknown as ResumeTextReceiptReader;
+  const life = new ServerLifecycle({ stopAndSettle: async () => {} }, { settle: async () => {} });
+  assert.equal(registerPrivateBrowserWire(socket, true, owner, members, store, reader, life), true);
+  assert.throws(() => registerPrivateBrowserWire(socket, true, owner, members, store, reader, life), /already/);
+  const rpc = (event: string, value: unknown) => client.timeout(1000).emitWithAck(event, value);
+  const grant = await rpc("private-session", { kind: "resume", request: request() });
+  assert.equal(grant.protocol, PRIVATE_BROWSER_PROTOCOL);
+  assert.equal(grant.lease.sessionId, "session-a");
+  assert.equal(grant.lease.generation, 1);
+  assert.equal(members.legacyUploadBindingFor(socket, owner, "candy986"), null);
+  const req = { roomId: "candy986", sessionId: "session-a", generation: 1, requestId: "request_private_12345" };
+  assert.deepEqual(await rpc("private-publication-poll", req), { outcome: "unknown" });
+  const cut = await rpc("private-snapshot", req);
+  assert.equal(cut.cut, "full-bounded-statement");
+  assert.deepEqual(await rpc("private-snapshot", req), { outcome: "unknown" });
+  const ack = { ...req, deliveryTry: cut.deliveryTry, ids: cut.history.map((r: any) => r.id) };
+  assert.deepEqual(await rpc("private-snapshot-ack", { ...ack, ids: [] }), { outcome: "unknown" });
+  assert.equal(cutAcks, 0);
+  assert.equal((await rpc("private-snapshot-ack", ack)).settled, true);
+  assert.equal((await rpc("private-snapshot-ack", ack)).settled, true);
+  assert.equal(cutAcks, 2, "confirmation retry revalidates durable ACK");
+  assert.equal((await rpc("private-publication-poll", req)).settled, true);
+  assert.deepEqual(await rpc("private-publication-poll", { ...req, requestId: "other_request_12345" }), { outcome: "unknown" });
+  assert.deepEqual(await rpc("private-text-receipt", { clientMessageId: "lost" }), { outcome: "unknown" });
+  assert.equal(reads, 1);
+  await life.stopAndSettle();
+  assert.deepEqual(await rpc("private-text-receipt", {}), { outcome: "unknown" });
+  assert.equal(reads, 1);
+});
+
+test("private wire keeps stalled work owned, rejects overlap and emits no stale receipt", async t => {
+  const f = await syncFixture(t), pending = deferred<null>(), entered = deferred<void>();
+  f.socket.handshake.auth.dimleProtocol = PRIVATE_BROWSER_PROTOCOL;
+  const life = new ServerLifecycle({ stopAndSettle: async () => {} }, { settle: async () => {} });
+  const reader = { read: async () => { entered.resolve(); await pending.promise; return null; } } as unknown as ResumeTextReceiptReader;
+  registerPrivateBrowserWire(f.socket, true, f.owner, f.members, {} as ResumePublication, reader, life);
+  const first = f.client.timeout(150).emitWithAck("private-text-receipt", {});
+  void first.catch(() => {});
+  await entered.promise;
+  assert.equal(life.activeHandlers, 1);
+  assert.deepEqual(await f.client.timeout(1000).emitWithAck("private-text-receipt", {}), { outcome: "unknown" });
+  f.opts.bindings.detach(f.binding);
+  pending.resolve(null);
+  await assert.rejects(first);
+  assert.equal(life.activeHandlers, 0);
+});
+
+
 import { publishBrowserJoin, publishBrowserResume } from "./resume-browser-handshake";
 import { createBrowserResumeController, type BrowserLease } from "./browser-resume-controller";
 
