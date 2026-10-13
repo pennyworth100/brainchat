@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, access } from "node:fs/promises";
 import { rootCertificates } from "node:tls";
 import { createServer } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -82,9 +82,9 @@ async function main() {
       DIMLE_CANDIDATE_CA_FILE:dir+"/server.crt",DATABASE_URL:"postgresql://invalid:secret@invalid/production"};
     for (const [key,role] of [["MIGRATION","migrator"],["RUNTIME","runtime"],["MAINTENANCE","maintenance"]])
       Object.assign(env,{["DIMLE_CANDIDATE_"+key+"_URL"]:`postgresql://candidate_${role}:fixture-only@127.0.0.1:${manifest.port}/candidate`});
-    const launch = (overrides: Record<string,string> = {}) => {
+    const launch = (overrides: Record<string,string> = {}, entry = "candidate-server.ts") => {
       let output = "";
-      child = spawn(process.execPath,["--import","tsx","candidate-server.ts"],{env:{...env,...overrides},stdio:["ignore","pipe","pipe"]});
+      child = spawn(process.execPath,["--import","tsx",entry],{env:{...env,...overrides},stdio:["ignore","pipe","pipe","ipc"]});
       child!.stdout!.on("data",chunk=>{output+=chunk;}); child!.stderr!.on("data",chunk=>{output+=chunk;});
       const exited = new Promise<number|null>(resolve=>child!.once("exit",resolve));
       return {output:()=>output,exited};
@@ -123,7 +123,40 @@ async function main() {
     assert.equal(await valid.exited,0);
     assert.equal((valid.output().match(/candidate shutdown settled/g)||[]).length,1);
     await until(async()=>!(await admin.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate'")).rowCount);
-    console.log(JSON.stringify({status:"PASS",actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
+    const audit = new Pool({...config,database:"candidate"});
+    try {
+      const history = (await audit.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows;
+      const budget = (await audit.query("SELECT * FROM message_write_budget")).rows;
+      const runtimeEnv = { UPLOAD_DIR: dir+"/preinstalled-uploads",
+        DIMLE_CANDIDATE_MIGRATION_URL: "invalid://unavailable-owner-credentials" };
+      const rejected = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
+      await until(() => rejected.output().includes("Fixture preflight pending"));
+      await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
+      await assert.rejects(fetch(`http://127.0.0.1:${port}/api/browser-session-mode`));
+      child!.send("reject");
+      assert.equal(await rejected.exited, 1);
+      await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
+      assert.ok(!rejected.output().includes("Running database migrations"));
+      const preinstalled = launch(runtimeEnv, "scripts/qa-preinstalled-entry.ts");
+      await until(() => preinstalled.output().includes("Fixture preflight pending"));
+      await assert.rejects(access(runtimeEnv.UPLOAD_DIR));
+      child!.send("verify");
+      await until(() => preinstalled.output().includes("Dimle running"));
+      assert.ok(!preinstalled.output().includes("Running database migrations"));
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/rooms`, {method:"POST"})).status, 201);
+      const active = (await audit.query("SELECT DISTINCT usename FROM pg_stat_activity WHERE datname='candidate'")).rows;
+      assert.ok(!active.some(row => row.usename === "candidate_migrator"));
+      assert.deepEqual((await audit.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows, history);
+      assert.deepEqual((await audit.query("SELECT * FROM message_write_budget")).rows, budget);
+      child!.kill("SIGTERM");
+      assert.equal(await preinstalled.exited, 0);
+      assert.equal((preinstalled.output().match(/Preinstalled fixture shutdown settled/g)||[]).length, 1);
+    } finally { await audit.end(); }
+    await until(async()=>!(await admin.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate'")).rowCount);
+    console.log(JSON.stringify({status:"PASS",preinstalledRuntime:true,noMigratorCredentials:true,
+      pendingVerifierBlocksFilesystemAndListener:true,rejectedVerifierBlocksStartup:true,
+      runtimeHasNoHistoryOrDDLPrivileges:true,historyAndClosedBudgetUnchanged:true,
+      actualCandidateCli:true,verifiedTLS:true,threeRoles:true,
       invalidCARejectedBeforeMigration:true,badPasswordRejectedBeforeMigration:true,elevatedRoleRejectedBeforeMigration:true,
       foreignDatabaseRejectedBeforeMigration:true,budgetColumnGrantRejectedBeforeMigration:true,
       exactGrantHistory:true,wrongHashAndTimestampRefusedBeforeGrants:true,

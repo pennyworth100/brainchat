@@ -9,7 +9,6 @@ import multer from "multer";
 import { createUploadParser } from "./src/lib/upload-parser";
 import crypto from "crypto";
 import fs from "fs";
-import type { Pool } from "pg";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
 import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
@@ -19,7 +18,7 @@ import { installProcessShutdown } from "./src/lib/process-shutdown";
 import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
 import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
 import { consumeJoinLimits } from "./src/lib/join-rate-limits";
-import { migrateDatabase } from "./src/lib/db/startup-migrations";
+import { prepareDatabaseStartup, type MigrationAuthorities, type PreinstalledAuthorities } from "./src/lib/db/database-startup";
 import { db, pool } from "./src/lib/db";
 import {
   authenticateAgent,
@@ -239,22 +238,21 @@ export async function main(options: Readonly<{
   strictUploads?: OwnedStrictUploadConfiguration;
   // Private composition only. Caller owns these pools and closes them AFTER
   // lifecycle settlement. No environment toggle or public activation.
-  databaseAuthorities?: Readonly<{ migrations: Pool; maintenance: Pool; publicationTables: boolean }>;
+  databaseAuthorities?: MigrationAuthorities;
+  // Runtime-only path. A trusted release composition must supply its verifier;
+  // no CLI/env activation or successful production preflight is implied.
+  preinstalledAuthorities?: PreinstalledAuthorities;
 }> = {}) {
-  const authorities = options.databaseAuthorities && { ...options.databaseAuthorities };
-  if (options.privateBrowserResume && !authorities?.publicationTables) {
+  if (options.privateBrowserResume && !(options.databaseAuthorities?.publicationTables ||
+      options.preinstalledAuthorities?.publicationTables)) {
     throw Error("Private browser protocol requires isolated publication authorities");
   }
-  if (authorities && (authorities.migrations === pool || authorities.maintenance === pool ||
-      authorities.migrations === authorities.maintenance)) {
-    throw Error("Database authorities require three distinct pools");
-  }
-  // Run migrations
-  console.log("Running database migrations...");
-  await migrateDatabase(authorities?.migrations ?? pool);
-  // No upload namespace mutation during module import or failed migrations.
+  if (!options.preinstalledAuthorities) console.log("Running database migrations...");
+  const authorities = await prepareDatabaseStartup(pool, options.databaseAuthorities,
+    options.preinstalledAuthorities);
+  // No upload namespace mutation during module import or rejected DB startup.
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  console.log("Migrations complete.");
+  console.log(options.preinstalledAuthorities ? "Preinstalled database verification complete." : "Migrations complete.");
 
   const app = next({ dev });
   const handle = app.getRequestHandler();
