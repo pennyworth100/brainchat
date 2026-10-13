@@ -90,26 +90,31 @@ export async function acquireWriterFence(client, manifest) {
   // this exact dedicated backend, never silently acquire a replacement lock.
   // Any observed failure permanently poisons this handle. Trusted callers must
   // not release/reacquire locks or multiplex this client between assertions.
-  let invalid = false, checking = false;
+  let invalid = false, checking = false, transitioning = false, phase = "FENCED";
   const invalidate = () => { invalid = true; };
   client.once("error", invalidate);
   client.once("end", invalidate);
+  async function originalSession() {
+    const current = (await client.query(`SELECT pg_backend_pid() AS pid,
+      backend_start::text, EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
+        AND pid=pg_backend_pid() AND granted AND mode='ExclusiveLock'
+        AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+        AND classid=1145654604 AND objid=2 AND objsubid=2) AS held
+      FROM pg_stat_activity WHERE pid=pg_backend_pid()`)).rows[0];
+    if (current?.pid !== backend.pid || current.backend_start !== backend.backend_start || current.held !== true)
+      throw Error("Fence original backend/session lock lost");
+  }
   async function assertHeld() {
     if (invalid || checking) { invalid = true; throw Error("Fence handle invalid"); }
     checking = true;
     try {
-      const current = (await client.query(`SELECT pg_backend_pid() AS pid,
-        backend_start::text, EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
-          AND pid=pg_backend_pid() AND granted AND mode='ExclusiveLock'
-          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
-          AND classid=1145654604 AND objid=2 AND objsubid=2) AS held
-        FROM pg_stat_activity WHERE pid=pg_backend_pid()`)).rows[0];
-      if (current?.pid !== backend.pid || current.backend_start !== backend.backend_start || current.held !== true)
-        throw Error("Fence original backend/session lock lost");
+      await originalSession();
       await identity();
       await background();
-      if ((await client.query("SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin", [names])).rowCount ||
-          (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND (usename IS DISTINCT FROM $1 OR backend_type<>$2)", [reader?.name ?? null,"client backend"])).rowCount)
+      const admitted = phase === "ACTIVATING" ? [runtime.name, maintenance.name] : [];
+      const allowedBackends = reader ? [...admitted, reader.name] : admitted;
+      if ((await client.query("SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin IS DISTINCT FROM (rolname=ANY($2::text[]))", [names,admitted])).rowCount ||
+          (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND (NOT(usename=ANY($1::text[])) OR usename IS NULL OR backend_type<>$2)", [allowedBackends,"client backend"])).rowCount)
         throw Error("Fence verification failed");
       if (invalid) throw Error("Fence handle invalid");
     } catch (error) {
@@ -117,9 +122,84 @@ export async function acquireWriterFence(client, manifest) {
       throw error;
     } finally { checking = false; }
   }
+  async function contain() {
+    invalid = true; // Containment never revives this handle or its audit evidence.
+    await originalSession();
+    const target = (await client.query(`SELECT current_database() AS database,current_user,session_user,
+      (SELECT system_identifier::text FROM pg_control_system()) AS system`)).rows[0];
+    if (target.database !== database || target.system !== systemIdentifier ||
+        target.current_user !== operator || target.session_user !== operator) throw Error("Containment target mismatch");
+    const actual = (await client.query("SELECT oid::int,rolname FROM pg_roles WHERE rolname=ANY($1::text[])",[names])).rows;
+    if (actual.length !== 3 || actual.some(a=>!roles.some(r=>r.name===a.rolname && r.oid===a.oid)))
+      throw Error("Containment principal mismatch");
+    await client.query("BEGIN");
+    try {
+      await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='10s'");
+      for (const role of roles) await client.query('ALTER ROLE "' + role.name + '" NOLOGIN');
+      await client.query("COMMIT");
+    } catch (error) { await client.query("ROLLBACK"); throw error; }
+    const writers = (await client.query(`SELECT pid,backend_start::text FROM pg_stat_activity
+      WHERE datname=current_database() AND usename=ANY($1::text[])`,[names])).rows;
+    for (const writer of writers) await client.query(`SELECT pg_terminate_backend(pid,1000)
+      FROM pg_stat_activity WHERE pid=$1 AND backend_start=$2::timestamptz
+      AND datname=current_database() AND usename=ANY($3::text[])`,[writer.pid,writer.backend_start,names]);
+    if ((await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND usename=ANY($1::text[])",[names])).rowCount)
+      throw Error("Activation containment drain unconfirmed");
+    phase = "CLOSED";
+  }
+  async function closeAdmission() {
+    if (checking || transitioning) throw Error("Activation operation busy");
+    transitioning = true;
+    try { await contain(); } finally { transitioning = false; }
+  }
+  // Explicit operator action only. These are trusted live verifiers, NOT booleans,
+  // saved receipts or user-supplied hooks. The controller must implement all three
+  // for this exact release/target. This primitive alone is not a deploy command.
+  async function beginActivation(options) {
+    const {verifyRelease, verifyCapacity, verifyRecovery} = options ?? {};
+    if (invalid || checking || transitioning || phase !== "FENCED" ||
+        [verifyRelease,verifyCapacity,verifyRecovery].some(f => typeof f !== "function")) {
+      invalid = true;
+      throw Error("Explicit live activation gates required");
+    }
+    transitioning = true;
+    let opening = false;
+    try {
+      for (const verify of [verifyRelease,verifyCapacity,verifyRecovery]) {
+        await assertHeld();
+        if (await verify() !== undefined) throw Error("Activation gate cannot return a saved receipt");
+        await assertHeld();
+      }
+      // Original session/lock is still held. Owner/migrator NEVER opens. No
+      // grants, password/expiry changes, migrations or quota mutation here.
+      opening = true;
+      await client.query("BEGIN");
+      try {
+        await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='10s'");
+        for (const role of [runtime,maintenance]) await client.query('ALTER ROLE "' + role.name + '" LOGIN');
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      }
+      phase = "ACTIVATING";
+      await assertHeld();
+      return Object.freeze({get state(){return phase;}, backend:Object.freeze({...backend}), assertHeld, closeAdmission});
+    } catch (error) {
+      invalid = true;
+      if (opening) {
+        try { await contain(); }
+        catch (containmentError) { throw new AggregateError([error,containmentError],"Activation failed; containment UNCONFIRMED"); }
+      }
+      // A lost session can make COMMIT ambiguous. Never claim closed admission
+      // or silently reconnect/reacquire. Controller must stop its runtime and
+      // verify containment through the independently authorized operator path.
+      throw error;
+    } finally { transitioning = false; }
+  }
   await assertHeld();
-  return Object.freeze({state:"FENCED",database,systemIdentifier,roles:roles.map(r=>({...r})),
+  return Object.freeze({get state(){return phase;},database,systemIdentifier,roles:roles.map(r=>({...r})),
     reader:reader ? Object.freeze({...reader}) : null,
     drained:sessions.filter(s=>s.usename!==reader?.name).length,
-    backend:Object.freeze({...backend}),assertHeld,activationAuthorized:false});
+    backend:Object.freeze({...backend}),assertHeld,beginActivation,closeAdmission,activationAuthorized:false});
 }

@@ -159,5 +159,92 @@ try {
  assert.match(dump,/CREATE FUNCTION public.enqueue_message_publication\(\) RETURNS trigger/);checks++;
  await readerOp.end();
  await assert.rejects(connect("fence_runtime"),e=>e.code==="28000");checks++;
+ // Controlled activation uses the same original operator, not a replacement
+ // acquisition or a FENCED assertion weakened by an environment flag.
+ async function activationCase(body) {
+   const c=await connect();
+   try { await body(c,await acquireWriterFence(c,readerManifest)); }
+   finally { await c.end(); }
+ }
+ async function closed(c) {
+   assert.equal((await c.query("SELECT count(*)::int n FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin",[["fence_owner","fence_runtime","fence_maint"]])).rows[0].n,0);
+ }
+ function gates(c,events=[]) {
+   // Fixture-only verifiers query this disposable target; they are NOT real
+   // release/capacity/recovery acceptance and must not be copied to managed DB.
+   return Object.fromEntries(["verifyRelease","verifyCapacity","verifyRecovery"].map(name=>[name,async()=>{
+     await closed(c);
+     assert.equal((await c.query("SELECT count(*)::int n FROM public.messages")).rows[0].n,0);
+     events.push(name);
+   }]));
+ }
+ await activationCase(async(c,f)=>{
+   await assert.rejects(f.beginActivation({verifyRelease:true,verifyCapacity:true,verifyRecovery:true}),/live activation gates/);
+   await closed(c);checks++;
+ });
+ for(const name of ["verifyRelease","verifyCapacity","verifyRecovery"]) await activationCase(async(c,f)=>{
+   const events=[],g=gates(c,events);g[name]=async()=>{throw Error("fixture rejected "+name);};
+   await assert.rejects(f.beginActivation(g),/fixture rejected/);
+   await closed(c);await assert.rejects(f.assertHeld(),/invalid/);checks++;
+ });
+ await activationCase(async(c,f)=>{
+   const g=gates(c);g.verifyCapacity=async()=>({status:"PASS"});
+   await assert.rejects(f.beginActivation(g),/saved receipt/);await closed(c);checks++;
+ });
+ await activationCase(async(c,f)=>{
+   const g=gates(c);g.verifyCapacity=async()=>{await c.query("SELECT pg_advisory_unlock_all()");};
+   await assert.rejects(f.beginActivation(g),/session lock lost/);
+   await closed(c);checks++;
+ });
+ await activationCase(async(c,f)=>{
+   const g=gates(c);g.verifyRecovery=async()=>{await c.query("ALTER ROLE fence_maint VALID UNTIL '2000-01-01'");};
+   await assert.rejects(f.beginActivation(g),/principal mismatch/);await closed(c);checks++;
+   await c.query('ALTER ROLE fence_maint VALID UNTIL '+"'"+expiry+"'");
+ });
+ await activationCase(async(c,f)=>{
+   let release;const waiting=new Promise(resolve=>{release=resolve;});
+   let entered;const pending=new Promise(resolve=>{entered=resolve;});
+   const g=gates(c);g.verifyCapacity=async()=>{entered();await waiting;};
+   const first=f.beginActivation(g);await pending;
+   await assert.rejects(f.beginActivation(g),/live activation gates/);
+   release();await assert.rejects(first,/invalid/);await closed(c);checks++;
+ });
+ await activationCase(async(c,f)=>{
+   const events=[];const lease=await f.beginActivation(gates(c,events));
+   assert.deepEqual(events,["verifyRelease","verifyCapacity","verifyRecovery"]);
+   assert.equal(lease.state,"ACTIVATING");assert.equal(f.state,"ACTIVATING");
+   assert.deepEqual(lease.backend,f.backend);await lease.assertHeld();checks++;
+   await assert.rejects(connect("fence_owner"),e=>e.code==="28000");checks++;
+   const r=await connect("fence_runtime"),m=await connect("fence_maint");
+   await r.query("SELECT * FROM public.messages");await m.query("SELECT * FROM public.messages");
+   await lease.assertHeld();checks++;
+   const rogue=await connect();await assert.rejects(lease.assertHeld(),/verification failed/);checks++;
+   await rogue.end();
+   await lease.closeAdmission();await closed(c);assert.equal(lease.state,"CLOSED");
+   await assert.rejects(lease.assertHeld(),/invalid/);
+   await assert.rejects(connect("fence_runtime"),e=>e.code==="28000");checks++;
+ });
+ await activationCase(async(c,f)=>{
+   // Real committed LOGIN transaction, simulated lost acknowledgement. The
+   // original live session must close/drain it instead of leaving roles open.
+   const query=c.query.bind(c);let injected=false;
+   c.query=async(...args)=>{const result=await query(...args);if(args[0]==="COMMIT"&&!injected){injected=true;throw Error("fixture commit ACK lost");}return result;};
+   await assert.rejects(f.beginActivation(gates(c)),/commit ACK lost/);
+   c.query=query;await closed(c);assert.equal(f.state,"CLOSED");checks++;
+ });
+ await activationCase(async(c,f)=>{
+   const query=c.query.bind(c);let injected=false;
+   c.query=async(...args)=>{const result=await query(...args);if(args[0]==="COMMIT"&&!injected){
+     injected=true;await query("SELECT pg_advisory_unlock_all()");throw Error("fixture post-commit lock lost");
+   }return result;};
+   await assert.rejects(f.beginActivation(gates(c)),/containment UNCONFIRMED/);
+   c.query=query;
+   assert.equal((await c.query("SELECT count(*)::int n FROM pg_roles WHERE rolname IN ('fence_runtime','fence_maint') AND rolcanlogin")).rows[0].n,2);
+   await assert.rejects(f.assertHeld(),/invalid/);
+   // Explicit new fixture-only acquisition contains the uncertain admission;
+   // never pretend that this retains the earlier release evidence.
+   const replacement=await acquireWriterFence(c,readerManifest);
+   assert.notEqual(replacement,f);await closed(c);checks++;
+ });
  console.log(JSON.stringify({status:"PASS",checks,fixtureOnly:true,automaticReopen:false}));
 } finally {await Promise.allSettled(clients.map(c=>c.end()));}

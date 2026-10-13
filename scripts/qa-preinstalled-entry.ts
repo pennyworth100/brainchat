@@ -28,6 +28,10 @@ async function start() {
       verify: async () => {
         console.log("Fixture preflight pending");
         const decision = await new Promise(resolve => process.once("message", resolve));
+        if (decision === "retained-activation") return { assertHeld: async () => {
+          process.send!({type:"assert-activation"});
+          assert.equal(await new Promise(resolve=>process.once("message",resolve)), "activation-held");
+        } };
         assert.ok(decision === "verify" || decision === "lose-lease" || decision === "late-gate" ||
           decision === "late-loss", "fixture verification rejected");
         let checks = 0;

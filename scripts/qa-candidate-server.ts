@@ -7,6 +7,8 @@ import { Pool } from "pg";
 import { migrateDatabase } from "../src/lib/db/startup-migrations";
 import { productionConfiguration } from "../src/lib/db/production-configuration";
 import { verifyProductionDatabaseIdentities } from "../src/lib/db/production-identity";
+// Trusted operator-only JavaScript primitive, exercised on owned TLS fixture.
+import { acquireWriterFence } from "./production/acquire-writer-fence.mjs";
 
 async function main() {
   const dir = process.env.LEDGER_TLS_FIXTURE!;
@@ -242,10 +244,50 @@ async function main() {
       child!.kill("SIGTERM");
       assert.equal(await preinstalled.exited, 0);
       assert.equal((preinstalled.output().match(/Preinstalled fixture shutdown settled/g)||[]).length, 1);
+      // Actual phase transition + actual runtime, with one retained operator
+      // client. IPC asks the parent to ASSERT, never acquire a replacement.
+      const operator = await audit.connect();
+      try {
+        const expiry = new Date(Date.now()+3600000).toISOString();
+        for (const name of ["candidate_migrator","candidate_runtime","candidate_maintenance"])
+          await operator.query('ALTER ROLE "'+name+'" VALID UNTIL '+"'"+expiry+"'");
+        const fm: Record<string,unknown> = {database:"candidate",operator:"dimle",
+          systemIdentifier:(await operator.query("SELECT system_identifier::text FROM pg_control_system()")).rows[0].system_identifier};
+        for (const [key,name] of [["owner","candidate_migrator"],["runtime","candidate_runtime"],["maintenance","candidate_maintenance"]])
+          fm[key]={name,oid:(await operator.query("SELECT oid::int FROM pg_roles WHERE rolname=$1",[name])).rows[0].oid};
+        const fence=await acquireWriterFence(operator,fm);
+        const lease=await fence.beginActivation({
+          verifyRelease:async()=>assert.deepEqual((await operator.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows,history),
+          // Deliberately CLOSED fixture: proves startup phase, NOT writable
+          // managed capacity or physical-upload/recovery acceptance.
+          verifyCapacity:async()=>assert.deepEqual((await operator.query("SELECT * FROM message_write_budget")).rows,budget),
+          verifyRecovery:async()=>assert.equal((await operator.query("SELECT count(*)::int n FROM messages")).rows[0].n,0),
+        });
+        const activated=launch({...runtimeEnv,UPLOAD_DIR:dir+"/activated-uploads"},"scripts/qa-preinstalled-entry.ts");
+        await until(()=>activated.output().includes("Fixture preflight pending"));
+        let assertions=0;let assertionError:unknown;
+        child!.on("message", async message=>{
+          if ((message as {type?:string}).type!=="assert-activation") return;
+          try { await lease.assertHeld();assertions++;child!.send("activation-held"); }
+          catch(error){assertionError=error;child!.send("activation-lost");}
+        });
+        child!.send("retained-activation");
+        await until(()=>activated.output().includes("Dimle running"));
+        assert.equal(assertionError,undefined);assert.equal(assertions,4);
+        assert.equal((await fetch(`http://127.0.0.1:${port}/api/rooms`,{method:"POST"})).status,201);
+        await lease.assertHeld();assert.deepEqual(lease.backend,fence.backend);
+        assert.equal((await operator.query("SELECT rolcanlogin FROM pg_roles WHERE rolname='candidate_migrator'")).rows[0].rolcanlogin,false);
+        child!.kill("SIGTERM");assert.equal(await activated.exited,0);
+        await lease.closeAdmission();
+        assert.equal((await operator.query("SELECT count(*)::int n FROM pg_stat_activity WHERE datname='candidate' AND pid<>pg_backend_pid()")).rows[0].n,0);
+        assert.deepEqual((await operator.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows,history);
+        assert.deepEqual((await operator.query("SELECT * FROM message_write_budget")).rows,budget);
+      } finally { operator.release(true); }
     } finally { await audit.end(); }
     await until(async()=>!(await admin.query("SELECT 1 FROM pg_stat_activity WHERE datname='candidate'")).rowCount);
     console.log(JSON.stringify({status:"PASS",productionConfigurationAndIdentity:true,identityEscalationsRejected:9,
       productionTransportFailuresRejected:4,
+      retainedOriginalOperatorActivationThroughRealRuntime:true,
       preinstalledRuntime:true,actualProductionRuntimeModule:true,noMigratorCredentials:true,
       productionIdentityDriftAfterGateRejected:true,productionStopPromiseRetained:true,
       activationLeaseLossAfterIdentityBlocksFilesystemAndListener:true,

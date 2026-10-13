@@ -27,6 +27,6 @@ export async function acquireAndAuditWriterFence(client, manifest) {
     await client.query("RESET dimle.cutover_runtime; RESET dimle.cutover_maintenance; RESET dimle.cutover_state");
   }
   await fence.assertHeld();
-  return Object.freeze({...fence, adoption:'PASS',
+  return Object.freeze({...fence, get state(){return fence.state;}, adoption:'PASS',
     adoptionSQLSHA256:createHash('sha256').update(sql).digest('hex'), activationAuthorized:false});
 }
