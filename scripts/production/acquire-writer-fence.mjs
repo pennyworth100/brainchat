@@ -5,14 +5,21 @@
  * NOLOGIN is durable; exceptions/disconnect NEVER reopen it. This primitive
  * does not authorize activation or claim protection against trusted admins.
  */
+import {auditCatalogReader} from "./audit-catalog-reader.mjs";
 export async function acquireWriterFence(client, manifest) {
-  const { database, systemIdentifier, operator, owner, runtime, maintenance } = manifest;
+  const { database, systemIdentifier, operator, owner, runtime, maintenance, reader } = structuredClone(manifest);
   const roles = [owner, runtime, maintenance];
+  const principals = reader ? [...roles,reader] : roles;
   if (!database || !systemIdentifier || !operator || roles.some(r =>
       !r || !/^[a-z_][a-z0-9_]{0,62}$/.test(r.name) || !Number.isSafeInteger(r.oid) || r.oid <= 0) ||
       new Set(roles.map(r => r.name)).size !== 3 || new Set(roles.map(r => r.oid)).size !== 3 ||
       roles.some(r => r.name === operator)) throw Error("Invalid fence manifest");
+  if (reader && (!/^[a-z_][a-z0-9_]{0,62}$/.test(reader.name) ||
+      !Number.isSafeInteger(reader.oid) || reader.oid<=0 || reader.name===operator ||
+      new Set(principals.map(r=>r.name)).size!==4 || new Set(principals.map(r=>r.oid)).size!==4))
+    throw Error("Invalid catalog reader manifest");
   const names = roles.map(r => r.name);
+  const allowedNames = principals.map(r=>r.name);
   // Session-scoped: another participating operator must not interleave.
   const lock = await client.query("SELECT pg_try_advisory_lock(1145654604, 2) AS acquired");
   if (lock.rows[0]?.acquired !== true) throw Error("Fence operator busy");
@@ -43,7 +50,8 @@ export async function acquireWriterFence(client, manifest) {
       throw Error("Fence principal has foreign database authority");
     if ((await client.query(`SELECT 1 FROM pg_roles WHERE rolcanlogin AND rolname<>$1
       AND NOT(rolname=ANY($2::text[])) AND has_database_privilege(oid,current_database(),'CONNECT')`,
-      [operator,names])).rowCount) throw Error("Uninventoried login authority");
+      [operator,allowedNames])).rowCount) throw Error("Uninventoried login authority");
+    if (reader) await auditCatalogReader(client,reader);
   }
   async function background() {
     if ((await client.query("SELECT 1 FROM pg_prepared_xacts WHERE database=current_database()")).rowCount ||
@@ -67,6 +75,7 @@ export async function acquireWriterFence(client, manifest) {
   const sessions = (await client.query(`SELECT pid,backend_start::text,usename,backend_type
     FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()`)).rows;
   for (const s of sessions) {
+    if (reader && s.usename===reader.name && s.backend_type==="client backend") continue;
     if (!names.includes(s.usename) || s.backend_type !== "client backend")
       throw Error("Uninventoried active backend; logins remain fenced");
     const stopped = await client.query(`SELECT pg_terminate_backend(pid,1000) AS stopped
@@ -77,8 +86,9 @@ export async function acquireWriterFence(client, manifest) {
   await identity();
   await background();
   if ((await client.query("SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]) AND rolcanlogin", [names])).rowCount ||
-      (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()")).rowCount)
+      (await client.query("SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND (usename IS DISTINCT FROM $1 OR backend_type<>$2)", [reader?.name ?? null,"client backend"])).rowCount)
     throw Error("Fence verification failed");
   return Object.freeze({state:"FENCED",database,systemIdentifier,roles:roles.map(r=>({...r})),
-    drained:sessions.length,activationAuthorized:false});
+    reader:reader ? Object.freeze({...reader}) : null,
+    drained:sessions.filter(s=>s.usename!==reader?.name).length,activationAuthorized:false});
 }

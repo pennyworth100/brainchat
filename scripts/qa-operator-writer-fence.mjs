@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {Client} from "pg";
 import {acquireWriterFence} from "./production/acquire-writer-fence.mjs";
+import {auditCatalogReader} from "./production/audit-catalog-reader.mjs";
+import {execFileSync} from "node:child_process";
 const port=Number(process.env.OWNED_PG_PORT);
 assert(port>1024 && process.env.FENCE_OWNED_FIXTURE==="yes");
 const clients=[];
@@ -61,5 +63,46 @@ try {
  assert.equal((await op.query("SELECT count(*)::int n FROM public.messages")).rows[0].n,0);checks++;
  await op.end();
  await assert.rejects(connect("fence_owner"),e=>e.code==="28000");checks++;
+ const verifier=await connect();
+ await verifier.query(`CREATE ROLE fence_reader LOGIN NOINHERIT VALID UNTIL $$${expiry}$$;
+   GRANT CONNECT ON DATABASE fence_owned TO fence_reader;
+   GRANT USAGE ON SCHEMA public TO fence_reader;
+   GRANT SELECT ON public.messages TO fence_reader`);
+ const readerRole={name:"fence_reader",oid:(await verifier.query("SELECT oid::int FROM pg_roles WHERE rolname=$1",["fence_reader"])).rows[0].oid};
+ await assert.rejects(auditCatalogReader(verifier,readerRole),/unsafe/);checks++;
+ // Owned fixture only: eliminate PUBLIC large-object/WAL mutation authority.
+ const mutators=(await verifier.query(`SELECT oid::regprocedure::text AS signature FROM pg_proc WHERE pronamespace=$$pg_catalog$$::regnamespace AND proname IN ($$lo_create$$,$$lo_creat$$,$$lo_from_bytea$$,$$lo_put$$,$$lo_import$$,$$lo_unlink$$,$$lowrite$$,$$lo_truncate$$,$$lo_truncate64$$,$$pg_logical_emit_message$$)`)).rows;
+ for(const f of mutators) await verifier.query("REVOKE EXECUTE ON FUNCTION "+f.signature+" FROM PUBLIC");
+ const readClient=await connect("fence_reader");
+ const readerManifest={...manifest,reader:readerRole};
+ async function unsafe(grant,revoke) {
+   await verifier.query(grant);
+   await assert.rejects(auditCatalogReader(verifier,readerRole),/unsafe/);checks++;
+   await verifier.query(revoke);
+   await auditCatalogReader(verifier,readerRole);
+ }
+ await unsafe("GRANT INSERT ON public.messages TO PUBLIC","REVOKE INSERT ON public.messages FROM PUBLIC");
+ await unsafe("GRANT UPDATE(body) ON public.messages TO fence_reader","REVOKE UPDATE(body) ON public.messages FROM fence_reader");
+ await unsafe("GRANT TEMP ON DATABASE fence_owned TO fence_reader","REVOKE TEMP ON DATABASE fence_owned FROM fence_reader");
+ await unsafe("GRANT CREATE ON SCHEMA public TO fence_reader","REVOKE CREATE ON SCHEMA public FROM fence_reader");
+ await unsafe("CREATE SEQUENCE public.reader_seq; GRANT USAGE ON public.reader_seq TO fence_reader","DROP SEQUENCE public.reader_seq");
+ await unsafe("CREATE FUNCTION public.reader_write() RETURNS void LANGUAGE sql SECURITY DEFINER AS $$INSERT INTO public.messages VALUES(8,NULL)$$","DROP FUNCTION public.reader_write()");
+ await unsafe("CREATE TABLE public.reader_owned(id int); ALTER TABLE public.reader_owned OWNER TO fence_reader","DROP TABLE public.reader_owned");
+ await unsafe("CREATE VIEW public.reader_view AS SELECT * FROM public.messages; GRANT SELECT(id) ON public.reader_view TO fence_reader","DROP VIEW public.reader_view");
+ await unsafe("CREATE ROLE reader_parent; GRANT reader_parent TO fence_reader","REVOKE reader_parent FROM fence_reader; DROP ROLE reader_parent");
+ if(Number((await verifier.query("SHOW server_version_num")).rows[0].server_version_num)>=170000)
+   await unsafe("GRANT MAINTAIN ON public.messages TO fence_reader","REVOKE MAINTAIN ON public.messages FROM fence_reader");
+ await verifier.end();
+ await rejected({...readerManifest,reader:{...readerRole,oid:readerRole.oid+9999}},/reader principal/);
+ const readerOp=await connect();
+ const withReader=await acquireWriterFence(readerOp,readerManifest);
+ assert.equal(withReader.reader.oid,readerRole.oid);assert.equal(withReader.activationAuthorized,false);checks++;
+ assert.equal((await readClient.query("SELECT count(*)::int n FROM public.messages")).rows[0].n,0);
+ for(const sql of ["INSERT INTO public.messages VALUES(2,NULL)","CREATE TABLE public.forbidden(id int)","SET ROLE fence_owner","SELECT pg_catalog.lo_create(0)"])
+   {await assert.rejects(readClient.query(sql),e=>e.code==="42501");checks++;}
+ const dump=execFileSync(process.env.CATALOG_PG_BIN+"/pg_dump",["--host=127.0.0.1","--port="+port,"--username=fence_reader","--dbname=fence_owned","--schema-only","--no-owner","--no-privileges","--lock-wait-timeout=2s"],{timeout:10000,encoding:"utf8"});
+ assert.match(dump,/CREATE TABLE public.messages/);checks++;
+ await readerOp.end();
+ await assert.rejects(connect("fence_runtime"),e=>e.code==="28000");checks++;
  console.log(JSON.stringify({status:"PASS",checks,fixtureOnly:true,automaticReopen:false}));
 } finally {await Promise.allSettled(clients.map(c=>c.end()));}
