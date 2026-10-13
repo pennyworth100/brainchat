@@ -13,10 +13,13 @@ import {
 import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
 import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
-import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
+import { mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
 import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
+import { createTextSender } from "@/lib/text-message-client";
+import { createNegotiatedRoomSession } from "@/lib/durable-room-session";
+import { publicOwnerScope, publicDraft, publicDraftSnapshot, publicOutbox, reconcilePublicConfirmation, type PendingPublicOperation } from "@/lib/public-outbox";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -368,6 +371,10 @@ function RoomInner() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  const durableScopeRef = useRef<string | null>(null);
+  const editorRevisionRef = useRef(0);
+  const [durableError, setDurableError] = useState("");
+  const [pendingOperation, setPendingOperation] = useState<PendingPublicOperation>();
 
   // Timeline: mixed messages and system messages
   const [timeline, setTimeline] = useState<
@@ -382,7 +389,7 @@ function RoomInner() {
   const getId = () => nextId.current++;
 
   const socketRef = useRef<Socket | null>(null);
-  const sessionRef = useRef<RoomSession | null>(null);
+  const sessionRef = useRef<ReturnType<typeof createNegotiatedRoomSession> | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const msgInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -454,9 +461,11 @@ function RoomInner() {
   // Socket connection
   useEffect(() => {
     if (!roomId) return;
-    const socket = io();
+    const socket = io({ autoConnect: false, reconnection: false, transports: ["websocket"],
+      auth: { dimleProtocol: "durable-session-v1" } });
     socketRef.current = socket;
-    const session = createRoomSession(socket, {
+    let receivedSnapshot = false;
+    const session = createNegotiatedRoomSession(socket, {
       onState: (state) => {
         setConnectionState(state);
         if (state !== "ready") {
@@ -465,13 +474,40 @@ function RoomInner() {
         }
       },
       onSnapshot: ({ history, users }) => {
-        receiveMessages(history);
+        receiveMessages(history, receivedSnapshot && session.usesDurableProtocol());
+        receivedSnapshot = true;
         setUserList(users);
         setUserCount(users.length);
       },
       onJoined: () => {
         setJoinError("");
-        sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+        try {
+          sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
+          const scope = session.outboxScope();
+          const initialRestore = durableScopeRef.current !== scope;
+          durableScopeRef.current = scope;
+          // Transport sync must not overwrite a newer editor value after a storage failure.
+          const restoredDraft = publicDraft(localStorage, scope);
+          const restoreRevision = editorRevisionRef.current;
+          if (initialRestore) setMsgInput(restoredDraft);
+          const checkOwner = session.operationGuard(roomId);
+          void (initialRestore ? reconcilePublicConfirmation(scope, localStorage, checkOwner) : publicOutbox(scope, "read")).then((pending) => {
+            checkOwner();
+            if (durableScopeRef.current === scope) {
+              setPendingOperation(pending);
+              if (initialRestore) {
+                const savedDraft = publicDraft(localStorage, scope);
+                setMsgInput(current => editorRevisionRef.current === restoreRevision && current === restoredDraft ? savedDraft : current);
+              }
+            }
+          }).catch(() => {
+            try { checkOwner(); } catch { return; }
+            if (durableScopeRef.current === scope) setDurableError("Could not read saved delivery status. Sending is blocked.");
+          });
+        } catch {
+          durableScopeRef.current = null;
+          setDurableError("Browser storage is unavailable. Sending is blocked.");
+        }
       },
       onError: (message, terminal = true) => {
         setJoinError(message);
@@ -482,7 +518,9 @@ function RoomInner() {
       },
     });
     sessionRef.current = session;
-    const onMessage = (message: ChatMessage) => receiveMessages([message], true);
+    const onMessage = (message: ChatMessage) => {
+      if (!session.usesDurableProtocol()) receiveMessages([message], true);
+    };
     socket.on("chat-message", onMessage);
     socket.on("chat-file", onMessage);
     socket.on("chat-image", onMessage);
@@ -589,6 +627,10 @@ function RoomInner() {
       void Notification.requestPermission().catch(() => {});
     }
     const name = usernameInput.trim() || "User_" + Math.floor(10 + Math.random() * 90);
+    durableScopeRef.current = null;
+    setPendingOperation(undefined);
+    setDurableError("");
+    setMsgInput("");
     setUsername(name);
     usernameRef.current = name;
     if (!roomId) return;
@@ -602,20 +644,63 @@ function RoomInner() {
     });
   }, [usernameInput, passwordInput, roomId]);
 
+  const resolveSavedDelivery = async () => {
+    const session = sessionRef.current;
+    if (!session || !roomId) return;
+    try {
+      const check = session.operationGuard(roomId);
+      const scope = session.outboxScope();
+      await session.resolveText(); check();
+      const pending = await reconcilePublicConfirmation(scope, localStorage, check); check();
+      setPendingOperation(pending);
+      setMsgInput(publicDraft(localStorage, scope));
+    } catch { setDurableError("Could not verify saved delivery. Your work is retained."); }
+  };
+
   const sendMessage = useCallback(async () => {
     const msg = msgInput.trim();
     const session = sessionRef.current;
     const socket = socketRef.current;
-    if (!msg || !username || !session || !socket || sendingRef.current) return;
+    if (!msg || !username || !roomId || !session || !socket || sendingRef.current) return;
+    let checkOwner: () => void;
+    try { checkOwner = session.operationGuard(roomId); } catch { return; }
     sendingRef.current = true;
     setSending(true);
+    let unsentReservation: { scope: string; id: string } | undefined;
+    const sentEditorRevision = editorRevisionRef.current;
+    let dispatched = false;
     try {
-      await session.sync();
-      const result = await socket.timeout(10_000).emitWithAck("send-message", { roomId, message: msg });
-      if (result.error) throw new Error(result.error);
-      receiveMessages([result.message]);
-      setMsgInput((current) => current === msgInput ? "" : current);
+      const scope = durableScopeRef.current;
+      if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
+      const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "text", payload: msg, outcome: "unknown", draft: publicDraftSnapshot(localStorage, scope) };
+      await publicOutbox(scope, "reserve", operation);
+      unsentReservation = { scope, id: operation.clientMessageId };
+      checkOwner();
+      setPendingOperation(operation);
+      const message = await createTextSender(() => operation.clientMessageId).send(socket, session, roomId, msg, () => { dispatched = true; });
+      checkOwner();
+      const confirmed = { ...operation, outcome: "confirmed" as const, confirmedMessageId: message.id };
+      await publicOutbox(scope, "confirm", confirmed, operation.clientMessageId);
+      checkOwner();
+      setPendingOperation(confirmed);
+      await reconcilePublicConfirmation(scope, localStorage, checkOwner);
+      checkOwner();
+      setPendingOperation(undefined);
+      checkOwner();
+      receiveMessages([message]);
+      const savedDraft = publicDraft(localStorage, scope);
+      setMsgInput((current) => editorRevisionRef.current === sentEditorRevision && current === msgInput ? savedDraft : current);
     } catch (err) {
+      if (unsentReservation && !dispatched) {
+        try {
+          // Exact reservation only; no transport was invoked, even if its owner ended.
+          await publicOutbox(unsentReservation.scope, "settle", undefined, unsentReservation.id);
+          checkOwner();
+          setPendingOperation(undefined);
+        } catch { /* Failed deletion stays conservatively blocked; no replay. */ }
+      }
+      // Stale success/error must not clear a draft, publish or resync a new join.
+      try { checkOwner(); } catch { return; }
       setTimeline((prev) => [...prev, { kind: "sys", text: err instanceof Error && err.message !== "operation has timed out"
         ? err.message : "Delivery not confirmed. Check the chat before retrying; your draft is kept.", id: getId() }]);
       session.sync().catch(() => {});
@@ -623,30 +708,61 @@ function RoomInner() {
       sendingRef.current = false;
       setSending(false);
     }
-  }, [msgInput, username, roomId, receiveMessages]);
+  }, [msgInput, username, roomId, receiveMessages, durableError]);
 
   const uploadFile = useCallback(
     async (file: File) => {
       const session = sessionRef.current;
       if (!username || !file || !roomId || !session) return;
+      let checkOwner: () => void;
+      try { checkOwner = session.operationGuard(roomId); } catch { return; }
       const uploadId = getId();
       setTimeline((prev) => [...prev, { kind: "uploading", name: file.name, id: uploadId }]);
+      let unsentReservation: { scope: string; id: string } | undefined;
+      let dispatched = false;
       try {
-        const data = await uploadRoomFile(file, roomId, session);
+        const scope = durableScopeRef.current;
+        if (!scope || durableError) throw Error("Browser storage is unavailable. Nothing was sent.");
+        const operation: PendingPublicOperation = { clientMessageId: crypto.randomUUID(), kind: "file", payload: file, outcome: "unknown" };
+        await publicOutbox(scope, "reserve", operation);
+        unsentReservation = { scope, id: operation.clientMessageId };
+        checkOwner();
+        setPendingOperation(operation);
+        const data = await uploadRoomFile(file, roomId, session, fetch, operation.clientMessageId, () => { dispatched = true; });
+        checkOwner();
+        const confirmed = { ...operation, outcome: "confirmed" as const, confirmedMessageId: data.message.id };
+        await publicOutbox(scope, "confirm", confirmed, operation.clientMessageId);
+        checkOwner();
+        setPendingOperation(confirmed);
+        await reconcilePublicConfirmation(scope, localStorage, checkOwner);
+        checkOwner();
+        setPendingOperation(undefined);
+        checkOwner();
         // The server persists + broadcasts before returning. No second socket
         // send is needed, so a disconnect cannot strand an uploaded attachment.
         setTimeline((prev) => prev.filter((item) => item.id !== uploadId));
         receiveMessages([data.message]);
       } catch (err) {
+        if (unsentReservation && !dispatched) {
+          try {
+            await publicOutbox(unsentReservation.scope, "settle", undefined, unsentReservation.id);
+            checkOwner();
+            setPendingOperation(undefined);
+          } catch { /* Failed deletion remains blocked; never discard uncertain work. */ }
+        }
+        try { checkOwner(); } catch { return; }
         const reason = err instanceof Error ? err.message : "Please try again.";
         setTimeline((prev) => prev.map((item) => item.id === uploadId
           ? { kind: "sys" as const, text: `Upload failed: ${file.name} — ${reason}`, id: uploadId }
           : item));
       } finally {
-        session.sync().catch(() => {});
+        // Old work may remove its own spinner, never publish into or resync a
+        // replacement owner (including an explicit same-room rejoin).
+        setTimeline((prev) => prev.filter((item) => item.id !== uploadId || item.kind !== "uploading"));
+        try { checkOwner(); session.sync().catch(() => {}); } catch { /* owner ended */ }
       }
     },
-    [username, roomId, receiveMessages]
+    [username, roomId, receiveMessages, durableError]
   );
 
   const handleDrop = useCallback(
@@ -934,6 +1050,17 @@ function RoomInner() {
         })}
       </div>
 
+      {(durableError || pendingOperation) && (
+        <div role="alert" aria-label="Delivery status" className="px-5 py-2 text-sm text-dimle-text-primary">
+          {durableError || (pendingOperation?.outcome === "confirmed"
+            ? "Delivery confirmed. Saved draft cleanup is pending; reload to finish. Nothing will be resent."
+            : pendingOperation?.kind === "file"
+            ? "Attachment status is unknown. Saved attachment retained; check room history. Automatic retry is disabled."
+            : "Delivery is not confirmed. Saved message retained; check room history. Automatic retry is disabled.")}
+          {pendingOperation?.kind === "text" && connectionState === "ready" && !durableError &&
+            <button className="ml-3 underline" onClick={() => void resolveSavedDelivery()}>Check saved delivery</button>}
+        </div>
+      )}
       {/* Input bar */}
       <div className="chat-composer flex items-center gap-2 px-5 py-3 bg-dimle-card border-t border-dimle-border">
         <input
@@ -960,7 +1087,15 @@ function RoomInner() {
           type="text"
           aria-label="Message"
           value={msgInput}
-          onChange={(e) => setMsgInput(e.target.value)}
+          onChange={(e) => {
+            const value = e.target.value;
+            editorRevisionRef.current++;
+            setMsgInput(value);
+            try {
+              if (!durableScopeRef.current) throw Error();
+              publicDraft(localStorage, durableScopeRef.current, value);
+            } catch { setDurableError("Draft could not be saved. Sending is blocked; keep this page open."); }
+          }}
           onKeyDown={(e) => e.key === "Enter" && sendMessage()}
           placeholder="Type a message…"
           autoComplete="off"

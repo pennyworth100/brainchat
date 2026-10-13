@@ -1,4 +1,6 @@
 import express from "express";
+import { isWriteCapacityError, writeCapacityReply } from "./src/lib/write-capacity-error";
+import { createUploadDownloadRouter } from "./src/lib/upload-download";
 import http from "http";
 import { Server, type Socket } from "socket.io";
 import next from "next";
@@ -7,9 +9,17 @@ import multer from "multer";
 import { createUploadParser } from "./src/lib/upload-parser";
 import crypto from "crypto";
 import fs from "fs";
+import type { Pool } from "pg";
 import { and, asc, eq, desc, gt } from "drizzle-orm";
 import { RateLimiterPostgres } from "rate-limiter-flexible";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { RateLimitCleanup } from "./src/lib/rate-limit-cleanup";
+import { ResumeSessionCleanup } from "./src/lib/resume-session-cleanup";
+import { ResumeSessionScheduler } from "./src/lib/resume-session-scheduler";
+import { installProcessShutdown } from "./src/lib/process-shutdown";
+import { UploadStorageSettlement } from "./src/lib/upload-storage-settlement";
+import { ServerLifecycle, trackedHttp, callbackStage, handlerStage } from "./src/lib/server-lifecycle";
+import { consumeJoinLimits } from "./src/lib/join-rate-limits";
+import { migrateDatabase } from "./src/lib/db/startup-migrations";
 import { db, pool } from "./src/lib/db";
 import {
   authenticateAgent,
@@ -18,6 +28,27 @@ import {
 } from "./src/lib/agent-api-auth";
 import type { JoinErrorDetails } from "./src/lib/join-error";
 import { registerPrivateMessages } from "./src/lib/private-message";
+import { claimRoomPolicy } from "./src/lib/room-policy";
+import { ResumeStore } from "./src/lib/resume-store";
+import { ResumeBindings, type ResumeBinding } from "./src/lib/resume-bindings";
+import { ResumeMemberships } from "./src/lib/resume-membership";
+import { attachResumeSocket, type ResumeSocketOwner } from "./src/lib/resume-socket";
+import { RoomActivityWriter } from "./src/lib/room-activity";
+import { LegacyUploadAdmission } from "./src/lib/legacy-upload-admission";
+import { preflightResumeUpload } from "./src/lib/resume-upload-preflight";
+import { validateResumeUploadFraming } from "./src/lib/resume-upload-framing";
+import { ResumeOperationGate, ResumeUploadOperationGate } from "./src/lib/resume-operation";
+import { ResumeUploadAdmissions, type ResumeUploadGrant } from "./src/lib/resume-upload-admission";
+import { ResumeHistoryReader } from "./src/lib/resume-history";
+import { syncResumeSocket } from "./src/lib/resume-sync";
+import { ResumeMessageWriter } from "./src/lib/resume-message";
+import { ResumeTextReceiptReader } from "./src/lib/resume-text-receipt";
+import { ResumePublication } from "./src/lib/resume-publication";
+import { privateBrowserNegotiated, registerPrivateBrowserWire, PRIVATE_BROWSER_PROTOCOL } from "./src/lib/private-browser-wire";
+import { publishBrowserJoin } from "./src/lib/resume-browser-handshake";
+import { ResumeImageWriter } from "./src/lib/resume-image";
+import { createOwnedStrictUploadService, type OwnedStrictUploadConfiguration } from "./src/lib/owned-strict-upload-service";
+import { sendResumeText, sendResumeImage } from "./src/lib/resume-send";
 import { rooms as roomsTable, messages as messagesTable } from "./src/lib/db/schema";
 import {
   generateCreationToken,
@@ -42,19 +73,8 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_PASSWORD_LENGTH = 256;
 const MAX_USERNAME_LENGTH = 64;
 const MAX_MESSAGE_LENGTH = 10_000;
-const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 
 class IdempotencyConflictError extends Error {}
-
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-// In-memory: online users per room (transient socket state)
-const onlineUsers = new Map<string, Map<string, string>>();
-
-function getOrCreateOnlineRoom(roomId: string) {
-  if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Map());
-  return onlineUsers.get(roomId)!;
-}
 
 function getSocketClientIp(
   socket: Socket,
@@ -94,12 +114,12 @@ async function roomExists(roomId: string) {
   return rows.length > 0;
 }
 
-async function touchRoom(roomId: string) {
+const roomActivity = new RoomActivityWriter(async (roomId: string) => {
   await db
     .update(roomsTable)
     .set({ lastActiveAt: new Date() })
     .where(eq(roomsTable.id, roomId));
-}
+});
 
 async function saveMessage(
   roomId: string,
@@ -111,7 +131,7 @@ async function saveMessage(
     .insert(messagesTable)
     .values({ roomId, username, type, content, ts: new Date() })
     .returning();
-  touchRoom(roomId).catch(() => {});
+  await roomActivity.touch(roomId);
   return deserializeMessage(row);
 }
 
@@ -134,7 +154,7 @@ async function saveAgentMessage(
     .returning();
 
   if (inserted) {
-    touchRoom(roomId).catch(() => {});
+    await roomActivity.touch(roomId);
     return { message: deserializeMessage(inserted), deduplicated: false };
   }
 
@@ -214,10 +234,26 @@ async function loadMessagesAfterId(roomId: string, afterId: number) {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function main(options: Readonly<{
+  privateBrowserResume?: boolean;
+  strictUploads?: OwnedStrictUploadConfiguration;
+  // Private composition only. Caller owns these pools and closes them AFTER
+  // lifecycle settlement. No environment toggle or public activation.
+  databaseAuthorities?: Readonly<{ migrations: Pool; maintenance: Pool; publicationTables: boolean }>;
+}> = {}) {
+  const authorities = options.databaseAuthorities && { ...options.databaseAuthorities };
+  if (options.privateBrowserResume && !authorities?.publicationTables) {
+    throw Error("Private browser protocol requires isolated publication authorities");
+  }
+  if (authorities && (authorities.migrations === pool || authorities.maintenance === pool ||
+      authorities.migrations === authorities.maintenance)) {
+    throw Error("Database authorities require three distinct pools");
+  }
   // Run migrations
   console.log("Running database migrations...");
-  await migrate(db, { migrationsFolder: "./drizzle" });
+  await migrateDatabase(authorities?.migrations ?? pool);
+  // No upload namespace mutation during module import or failed migrations.
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   console.log("Migrations complete.");
 
   const app = next({ dev });
@@ -225,16 +261,46 @@ async function main() {
   await app.prepare();
 
   const expressApp = express();
+  expressApp.use("/candidate-recovery", (_req, res, next) => {
+    if (!options.privateBrowserResume) { res.sendStatus(404); return; }
+    next();
+  });
+  expressApp.get("/api/browser-session-mode", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ mode: options.privateBrowserResume ? "durable-session-v1" : "legacy" });
+  });
   const trustProxyHops = parseInt(process.env.TRUST_PROXY_HOPS || "0", 10);
   if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);
   const io = new Server(server);
+  const resumeStore = new ResumeStore(pool);
+  const resumeBindings = new ResumeBindings();
+  const resumeMembers = new ResumeMemberships(resumeBindings);
+  const resumeGate = new ResumeOperationGate(pool, resumeBindings);
+  const socketOwners = new WeakMap<Socket, ResumeSocketOwner>();
+  const legacyUploadAdmission = new LegacyUploadAdmission(resumeMembers, resumeGate);
+  const uploadAdmissions = new ResumeUploadAdmissions(resumeBindings);
+  const uploadGate = new ResumeUploadOperationGate(pool, uploadAdmissions);
+  const resumeHistory = new ResumeHistoryReader(resumeGate);
+  const resumeText = new ResumeMessageWriter(resumeGate);
+  const textReceipts = new ResumeTextReceiptReader(resumeGate);
+  const publication = new ResumePublication(resumeGate);
+  const resumeImage = new ResumeImageWriter(resumeGate);
+  // Paired writer/reader use one pool and root. No production physical provider
+  // yet: null provisioning keeps both disabled without a legacy fallback.
+  const strictFiles = await createOwnedStrictUploadService(pool, uploadAdmissions, options.strictUploads ?? null)
+    .catch(async error => { await app.close(); throw error; });
+  const strictUploads = strictFiles.uploads;
+  let startupLifecycle: ServerLifecycle | undefined;
+
+  try {
 
   const rateLimiterStore = {
     storeClient: pool,
     storeType: "pool" as const,
     tableName: "rate_limits",
     tableCreated: true,
+    clearExpiredByTimeout: false,
   };
   const createRoomLimiter = new RateLimiterPostgres({
     ...rateLimiterStore,
@@ -260,6 +326,22 @@ async function main() {
     points: 30,
     duration: 60 * 60,
   });
+  // One owner for the shared table, replacing four dependency-owned timers.
+  // Retained for coordinated shutdown; not a partial SIGTERM/recovery fence.
+  const maintenancePool = authorities?.maintenance ?? pool;
+  const rateLimitCleanup = new RateLimitCleanup(maintenancePool);
+  const sessionCleanup = new ResumeSessionScheduler(new ResumeSessionCleanup(
+    maintenancePool, authorities?.publicationTables ?? false));
+  const lifecycle = new ServerLifecycle({
+    stopAndSettle: async () => {
+      const [rateLimits, sessions] = await Promise.allSettled([
+        rateLimitCleanup.stopAndSettle(), sessionCleanup.stopAndSettle(),
+      ]);
+      return { rateLimits, sessions };
+    },
+  }, roomActivity);
+  lifecycle.own(strictFiles);
+  startupLifecycle = lifecycle;
 
   // Security headers
   expressApp.disable("x-powered-by");
@@ -282,10 +364,19 @@ async function main() {
     nxt();
   });
 
-  expressApp.use(express.json({ limit: "32kb" }));
+  // Credential uploads reject invalid framing before the generic JSON parser
+  // can consume a body with a forged Content-Type. Still no body/FS work here.
+  expressApp.use("/api/upload", (req, res, nxt) => {
+    if ((req.headers["x-resume-session-id"] !== undefined || req.headers["x-resume-token"] !== undefined) &&
+        !validateResumeUploadFraming(req)) {
+      return res.status(400).json({ error: "Invalid upload framing" });
+    }
+    nxt();
+  });
+  const jsonBody = callbackStage(express.json({ limit: "32kb" }));
 
   // ── Room creation ─────────────────────────────────────────────────────────
-  expressApp.post("/api/rooms", async (req, res) => {
+  expressApp.post("/api/rooms", trackedHttp(lifecycle, jsonBody, handlerStage(async (req, res) => {
     try {
       await createRoomLimiter.consume(req.ip || req.socket.remoteAddress || "unknown");
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -319,33 +410,14 @@ async function main() {
       console.error("POST /api/rooms error:", err);
       return res.status(500).json({ error: "Internal error" });
     }
-  });
+  })));
 
   // ── Serve uploaded files ──────────────────────────────────────────────────
-  expressApp.use(
-    "/uploads",
-    (req, res, nxt) => {
-      let rel: string;
-      try {
-        rel = decodeURIComponent(req.path);
-      } catch {
-        return res.status(400).end();
-      }
-      // Reject parent-directory segments, not ordinary names like report..pdf.
-      if (rel.split(/[\\/]/).includes("..")) return res.status(403).end();
-      nxt();
-    },
-    express.static(UPLOAD_DIR, {
-      setHeaders: (res) => {
-        res.setHeader("Content-Disposition", "attachment");
-        res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-        res.setHeader("Cache-Control", "private, max-age=3600");
-      },
-    })
-  );
+  expressApp.use("/uploads", createUploadDownloadRouter(UPLOAD_DIR, strictFiles.downloads, lifecycle));
 
   // ── File uploads ──────────────────────────────────────────────────────────
-  const storage = multer.diskStorage({
+  const storageSettlement = new UploadStorageSettlement();
+  const storage = storageSettlement.wrap(multer.diskStorage({
     destination: (req, _file, cb) => {
       const token = crypto.randomBytes(8).toString("hex");
       const dir = path.join(UPLOAD_DIR, token);
@@ -365,13 +437,13 @@ async function main() {
           .trim() || "file";
       cb(null, safe);
     },
-  });
+  }));
 
   const uploadMiddleware = createUploadParser(storage, MAX_FILE_SIZE);
 
   expressApp.post(
     "/api/upload",
-    async (req, res, nxt) => {
+    trackedHttp(lifecycle, handlerStage(async (req, res, nxt) => {
       const rawRoomId = req.headers["x-room-id"];
       const socketId = req.headers["x-socket-id"];
       if (
@@ -379,18 +451,16 @@ async function main() {
         typeof socketId !== "string" ||
         !isValidRoomId(rawRoomId)
       ) {
-        return res.status(401).json({ error: "Join the room before uploading" });
+        return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
       }
       const roomId = normalizeRoomId(rawRoomId);
-      const users = onlineUsers.get(roomId);
       const activeSocket = io.sockets.sockets.get(socketId);
-      if (!users?.has(socketId) || !activeSocket?.rooms.has(roomId)) {
-        return res.status(401).json({ error: "Join the room before uploading" });
+      const owner = activeSocket && socketOwners.get(activeSocket);
+      if (!activeSocket || !owner || !resumeMembers.bindingFor(activeSocket, owner, roomId)) {
+        return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
       }
-      res.locals.uploadIdentity = { roomId, username: users.get(socketId)! };
       try {
         await uploadLimiter.consume(`${req.ip || "unknown"}:${socketId}`);
-        nxt();
       } catch (err) {
         if (typeof err === "object" && err && "msBeforeNext" in err) {
           res.setHeader(
@@ -400,30 +470,139 @@ async function main() {
         }
         return res.status(429).json({ error: "Too many uploads. Try again later." });
       }
-    },
-    uploadMiddleware,
-    async (req, res) => {
-      if (!req.file) return res.status(400).json({ error: "No file" });
-      const token = (req as express.Request & { _uploadToken: string })._uploadToken;
-      const file = {
-        url: `/uploads/${token}/${req.file.filename}`,
-        name: req.file.originalname,
-        size: req.file.size,
-        mime: req.file.mimetype || "application/octet-stream",
-      };
       try {
-        // Authenticate before accepting bytes; then publish independently of
-        // the socket's lifetime (iOS may sleep while the HTTP upload finishes).
-        const { roomId, username } = res.locals.uploadIdentity;
-        const message = await saveMessage(roomId, username, "file", JSON.stringify(file));
-        io.to(roomId).emit("chat-file", message);
-        res.json({ ...file, message });
-      } catch (err) {
-        console.error("upload persistence error:", err);
-        fs.promises.unlink(req.file.path).catch(() => {});
-        res.status(500).json({ error: "Could not save the attachment. Please try again." });
+        // Header omission cannot restore legacy authority to a strict/resumed owner.
+        // Invalid/partial credentials MUST NOT fall back to socket-id authority.
+        const sessionId = req.headers["x-resume-session-id"];
+        const token = req.headers["x-resume-token"];
+        if (sessionId !== undefined || token !== undefined ||
+            !resumeMembers.legacyUploadBindingFor(activeSocket, owner, roomId)) {
+          const grant = await preflightResumeUpload(activeSocket, owner,
+            resumeMembers, resumeStore, uploadAdmissions, { roomId, sessionId, token });
+          if (!grant) return res.status(403).json({ error: "Upload credential rejected" });
+          if (req.destroyed || res.destroyed) {
+            uploadAdmissions.release(grant); // No parser/source work started.
+            return;
+          }
+          const result = await strictUploads.run(grant, req);
+          if (result.status === "saved") {
+            const { inserted, message } = result.value;
+            // A replay returns its durable receipt, never a second broadcast.
+            // Notification/activity/response failures cannot undo a committed file.
+            if (inserted) {
+              try { await roomActivity.touch(roomId); }
+              catch (error) { console.error("strict upload activity after save:", error); }
+              try { resumeMembers.broadcast(roomId, "chat-file", message); }
+              catch (error) { console.error("strict upload notification after save:", error); }
+            }
+            try { return res.json({ clientMessageId: result.clientMessageId, url: message.url, name: message.name,
+              size: message.size, mime: message.mime, message }); }
+            catch (error) { console.error("strict upload response after save:", error); res.destroy(); return; }
+          }
+          if (result.status === "invalid") return res.status(400).json({ error: "Invalid strict upload" });
+          if (result.status === "denied") return res.status(403).json({ error: "Upload authorization expired or changed" });
+          if (result.status === "failed") {
+            console.error("strict upload persistence:", result.error);
+            return res.status(result.commit === "unknown" ? 500 : 503).json({
+              code: result.commit === "unknown" ? "UPLOAD_OUTCOME_UNKNOWN" : "UPLOAD_NOT_COMMITTED",
+              error: "Attachment was not acknowledged. Check room history before uploading again.",
+            });
+          }
+          return res.status(503).json({ code: "UPLOAD_RESOURCE_UNAVAILABLE",
+            error: "Authenticated uploads are not available yet" });
+        }
+        // Revalidate AFTER asynchronous rate charging, before parser/FS effects.
+        // A room projection or a physically connected revoked socket is not authority.
+        const identity = await legacyUploadAdmission.authorize(activeSocket, owner, roomId);
+        if (!identity || req.destroyed || res.destroyed ||
+            resumeMembers.legacyUploadBindingFor(activeSocket, owner, roomId) !== identity) {
+          return res.status(401).json({ code: "UPLOAD_AUTH_REQUIRED", error: "Join the room before uploading" });
+        }
+        const grant = uploadAdmissions.admit(identity);
+        if (!grant) return res.status(429).json({ error: "Upload already in progress or capacity exhausted" });
+        res.locals.uploadGrant = grant;
+      } catch (error) {
+        console.error("upload admission error:", error);
+        return res.status(503).json({ error: "Could not authorize upload" });
       }
-    }
+      nxt();
+    }),
+    async (req, res) => {
+      // Multer abort may call back before late storage/cleanup. Retain BOTH,
+      // including a synchronous parser throw after starting storage work.
+      let failed = false, parserError: unknown;
+      try { await callbackStage(uploadMiddleware)(req, res); }
+      catch (error) { failed = true; parserError = error; }
+      await storageSettlement.settle(req);
+      if (failed) {
+        uploadAdmissions.release(res.locals.uploadGrant);
+        throw parserError;
+      }
+      return true;
+    },
+    handlerStage(async (req, res) => {
+      const grant: ResumeUploadGrant = res.locals.uploadGrant;
+      try {
+        if (!req.file) return res.status(400).json({ error: "No file" });
+        const token = (req as express.Request & { _uploadToken: string })._uploadToken;
+        const file = {
+          url: `/uploads/${token}/${req.file.filename}`,
+          name: req.file.originalname,
+          size: req.file.size,
+          mime: req.file.mimetype || "application/octet-stream",
+        };
+        const { roomId, username } = grant.binding;
+        let message: Awaited<ReturnType<typeof saveMessage>>;
+        try {
+          const outcome = await uploadGate.runWithOutcome(grant, async transaction => {
+            const saved = await transaction.query<MessageRow>(`INSERT INTO messages
+              (room_id, username, type, content, ts) VALUES ($1, $2, 'file', $3, clock_timestamp())
+              RETURNING id, room_id AS "roomId", username, type, content, ts`,
+            [roomId, username, JSON.stringify(file)]);
+            if (!saved.rows[0]) throw Error("Missing upload receipt");
+            return deserializeMessage(saved.rows[0]);
+          });
+          if (!outcome.completed) throw outcome.error;
+          if (!outcome.result.authorized) {
+            // Not 401: clients must not automatically re-upload. Preserve bytes.
+            return res.status(403).json({ error: "Upload authorization expired or changed" });
+          }
+          message = outcome.result.value;
+          // Outside the room SHARE lock to avoid lock upgrade deadlocks.
+          await roomActivity.touch(roomId);
+        } catch (err) {
+          // A rejected INSERT result is NOT proof of rollback. Preserve the bytes
+          // even when no row is visible: there is no safe retry/reclamation receipt.
+          console.error("upload persistence outcome unknown:", err);
+          if (isWriteCapacityError(err)) return res.status(503).json({
+            ...writeCapacityReply(), code: "UPLOAD_OUTCOME_UNKNOWN",
+            reason: "WRITE_CAPACITY_EXHAUSTED",
+            error: "Attachment storage capacity is exhausted. Check room history before uploading again.",
+          });
+          return res.status(500).json({
+            code: "UPLOAD_OUTCOME_UNKNOWN",
+            error: "Attachment status is unknown. Check room history before uploading again.",
+          });
+        }
+        try {
+          // Publication failure cannot invalidate an acknowledged saved message.
+          resumeMembers.broadcast(roomId, "chat-file", message);
+        } catch (err) {
+          console.error("upload notification error after save:", err);
+        }
+        // A response failure/disconnected client must never trigger byte cleanup.
+        try {
+          res.json({ ...file, message });
+        } catch (err) {
+          console.error("upload response error after save:", err);
+          res.destroy();
+        }
+      } finally {
+        // Actual parser/persistence settlement, never timeout/disconnect alone.
+        // Capacity release does not authorize cleanup or retry.
+        uploadAdmissions.release(grant);
+      }
+    }))
   );
 
   // ── API key middleware ────────────────────────────────────────────────────
@@ -445,8 +624,7 @@ async function main() {
   // GET /api/messages/:roomId
   expressApp.get(
     "/api/messages/:roomId",
-    requireApiKey,
-    async (req, res) => {
+    trackedHttp(lifecycle, handlerStage(requireApiKey), handlerStage(async (req, res) => {
       try {
         const rawRoomId = req.params.roomId as string;
         if (!isValidRoomId(rawRoomId))
@@ -472,11 +650,11 @@ async function main() {
         console.error("GET /api/messages error:", err);
         res.status(500).json({ error: "Internal error" });
       }
-    }
+    }))
   );
 
   // POST /api/send
-  expressApp.post("/api/send", requireApiKey, async (req, res) => {
+  expressApp.post("/api/send", trackedHttp(lifecycle, jsonBody, handlerStage(requireApiKey), handlerStage(async (req, res) => {
     try {
       const { roomId: rawRoomId, message, clientMessageId } = req.body;
       const principal = res.locals.agentPrincipal as AgentPrincipal;
@@ -505,58 +683,138 @@ async function main() {
         message,
         clientMessageId
       );
-      if (!result.deduplicated) io.to(roomId).emit("chat-message", result.message);
+      if (!result.deduplicated) resumeMembers.broadcast(roomId, "chat-message", result.message);
       res.json({ ok: true, ...result });
     } catch (err) {
       if (err instanceof IdempotencyConflictError) {
         return res.status(409).json({ error: err.message });
       }
       console.error("POST /api/send error:", err);
+      if (isWriteCapacityError(err)) return res.status(503).json(writeCapacityReply());
       res.status(500).json({ error: "Internal error" });
     }
-  });
+  })));
 
   // ── Socket.io ─────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
+    if (!lifecycle.accepting) { socket.disconnect(true); return; }
+    const onWorkError = (error: unknown) => console.error("Socket handler error:", error);
+    const draining = (...args: unknown[]) => {
+      const ack = args.at(-1);
+      if (typeof ack === "function") ack({ error: "Server is draining" });
+      else socket.emit("join-error", "Server is draining");
+    };
     let currentRoom: string | null = null;
+    let publishedBinding: ResumeBinding | null = null;
+    // Once issuance might have started, this physical owner can NEVER prove
+    // non-issuance (including concurrent authentication or a lost join ACK).
+    let joinIssuanceStarted = false;
+    let privateJoinAttempted = false;
+    const privateBrowser = privateBrowserNegotiated(socket, options.privateBrowserResume === true);
+    // Normal authenticated joins now use the real durable/session owner. Do not
+    // expose credentials or register resume until ALL protected paths migrate.
+    const owner = attachResumeSocket(socket, {
+      store: resumeStore, bindings: resumeBindings, memberships: resumeMembers,
+      issue: (roomId, username, authVersion) =>
+        resumeStore.issueAfterAuthenticatedJoin(roomId, username, authVersion),
+      prepare: async () => async () => {},
+      onCleanupError: error => console.error("Session cleanup error:", error),
+      publishJoin: async (binding, live) => {
+        const roomId = binding.roomId;
+        const current = () => live() && resumeMembers.isCurrent(binding, roomId);
+        if (privateBrowser) {
+          if (!current()) return false;
+          currentRoom = roomId;
+          return true; // no legacy snapshot: exact publication cut follows durable lease ACK
+        }
+        const history = await resumeHistory.read(binding);
+        if (history === null || !current()) return false;
+        currentRoom = roomId;
+        if (!current()) return false;
+        const users = resumeMembers.presence(roomId).users.map(user => user.username);
+        if (!resumeMembers.send(binding, roomId, "chat-history", history) || !current()) return false;
+        if (!resumeMembers.send(binding, roomId, "room-snapshot", {
+          history, users, capabilities: { textOperationKeys: true },
+        }) || !current()) return false;
+        publishedBinding = binding;
+        resumeMembers.broadcastExcept(binding, roomId, "system-message", `${binding.username} joined`);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+        if (!current()) return false;
+        resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
+        return current();
+      },
+    });
 
+    lifecycle.own(owner);
+    registerPrivateBrowserWire(socket, privateBrowser, owner, resumeMembers, publication, textReceipts, lifecycle,
+      binding => {
+        // Presence follows the confirmed durable publication cut, including
+        // resume/transfer. An old physical owner cannot publish for its successor.
+        if (!resumeMembers.isCurrent(binding, binding.roomId)) return;
+        const firstPublication = publishedBinding !== binding;
+        publishedBinding = binding;
+        currentRoom = binding.roomId;
+        if (firstPublication) resumeMembers.broadcastExcept(binding, binding.roomId,
+          "system-message", `${binding.username} joined`);
+        if (!resumeMembers.isCurrent(binding, binding.roomId)) return;
+        const presence = resumeMembers.presence(binding.roomId);
+        resumeMembers.broadcast(binding.roomId, "user-count", presence.count);
+        resumeMembers.broadcast(binding.roomId, "user-list", presence.users.map(user => user.username));
+      });
     socket.on(
       "join-room",
-      async ({
+      lifecycle.socket(async ({
         roomId: rawRoomId,
         username,
         password,
         creationToken,
+        operationId,
       }: {
         roomId: string;
         username: string;
         password?: string;
         creationToken?: string;
-      }) => {
+        operationId?: string;
+      }, ack?: (value: unknown) => void) => {
+        if (privateBrowser && typeof ack !== "function") return;
+        // Public retry always creates a fresh physical socket. Fence before any
+        // await: a concurrent successful authentication must not race a refusal.
+        if (privateBrowser) {
+          if (privateJoinAttempted) { ack!({ outcome: "unknown" }); return; }
+          privateJoinAttempted = true;
+        }
+        const refuse = (error: string, details?: JoinErrorDetails) => {
+          if (privateBrowser) {
+            if (!joinIssuanceStarted && typeof rawRoomId === "string" &&
+                typeof username === "string" && typeof operationId === "string" &&
+                /^[A-Za-z0-9_-]{16,128}$/.test(operationId)) {
+              ack!({ protocol: PRIVATE_BROWSER_PROTOCOL, outcome: "join-not-issued",
+                roomId: normalizeRoomId(rawRoomId), username, operationId, error, ...details });
+            } else ack!({ outcome: "unknown" });
+          } else socket.emit("join-error", error, details);
+        };
         if (typeof rawRoomId !== "string" || !rawRoomId || !username) return;
         if (!isValidRoomId(rawRoomId)) {
-          socket.emit("join-error", "Invalid room ID");
+          refuse("Invalid room ID");
           return;
         }
         const roomId = normalizeRoomId(rawRoomId);
         if (typeof username !== "string" || username.length > MAX_USERNAME_LENGTH) {
-          socket.emit("join-error", "Username is too long");
+          refuse("Username is too long");
           return;
         }
         if ((password?.length ?? 0) > MAX_PASSWORD_LENGTH) {
-          socket.emit("join-error", "Password is too long");
+          refuse("Password is too long");
           return;
         }
         try {
           const clientIp = getSocketClientIp(socket, trustProxyHops);
-          await Promise.all([
-            joinIpLimiter.consume(clientIp),
-            joinRoomLimiter.consume(`${clientIp}:${roomId}`),
-          ]);
+          await consumeJoinLimits(joinIpLimiter, joinRoomLimiter, clientIp, roomId);
 
           let room = await getRoom(roomId);
           if (!room) {
-            socket.emit("join-error", "Room not found");
+            refuse("Room not found");
             return;
           }
 
@@ -565,51 +823,42 @@ async function main() {
               ? hashCreationToken(creationToken)
               : "";
             if (!safeEqual(room.creationTokenHash, providedTokenHash)) {
-              socket.emit("join-error", "Room is not ready yet");
+              refuse("Room is not ready yet");
               return;
             }
 
             const passwordHash = password ? await hashPassword(password) : null;
-            const [claimed] = await db
-              .update(roomsTable)
-              .set({ passwordHash, creationTokenHash: null })
-              .where(
-                and(
-                  eq(roomsTable.id, roomId),
-                  eq(roomsTable.creationTokenHash, room.creationTokenHash)
-                )
-              )
-              .returning();
+            const claimed = await claimRoomPolicy(pool, roomId, room.creationTokenHash, passwordHash);
             if (!claimed) {
-              socket.emit("join-error", "Room was already claimed");
+              refuse("Room was already claimed");
               return;
             }
-            room = claimed;
+            room = { ...room, ...claimed };
           } else if (
             room.passwordHash &&
             !(await verifyPassword(room.passwordHash, password || ""))
           ) {
-            socket.emit("join-error", "Wrong password");
+            refuse("Wrong password");
             return;
           }
           if (!socket.connected) return;
           // This client has one active room. Do not leave stale memberships.
           if (currentRoom && currentRoom !== roomId) return;
-          currentRoom = roomId;
-          const users = getOrCreateOnlineRoom(roomId);
-          users.set(socket.id, username);
-          await socket.join(roomId);
-          socket.emit("room-info", { hasPassword: !!room.passwordHash });
-          const history = await loadHistory(roomId);
-          if (!socket.connected) return;
-          socket.emit("chat-history", history); // v3.0.1 compatibility
-          socket.emit("room-snapshot", { history, users: Array.from(users.values()) });
-          socket.to(roomId).emit("system-message", `${username} joined`);
-          io.to(roomId).emit("user-count", users.size);
-          io.to(roomId).emit("user-list", Array.from(users.values()));
+          joinIssuanceStarted = true;
+          if (privateBrowser) {
+            const sent = await publishBrowserJoin(socket, owner, resumeMembers,
+              { roomId, username, authVersion: room.authVersion }, lease => ack!({
+                protocol: PRIVATE_BROWSER_PROTOCOL, lease,
+              }));
+            if (!sent && socket.connected) ack!({ outcome: "unknown" });
+            return;
+          }
+          const joined = await owner.join({ roomId, username, authVersion: room.authVersion });
+          if (!joined || !resumeMembers.isCurrent(joined.binding, roomId)) return;
+          resumeMembers.send(joined.binding, roomId, "room-info", { hasPassword: !!room.passwordHash });
         } catch (err) {
-          if (typeof err === "object" && err && "msBeforeNext" in err) {
-            socket.emit("join-error", "Too many attempts. Try again later.", {
+          if (!joinIssuanceStarted && typeof err === "object" && err && "msBeforeNext" in err) {
+            refuse("Too many attempts. Try again later.", {
               code: "RATE_LIMITED", retryAfterMs: Number(err.msBeforeNext),
             } satisfies JoinErrorDetails);
             return;
@@ -617,89 +866,93 @@ async function main() {
           console.error("join-room error:", err);
           socket.emit("join-error", "Server error", { code: "SERVER_ERROR" } satisfies JoinErrorDetails);
         }
-      }
+      }, draining, onWorkError)
     );
 
-    socket.on("sync-room", async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack) => {
+    socket.on("sync-room", lifecycle.socket(async (payload: { roomId?: unknown; probeOnly?: unknown } | null, ack: ((value: any) => void) | undefined) => {
       if (typeof ack !== "function") return;
       const roomId = payload?.roomId;
-      if (typeof roomId !== "string" || roomId !== currentRoom || !socket.rooms.has(roomId) || !onlineUsers.get(roomId)?.has(socket.id)) {
+      const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+      if (!binding) {
         return ack({ error: "Rejoin the room" });
       }
       // Membership/transport liveness only, not database or history readiness.
       // Keep the existing event for rolling compatibility with older clients.
-      if (payload?.probeOnly === true) return ack({ ok: true });
       try {
-        const history = await loadHistory(roomId);
-        if (!socket.connected) return;
-        ack({ history, users: Array.from(onlineUsers.get(roomId)?.values() || []) });
+        const handedOff = await syncResumeSocket(socket, owner, binding, resumeMembers, resumeHistory, payload, ack);
+        if (!handedOff && resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       } catch (err) {
         console.error("sync-room error:", err);
-        ack({ error: "Could not sync the room" });
+        if (resumeMembers.isCurrent(binding, binding.roomId)) ack({ error: "Could not sync the room" });
       }
-    });
+    }, draining, onWorkError));
 
-    socket.on(
-      "send-message",
-      async ({ roomId, message }: { roomId: string; message: string }, ack) => {
+    // Existing normal-join clients use the same exact physical/session authority.
+    // Missing keys retain legacy one-attempt semantics; never auto-retry them.
+    // An explicit key permits a same-session receipt lookup, not replayed fanout.
+    for (const event of ["send-message", "send-image"] as const) {
+      socket.on(event, lifecycle.socket(async (payload: { roomId?: unknown; message?: unknown; dataUrl?: unknown; clientMessageId?: unknown } | null, ack: ((value: any) => void) | undefined) => {
         const reply = typeof ack === "function" ? ack : () => {};
-        if (!roomId || typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LENGTH) {
+        const roomId = payload?.roomId;
+        if (event === "send-message" && (!roomId || typeof payload?.message !== "string" ||
+            !payload.message.trim() || payload.message.length > MAX_MESSAGE_LENGTH)) {
           return reply({ error: "Invalid message" });
         }
-        const username = onlineUsers.get(roomId)?.get(socket.id);
-        if (!username || !socket.rooms.has(roomId)) return reply({ error: "Rejoin the room before sending" });
+        const binding = typeof roomId === "string" ? resumeMembers.bindingFor(socket, owner, roomId) : null;
+        if (!binding) return reply({ error: "Rejoin the room before sending" });
+        const current = () => resumeMembers.isCurrent(binding, binding.roomId);
+        const request = { roomId, clientMessageId: payload?.clientMessageId === undefined
+          ? crypto.randomUUID() : payload.clientMessageId };
+        const handoff = (receipt: { clientMessageId: string; message: unknown }) => {
+          // Preserve legacy sender echo, including old image clients without ACK.
+          // Exact outbound lease rechecked independently from the ACK.
+          reply(receipt);
+          resumeMembers.send(binding, binding.roomId,
+            event === "send-message" ? "chat-message" : "chat-image", receipt.message);
+        };
         try {
-          const saved = await saveMessage(roomId, username, "message", message);
-          io.to(roomId).emit("chat-message", saved);
-          reply({ message: saved });
+          const result = event === "send-message"
+            ? await sendResumeText(socket, owner, binding, resumeMembers, resumeText,
+              { ...request, message: payload?.message }, handoff)
+            : await sendResumeImage(socket, owner, binding, resumeMembers, resumeImage,
+              { ...request, dataUrl: payload?.dataUrl }, handoff);
+          if (result.committed === true) {
+            // Best effort activity only, outside the gate's room SHARE lock.
+            if (result.inserted) await roomActivity.touch(binding.roomId);
+            for (const failure of result.errors) console.error(event + " handoff " + failure.stage, failure.error);
+          } else if (current()) {
+            reply(result.committed === null
+              ? { error: "Write outcome unknown; sync before retrying", outcome: "unknown", clientMessageId: request.clientMessageId }
+              : { error: "Message denied or invalid" });
+          }
         } catch (err) {
-          console.error("send-message error:", err);
-          reply({ error: "Could not save the message" });
+          console.error(event + " error:", err);
+          if (current() && isWriteCapacityError(err)) return reply({
+            ...writeCapacityReply(), clientMessageId: request.clientMessageId,
+          });
+          // Even a COMMIT rejection can mean a committed row. Never claim rollback.
+          if (current()) reply({ error: "Write outcome unknown; sync before retrying",
+            outcome: "unknown", clientMessageId: request.clientMessageId });
         }
-      }
-    );
+      }, draining, onWorkError));
+    }
 
-    // Files are now saved and broadcast by POST /api/upload. The old
-    // v3.0.1 send-file notification is intentionally ignored to avoid doubles.
+    // Files are saved by POST /api/upload; old send-file remains ignored.
 
-    socket.on(
-      "send-image",
-      async ({ roomId, dataUrl }: { roomId: string; dataUrl: string }) => {
-        if (!roomId || !dataUrl) return;
-        if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return;
-        if (!/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(dataUrl)) return;
-        const users = onlineUsers.get(roomId);
-        if (!users) return;
-        const username = users.get(socket.id);
-        if (!username) return;
-        try {
-          const content = JSON.stringify({ dataUrl });
-          const saved = await saveMessage(roomId, username, "image", content);
-          io.to(roomId).emit("chat-image", saved);
-        } catch (err) {
-          console.error("send-image error:", err);
-        }
-      }
-    );
-
-    registerPrivateMessages(io, socket, onlineUsers);
+    registerPrivateMessages(socket, owner, resumeMembers, resumeGate, 5000, lifecycle);
+    socketOwners.set(socket, owner);
 
     socket.on("disconnect", () => {
-      if (!currentRoom) return;
-      const users = onlineUsers.get(currentRoom);
-      if (!users) return;
-      const username = users.get(socket.id);
-      users.delete(socket.id);
-      if (users.size === 0) {
-        onlineUsers.delete(currentRoom);
-      } else {
-        io.to(currentRoom).emit("system-message", `${username} left`);
-        io.to(currentRoom).emit("user-count", users.size);
-        io.to(currentRoom).emit(
-          "user-list",
-          Array.from(users.values())
-        );
-      }
+      void lifecycle.closeOwner(owner);
+      socketOwners.delete(socket);
+      // Authority is released synchronously at disconnecting. A displaced
+      // transport must not announce its live logical successor as departed.
+      if (!publishedBinding) return;
+      const { roomId, sessionId, username } = publishedBinding;
+      if (resumeMembers.presence(roomId).users.some(user => user.id === sessionId)) return;
+      resumeMembers.broadcast(roomId, "system-message", `${username} left`);
+      resumeMembers.broadcast(roomId, "user-count", resumeMembers.presence(roomId).count);
+      resumeMembers.broadcast(roomId, "user-list", resumeMembers.presence(roomId).users.map(user => user.username));
     });
   });
 
@@ -719,12 +972,39 @@ async function main() {
     return handle(req, res);
   });
 
-  server.listen(PORT, () => {
-    console.log(`Dimle running on http://localhost:${PORT}`);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(PORT, () => { server.off("error", reject); resolve(); });
   });
+  console.log(`Dimle running on http://localhost:${PORT}`);
+  sessionCleanup.start();
+  return { lifecycle, server, io, app, settleStrictUploads: strictFiles.close };
+  } catch (error) {
+    await startupLifecycle?.stopAndSettle();
+    await strictFiles.close();
+    await new Promise<void>(resolve => io.close(() => resolve()));
+    await app.close();
+    throw error;
+  }
 }
 
-main().catch((err) => {
+if (require.main === module) main().then(runtime => {
+  installProcessShutdown(process, async () => {
+    const report = await runtime.lifecycle.stopAndSettle();
+    // Lifecycle reports owner failures; this retained promise additionally
+    // refuses pool shutdown / a successful process report on ledger failure.
+    await runtime.settleStrictUploads();
+    await new Promise<void>((resolve, reject) => runtime.io.close(error => error ? reject(error) : resolve()));
+    await runtime.app.close();
+    await pool.end();
+    return report;
+  }, (event, detail) => {
+    if (event === "failed") {
+      process.exitCode = 1;
+      console.error("Dimle shutdown failed; settlement unconfirmed", detail);
+    } else console.log("Dimle shutdown " + event, detail ?? "");
+  });
+}).catch((err) => {
   console.error("Failed to start:", err);
   process.exit(1);
 });

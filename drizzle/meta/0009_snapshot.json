@@ -1,0 +1,889 @@
+{
+  "id": "5b1795a3-6dbe-41de-a8b1-604dfb434073",
+  "prevId": "5426ad2d-121d-4922-b1a0-c78ddce0a3f1",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.messages": {
+      "name": "messages",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "room_id": {
+          "name": "room_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "username": {
+          "name": "username",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'message'"
+        },
+        "content": {
+          "name": "content",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "client_message_id": {
+          "name": "client_message_id",
+          "type": "varchar(128)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ts": {
+          "name": "ts",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "messages_agent_idempotency_idx": {
+          "name": "messages_agent_idempotency_idx",
+          "columns": [
+            {
+              "expression": "room_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "username",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "client_message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "messages_room_id_rooms_id_fk": {
+          "name": "messages_room_id_rooms_id_fk",
+          "tableFrom": "messages",
+          "tableTo": "rooms",
+          "columnsFrom": [
+            "room_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.rate_limits": {
+      "name": "rate_limits",
+      "schema": "",
+      "columns": {
+        "key": {
+          "name": "key",
+          "type": "varchar(255)",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "points": {
+          "name": "points",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "expire": {
+          "name": "expire",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.resume_message_receipts": {
+      "name": "resume_message_receipts",
+      "schema": "",
+      "columns": {
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "client_message_id": {
+          "name": "client_message_id",
+          "type": "varchar(128)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload_hash": {
+          "name": "payload_hash",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "resume_receipts_message_idx": {
+          "name": "resume_receipts_message_idx",
+          "columns": [
+            {
+              "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "resume_message_receipts_session_id_room_resume_sessions_id_fk": {
+          "name": "resume_message_receipts_session_id_room_resume_sessions_id_fk",
+          "tableFrom": "resume_message_receipts",
+          "tableTo": "room_resume_sessions",
+          "columnsFrom": [
+            "session_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "resume_message_receipts_message_id_messages_id_fk": {
+          "name": "resume_message_receipts_message_id_messages_id_fk",
+          "tableFrom": "resume_message_receipts",
+          "tableTo": "messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "resume_message_receipts_session_id_client_message_id_pk": {
+          "name": "resume_message_receipts_session_id_client_message_id_pk",
+          "columns": [
+            "session_id",
+            "client_message_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.resume_upload_attempts": {
+      "name": "resume_upload_attempts",
+      "schema": "",
+      "columns": {
+        "storage_key": {
+          "name": "storage_key",
+          "type": "varchar(64)",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "room_id": {
+          "name": "room_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "client_message_id": {
+          "name": "client_message_id",
+          "type": "varchar(128)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reserved_bytes": {
+          "name": "reserved_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "resume_upload_attempt_bounds": {
+          "name": "resume_upload_attempt_bounds",
+          "value": "\"resume_upload_attempts\".\"reserved_bytes\" > 0 AND \"resume_upload_attempts\".\"reserved_bytes\" <= 104857600 AND \"resume_upload_attempts\".\"storage_key\" ~ '^[0-9a-f]{64}$'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.resume_upload_budget": {
+      "name": "resume_upload_budget",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "capacity_bytes": {
+          "name": "capacity_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reserved_bytes": {
+          "name": "reserved_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "resume_upload_budget_bounds": {
+          "name": "resume_upload_budget_bounds",
+          "value": "\"resume_upload_budget\".\"id\" = 1 AND \"resume_upload_budget\".\"capacity_bytes\" > 0 AND \"resume_upload_budget\".\"capacity_bytes\" <= 9007199254740991 AND \"resume_upload_budget\".\"reserved_bytes\" >= 0 AND \"resume_upload_budget\".\"reserved_bytes\" <= \"resume_upload_budget\".\"capacity_bytes\""
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.room_resume_sessions": {
+      "name": "room_resume_sessions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "token_hash": {
+          "name": "token_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "room_id": {
+          "name": "room_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "username": {
+          "name": "username",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_version": {
+          "name": "auth_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "generation": {
+          "name": "generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_operation_id": {
+          "name": "last_operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_transport_id": {
+          "name": "last_transport_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "issued_at": {
+          "name": "issued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "resume_sessions_expiry_idx": {
+          "name": "resume_sessions_expiry_idx",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "room_resume_sessions_room_id_rooms_id_fk": {
+          "name": "room_resume_sessions_room_id_rooms_id_fk",
+          "tableFrom": "room_resume_sessions",
+          "tableTo": "rooms",
+          "columnsFrom": [
+            "room_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "room_resume_sessions_token_hash_unique": {
+          "name": "room_resume_sessions_token_hash_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "token_hash"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.rooms": {
+      "name": "rooms",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "auth_version": {
+          "name": "auth_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "password_hash": {
+          "name": "password_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creation_token_hash": {
+          "name": "creation_token_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_active_at": {
+          "name": "last_active_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.upload_resource_attempts": {
+      "name": "upload_resource_attempts",
+      "schema": "",
+      "columns": {
+        "attempt_id": {
+          "name": "attempt_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "database_identity": {
+          "name": "database_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_identity": {
+          "name": "schema_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "quota_domain": {
+          "name": "quota_domain",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "namespace": {
+          "name": "namespace",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_version": {
+          "name": "policy_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "writer_generation": {
+          "name": "writer_generation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "audit_id": {
+          "name": "audit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "writer_id": {
+          "name": "writer_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "allocated_bytes": {
+          "name": "allocated_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "objects": {
+          "name": "objects",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_snapshot": {
+          "name": "policy_snapshot",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "resource_attempt_operation_idx": {
+          "name": "resource_attempt_operation_idx",
+          "columns": [
+            {
+              "expression": "database_identity",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "schema_identity",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "quota_domain",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "operation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "resource_attempt_policy_fk": {
+          "name": "resource_attempt_policy_fk",
+          "tableFrom": "upload_resource_attempts",
+          "tableTo": "upload_resource_policies",
+          "columnsFrom": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain",
+            "namespace",
+            "policy_version",
+            "writer_generation"
+          ],
+          "columnsTo": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain",
+            "namespace",
+            "policy_version",
+            "writer_generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "restrict"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "resource_attempt_identity": {
+          "name": "resource_attempt_identity",
+          "value": "length(\"upload_resource_attempts\".\"database_identity\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"database_identity\" = btrim(\"upload_resource_attempts\".\"database_identity\") AND \"upload_resource_attempts\".\"database_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"schema_identity\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"schema_identity\" = btrim(\"upload_resource_attempts\".\"schema_identity\") AND \"upload_resource_attempts\".\"schema_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"quota_domain\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"quota_domain\" = btrim(\"upload_resource_attempts\".\"quota_domain\") AND \"upload_resource_attempts\".\"quota_domain\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"namespace\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"namespace\" = btrim(\"upload_resource_attempts\".\"namespace\") AND \"upload_resource_attempts\".\"namespace\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"policy_version\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"policy_version\" = btrim(\"upload_resource_attempts\".\"policy_version\") AND \"upload_resource_attempts\".\"policy_version\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"writer_generation\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"writer_generation\" = btrim(\"upload_resource_attempts\".\"writer_generation\") AND \"upload_resource_attempts\".\"writer_generation\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"audit_id\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"audit_id\" = btrim(\"upload_resource_attempts\".\"audit_id\") AND \"upload_resource_attempts\".\"audit_id\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"operation_id\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"operation_id\" = btrim(\"upload_resource_attempts\".\"operation_id\") AND \"upload_resource_attempts\".\"operation_id\" !~ '[[:cntrl:]]' AND length(\"upload_resource_attempts\".\"writer_id\") BETWEEN 1 AND 512 AND \"upload_resource_attempts\".\"writer_id\" = btrim(\"upload_resource_attempts\".\"writer_id\") AND \"upload_resource_attempts\".\"writer_id\" !~ '[[:cntrl:]]'"
+        },
+        "resource_attempt_charge": {
+          "name": "resource_attempt_charge",
+          "value": "\"upload_resource_attempts\".\"allocated_bytes\" BETWEEN 1 AND 9007199254740991 AND \"upload_resource_attempts\".\"objects\" BETWEEN 1 AND 9007199254740991"
+        },
+        "resource_attempt_snapshot": {
+          "name": "resource_attempt_snapshot",
+          "value": "(\n  jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\") = 'object'\n  AND \"upload_resource_attempts\".\"policy_snapshot\" @> jsonb_build_object(\n    'adapter', 'multer-crossing-byte-v1',\n    'layout', 'provisioned-root-one-directory-one-file-v1',\n    'allocationModel', 'audited-rounded-copies-v1',\n    'stableExclusiveNamespace', true, 'allAllocationCostsBounded', true,\n    'identity', jsonb_build_object('database', \"upload_resource_attempts\".\"database_identity\",\n      'schema', \"upload_resource_attempts\".\"schema_identity\", 'quotaDomain', \"upload_resource_attempts\".\"quota_domain\",\n      'namespace', \"upload_resource_attempts\".\"namespace\", 'policyVersion', \"upload_resource_attempts\".\"policy_version\",\n      'writerGeneration', \"upload_resource_attempts\".\"writer_generation\"))\n  AND \"upload_resource_attempts\".\"policy_snapshot\" ?& ARRAY['maxFileBytes','allocationUnitBytes','allocationCopies',\n    'directoryAndParentBytes','metadataBytes','temporaryBytes','additionalObjects']\n  AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'maxFileBytes') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'maxFileBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'maxFileBytes')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'maxFileBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'allocationUnitBytes') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric BETWEEN 1 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'allocationCopies') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationCopies')::numeric BETWEEN 1 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationCopies')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'allocationCopies')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'directoryAndParentBytes') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'metadataBytes') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'metadataBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'metadataBytes')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'metadataBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'temporaryBytes') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'temporaryBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'temporaryBytes')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'temporaryBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_attempts\".\"policy_snapshot\"->'additionalObjects') = 'number'\n        THEN (\"upload_resource_attempts\".\"policy_snapshot\"->>'additionalObjects')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_attempts\".\"policy_snapshot\"->>'additionalObjects')::numeric) = (\"upload_resource_attempts\".\"policy_snapshot\"->>'additionalObjects')::numeric\n        ELSE false END\n) IS TRUE"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.upload_resource_domains": {
+      "name": "upload_resource_domains",
+      "schema": "",
+      "columns": {
+        "database_identity": {
+          "name": "database_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_identity": {
+          "name": "schema_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "quota_domain": {
+          "name": "quota_domain",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "writer_generation": {
+          "name": "writer_generation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "active": {
+          "name": "active",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "audit_id": {
+          "name": "audit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "capacity_bytes": {
+          "name": "capacity_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "headroom_bytes": {
+          "name": "headroom_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "baseline_bytes": {
+          "name": "baseline_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outstanding_bytes": {
+          "name": "outstanding_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "capacity_objects": {
+          "name": "capacity_objects",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "headroom_objects": {
+          "name": "headroom_objects",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "baseline_objects": {
+          "name": "baseline_objects",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outstanding_objects": {
+          "name": "outstanding_objects",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "resource_domain_pk": {
+          "name": "resource_domain_pk",
+          "columns": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "resource_domain_identity": {
+          "name": "resource_domain_identity",
+          "value": "length(\"upload_resource_domains\".\"database_identity\") BETWEEN 1 AND 512 AND \"upload_resource_domains\".\"database_identity\" = btrim(\"upload_resource_domains\".\"database_identity\") AND \"upload_resource_domains\".\"database_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_domains\".\"schema_identity\") BETWEEN 1 AND 512 AND \"upload_resource_domains\".\"schema_identity\" = btrim(\"upload_resource_domains\".\"schema_identity\") AND \"upload_resource_domains\".\"schema_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_domains\".\"quota_domain\") BETWEEN 1 AND 512 AND \"upload_resource_domains\".\"quota_domain\" = btrim(\"upload_resource_domains\".\"quota_domain\") AND \"upload_resource_domains\".\"quota_domain\" !~ '[[:cntrl:]]' AND length(\"upload_resource_domains\".\"writer_generation\") BETWEEN 1 AND 512 AND \"upload_resource_domains\".\"writer_generation\" = btrim(\"upload_resource_domains\".\"writer_generation\") AND \"upload_resource_domains\".\"writer_generation\" !~ '[[:cntrl:]]' AND length(\"upload_resource_domains\".\"audit_id\") BETWEEN 1 AND 512 AND \"upload_resource_domains\".\"audit_id\" = btrim(\"upload_resource_domains\".\"audit_id\") AND \"upload_resource_domains\".\"audit_id\" !~ '[[:cntrl:]]'"
+        },
+        "resource_domain_bytes": {
+          "name": "resource_domain_bytes",
+          "value": "\"upload_resource_domains\".\"capacity_bytes\" BETWEEN 1 AND 9007199254740991 AND \"upload_resource_domains\".\"headroom_bytes\" BETWEEN 0 AND 9007199254740991 AND \"upload_resource_domains\".\"baseline_bytes\" BETWEEN 0 AND 9007199254740991 AND \"upload_resource_domains\".\"outstanding_bytes\" BETWEEN 0 AND 9007199254740991\n    AND \"upload_resource_domains\".\"headroom_bytes\" + \"upload_resource_domains\".\"baseline_bytes\" + \"upload_resource_domains\".\"outstanding_bytes\" <= \"upload_resource_domains\".\"capacity_bytes\""
+        },
+        "resource_domain_objects": {
+          "name": "resource_domain_objects",
+          "value": "\"upload_resource_domains\".\"capacity_objects\" BETWEEN 1 AND 9007199254740991 AND \"upload_resource_domains\".\"headroom_objects\" BETWEEN 0 AND 9007199254740991 AND \"upload_resource_domains\".\"baseline_objects\" BETWEEN 0 AND 9007199254740991 AND \"upload_resource_domains\".\"outstanding_objects\" BETWEEN 0 AND 9007199254740991\n    AND \"upload_resource_domains\".\"headroom_objects\" + \"upload_resource_domains\".\"baseline_objects\" + \"upload_resource_domains\".\"outstanding_objects\" <= \"upload_resource_domains\".\"capacity_objects\""
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.upload_resource_policies": {
+      "name": "upload_resource_policies",
+      "schema": "",
+      "columns": {
+        "database_identity": {
+          "name": "database_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_identity": {
+          "name": "schema_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "quota_domain": {
+          "name": "quota_domain",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "namespace": {
+          "name": "namespace",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_version": {
+          "name": "policy_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "writer_generation": {
+          "name": "writer_generation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_snapshot": {
+          "name": "policy_snapshot",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "resource_policy_domain_fk": {
+          "name": "resource_policy_domain_fk",
+          "tableFrom": "upload_resource_policies",
+          "tableTo": "upload_resource_domains",
+          "columnsFrom": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain"
+          ],
+          "columnsTo": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "restrict"
+        }
+      },
+      "compositePrimaryKeys": {
+        "resource_policy_pk": {
+          "name": "resource_policy_pk",
+          "columns": [
+            "database_identity",
+            "schema_identity",
+            "quota_domain",
+            "namespace",
+            "policy_version",
+            "writer_generation"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "resource_policy_identity": {
+          "name": "resource_policy_identity",
+          "value": "length(\"upload_resource_policies\".\"database_identity\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"database_identity\" = btrim(\"upload_resource_policies\".\"database_identity\") AND \"upload_resource_policies\".\"database_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_policies\".\"schema_identity\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"schema_identity\" = btrim(\"upload_resource_policies\".\"schema_identity\") AND \"upload_resource_policies\".\"schema_identity\" !~ '[[:cntrl:]]' AND length(\"upload_resource_policies\".\"quota_domain\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"quota_domain\" = btrim(\"upload_resource_policies\".\"quota_domain\") AND \"upload_resource_policies\".\"quota_domain\" !~ '[[:cntrl:]]' AND length(\"upload_resource_policies\".\"namespace\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"namespace\" = btrim(\"upload_resource_policies\".\"namespace\") AND \"upload_resource_policies\".\"namespace\" !~ '[[:cntrl:]]' AND length(\"upload_resource_policies\".\"policy_version\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"policy_version\" = btrim(\"upload_resource_policies\".\"policy_version\") AND \"upload_resource_policies\".\"policy_version\" !~ '[[:cntrl:]]' AND length(\"upload_resource_policies\".\"writer_generation\") BETWEEN 1 AND 512 AND \"upload_resource_policies\".\"writer_generation\" = btrim(\"upload_resource_policies\".\"writer_generation\") AND \"upload_resource_policies\".\"writer_generation\" !~ '[[:cntrl:]]'"
+        },
+        "resource_policy_snapshot": {
+          "name": "resource_policy_snapshot",
+          "value": "(\n  jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\") = 'object'\n  AND \"upload_resource_policies\".\"policy_snapshot\" @> jsonb_build_object(\n    'adapter', 'multer-crossing-byte-v1',\n    'layout', 'provisioned-root-one-directory-one-file-v1',\n    'allocationModel', 'audited-rounded-copies-v1',\n    'stableExclusiveNamespace', true, 'allAllocationCostsBounded', true,\n    'identity', jsonb_build_object('database', \"upload_resource_policies\".\"database_identity\",\n      'schema', \"upload_resource_policies\".\"schema_identity\", 'quotaDomain', \"upload_resource_policies\".\"quota_domain\",\n      'namespace', \"upload_resource_policies\".\"namespace\", 'policyVersion', \"upload_resource_policies\".\"policy_version\",\n      'writerGeneration', \"upload_resource_policies\".\"writer_generation\"))\n  AND \"upload_resource_policies\".\"policy_snapshot\" ?& ARRAY['maxFileBytes','allocationUnitBytes','allocationCopies',\n    'directoryAndParentBytes','metadataBytes','temporaryBytes','additionalObjects']\n  AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'maxFileBytes') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'maxFileBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'maxFileBytes')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'maxFileBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'allocationUnitBytes') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric BETWEEN 1 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'allocationUnitBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'allocationCopies') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'allocationCopies')::numeric BETWEEN 1 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'allocationCopies')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'allocationCopies')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'directoryAndParentBytes') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'directoryAndParentBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'metadataBytes') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'metadataBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'metadataBytes')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'metadataBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'temporaryBytes') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'temporaryBytes')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'temporaryBytes')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'temporaryBytes')::numeric\n        ELSE false END AND CASE WHEN jsonb_typeof(\"upload_resource_policies\".\"policy_snapshot\"->'additionalObjects') = 'number'\n        THEN (\"upload_resource_policies\".\"policy_snapshot\"->>'additionalObjects')::numeric BETWEEN 0 AND 9007199254740991\n          AND trunc((\"upload_resource_policies\".\"policy_snapshot\"->>'additionalObjects')::numeric) = (\"upload_resource_policies\".\"policy_snapshot\"->>'additionalObjects')::numeric\n        ELSE false END\n) IS TRUE"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
