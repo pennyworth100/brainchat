@@ -127,3 +127,28 @@ SQL files, not fixture-only schema/grants. It verifies dirty column-grant rollba
 replay refusal, quota/message-delete/DDL denial, CLOSED budget preservation, real
 room creation and settled shutdown. This remains an isolated test, not managed
 production installation, finite-capacity approval or physical upload acceptance.
+
+## Fenced catalog reader compatibility (3.0.46)
+
+The optional catalog reader is a fourth isolated principal, not the application
+runtime. The operator audits its effective authority before and after durable
+NOLOGIN fencing; errors never automatically reopen writers.
+
+The release necessarily contains `admit_message_write()` and
+`enqueue_message_publication()`. A blanket ban on user routines incorrectly
+rejects this schema. The reader audit permits only zero-argument PL/pgSQL
+functions returning PostgreSQL's trigger type, with no effective reader EXECUTE.
+The built-in PL/pgSQL handler rejects ordinary invocation before executing the
+body; a reader without DML/DDL/ownership cannot cause the write triggers.
+Ordinary routines remain forbidden even when EXECUTE is revoked, because
+casts/type I/O can invoke them indirectly. C, internal and custom-language
+trigger routines are not covered by this exception.
+
+This is an authority check, not a replacement for the independent canonical
+catalog and owner/ACL comparison. Do not drop required release triggers to pass
+the reader audit or replay the existing grant installer. PUBLIC large-object/WAL
+mutation rights must still be removed by separately reviewed provisioning.
+The real PostgreSQL fixture uses the exact installer trigger definitions and
+verifies denied direct calls, denied DML, non-PL/pgSQL rejection, and schema-only
+pg_dump while writer logins remain closed. Managed provisioning, activation,
+physical uploads and paired backup remain separate gates.

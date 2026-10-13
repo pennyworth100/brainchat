@@ -24,10 +24,16 @@ export async function auditCatalogReader(client, reader) {
           ($$pg_catalog$$::regnamespace,$$information_schema$$::regnamespace)
           AND (has_table_privilege($1::oid,oid,$$SELECT$$) OR has_any_column_privilege($1::oid,oid,$$SELECT$$))))`,
     `SELECT 1 FROM pg_class WHERE CASE WHEN relkind=$$S$$ THEN has_sequence_privilege($1::oid,oid,$$USAGE,UPDATE$$) ELSE false END`,
-    // Reject user code entirely: casts/type I/O can invoke routines indirectly,
-    // even when direct EXECUTE is denied.
+    // Non-trigger user code can run indirectly through casts/type I/O even
+    // without EXECUTE. The release necessarily contains PL/pgSQL triggers.
+    // That built-in handler rejects non-trigger invocation; this reader cannot
+    // cause a DML trigger (all writes denied). Do not extend this exception to
+    // C/custom languages or ordinary routines.
     `SELECT 1 FROM pg_proc WHERE pronamespace NOT IN
-      ($$pg_catalog$$::regnamespace,$$information_schema$$::regnamespace)`,
+      ($$pg_catalog$$::regnamespace,$$information_schema$$::regnamespace)
+      AND NOT (prokind=$$f$$ AND prorettype=$$pg_catalog.trigger$$::regtype
+        AND pronargs=0 AND prolang IN (SELECT oid FROM pg_language WHERE lanname=$$plpgsql$$ AND lanpltrusted)
+        AND NOT has_function_privilege($1::oid,oid,$$EXECUTE$$))`,
     // Large-object/WAL mutators bypass ordinary table ACLs. Provisioning must
     // explicitly remove PUBLIC execution; this audit never changes grants.
     `SELECT proname FROM pg_proc WHERE pronamespace=$$pg_catalog$$::regnamespace

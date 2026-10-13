@@ -3,6 +3,7 @@ import {Client} from "pg";
 import {acquireWriterFence} from "./production/acquire-writer-fence.mjs";
 import {auditCatalogReader} from "./production/audit-catalog-reader.mjs";
 import {execFileSync} from "node:child_process";
+import {readFileSync} from "node:fs";
 const port=Number(process.env.OWNED_PG_PORT);
 assert(port>1024 && process.env.FENCE_OWNED_FIXTURE==="yes");
 const clients=[];
@@ -74,6 +75,22 @@ try {
  const mutators=(await verifier.query(`SELECT oid::regprocedure::text AS signature FROM pg_proc WHERE pronamespace=$$pg_catalog$$::regnamespace AND proname IN ($$lo_create$$,$$lo_creat$$,$$lo_from_bytea$$,$$lo_put$$,$$lo_import$$,$$lo_unlink$$,$$lowrite$$,$$lo_truncate$$,$$lo_truncate64$$,$$pg_logical_emit_message$$)`)).rows;
  for(const f of mutators) await verifier.query("REVOKE EXECUTE ON FUNCTION "+f.signature+" FROM PUBLIC");
  const readClient=await connect("fence_reader");
+ // Use the ACTUAL release definitions, not a function-free toy schema.
+ const installer=readFileSync(new URL("./production/install-publication-closed.sql",import.meta.url),"utf8");
+ for (const name of ["admit_message_write","enqueue_message_publication"]) {
+   const start=installer.indexOf("CREATE FUNCTION public."+name+"()");
+   assert.ok(start>=0,"missing release trigger "+name);
+   const end=installer.indexOf("$$;",start);
+   assert.ok(end>start);
+   await verifier.query(installer.slice(start,end+3));
+   await verifier.query("REVOKE ALL ON FUNCTION public."+name+"() FROM PUBLIC");
+   await assert.rejects(readClient.query("SELECT public."+name+"()"),e=>e.code==="42501");checks++;
+   // PL/pgSQL rejects even an operator's ordinary invocation before the body.
+   await assert.rejects(verifier.query("SELECT public."+name+"()"),e=>e.code==="0A000");checks++;
+ }
+ await verifier.query("CREATE TRIGGER release_admission AFTER INSERT ON public.messages FOR EACH ROW EXECUTE FUNCTION public.admit_message_write()");
+ await verifier.query("CREATE TRIGGER release_publication AFTER INSERT ON public.messages FOR EACH ROW EXECUTE FUNCTION public.enqueue_message_publication()");
+ await auditCatalogReader(verifier,readerRole);checks++;
  const readerManifest={...manifest,reader:readerRole};
  async function unsafe(grant,revoke) {
    await verifier.query(grant);
@@ -87,6 +104,9 @@ try {
  await unsafe("GRANT CREATE ON SCHEMA public TO fence_reader","REVOKE CREATE ON SCHEMA public FROM fence_reader");
  await unsafe("CREATE SEQUENCE public.reader_seq; GRANT USAGE ON public.reader_seq TO fence_reader","DROP SEQUENCE public.reader_seq");
  await unsafe("CREATE FUNCTION public.reader_write() RETURNS void LANGUAGE sql SECURITY DEFINER AS $$INSERT INTO public.messages VALUES(8,NULL)$$","DROP FUNCTION public.reader_write()");
+ await unsafe("CREATE FUNCTION public.reader_hidden() RETURNS text LANGUAGE sql AS $$SELECT 'hidden'::text$$; REVOKE ALL ON FUNCTION public.reader_hidden() FROM PUBLIC","DROP FUNCTION public.reader_hidden()");
+ await unsafe("GRANT EXECUTE ON FUNCTION public.admit_message_write() TO fence_reader","REVOKE EXECUTE ON FUNCTION public.admit_message_write() FROM fence_reader");
+ await unsafe("CREATE FUNCTION public.reader_internal_trigger() RETURNS trigger LANGUAGE internal AS 'suppress_redundant_updates_trigger'; REVOKE ALL ON FUNCTION public.reader_internal_trigger() FROM PUBLIC","DROP FUNCTION public.reader_internal_trigger()");
  await unsafe("CREATE TABLE public.reader_owned(id int); ALTER TABLE public.reader_owned OWNER TO fence_reader","DROP TABLE public.reader_owned");
  await unsafe("CREATE VIEW public.reader_view AS SELECT * FROM public.messages; GRANT SELECT(id) ON public.reader_view TO fence_reader","DROP VIEW public.reader_view");
  await unsafe("CREATE ROLE reader_parent; GRANT reader_parent TO fence_reader","REVOKE reader_parent FROM fence_reader; DROP ROLE reader_parent");
@@ -102,6 +122,8 @@ try {
    {await assert.rejects(readClient.query(sql),e=>e.code==="42501");checks++;}
  const dump=execFileSync(process.env.CATALOG_PG_BIN+"/pg_dump",["--host=127.0.0.1","--port="+port,"--username=fence_reader","--dbname=fence_owned","--schema-only","--no-owner","--no-privileges","--lock-wait-timeout=2s"],{timeout:10000,encoding:"utf8"});
  assert.match(dump,/CREATE TABLE public.messages/);checks++;
+ assert.match(dump,/CREATE FUNCTION public.admit_message_write\(\) RETURNS trigger/);
+ assert.match(dump,/CREATE FUNCTION public.enqueue_message_publication\(\) RETURNS trigger/);checks++;
  await readerOp.end();
  await assert.rejects(connect("fence_runtime"),e=>e.code==="28000");checks++;
  console.log(JSON.stringify({status:"PASS",checks,fixtureOnly:true,automaticReopen:false}));
