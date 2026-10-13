@@ -265,6 +265,10 @@ export async function main(options: Readonly<{
     if (!options.privateBrowserResume) { res.sendStatus(404); return; }
     next();
   });
+  expressApp.get("/api/browser-session-mode", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ mode: options.privateBrowserResume ? "durable-session-v1" : "legacy" });
+  });
   const trustProxyHops = parseInt(process.env.TRUST_PROXY_HOPS || "0", 10);
   if (trustProxyHops > 0) expressApp.set("trust proxy", trustProxyHops);
   const server = http.createServer(expressApp);

@@ -13,11 +13,12 @@ import {
 import { useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
 import { isValidRoomId, normalizeRoomId } from "@/lib/room-id";
-import { createRoomSession, mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
+import { mergeMessages, type ChatMessage, type ConnectionState, type RoomSession } from "@/lib/room-session";
 import { roomDocumentTitle, roomNotificationBody, shouldNotifyRoomMessage } from "@/lib/room-notifications";
 import { uploadRoomFile } from "@/lib/upload-client";
 import { sendPrivateMessage } from "@/lib/private-message-client";
 import { createTextSender } from "@/lib/text-message-client";
+import { createNegotiatedRoomSession } from "@/lib/durable-room-session";
 import { publicOwnerScope, publicDraft, publicDraftSnapshot, publicOutbox, reconcilePublicConfirmation, type PendingPublicOperation } from "@/lib/public-outbox";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -388,7 +389,7 @@ function RoomInner() {
   const getId = () => nextId.current++;
 
   const socketRef = useRef<Socket | null>(null);
-  const sessionRef = useRef<RoomSession | null>(null);
+  const sessionRef = useRef<ReturnType<typeof createNegotiatedRoomSession> | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const msgInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -460,9 +461,11 @@ function RoomInner() {
   // Socket connection
   useEffect(() => {
     if (!roomId) return;
-    const socket = io();
+    const socket = io({ autoConnect: false, reconnection: false, transports: ["websocket"],
+      auth: { dimleProtocol: "durable-session-v1" } });
     socketRef.current = socket;
-    const session = createRoomSession(socket, {
+    let receivedSnapshot = false;
+    const session = createNegotiatedRoomSession(socket, {
       onState: (state) => {
         setConnectionState(state);
         if (state !== "ready") {
@@ -471,7 +474,8 @@ function RoomInner() {
         }
       },
       onSnapshot: ({ history, users }) => {
-        receiveMessages(history);
+        receiveMessages(history, receivedSnapshot && session.usesDurableProtocol());
+        receivedSnapshot = true;
         setUserList(users);
         setUserCount(users.length);
       },
@@ -479,7 +483,7 @@ function RoomInner() {
         setJoinError("");
         try {
           sessionStorage.removeItem(`dimle:creation-token:${roomId}`);
-          const scope = publicOwnerScope(sessionStorage, roomId, usernameRef.current!);
+          const scope = session.outboxScope();
           const initialRestore = durableScopeRef.current !== scope;
           durableScopeRef.current = scope;
           // Transport sync must not overwrite a newer editor value after a storage failure.
@@ -514,7 +518,9 @@ function RoomInner() {
       },
     });
     sessionRef.current = session;
-    const onMessage = (message: ChatMessage) => receiveMessages([message], true);
+    const onMessage = (message: ChatMessage) => {
+      if (!session.usesDurableProtocol()) receiveMessages([message], true);
+    };
     socket.on("chat-message", onMessage);
     socket.on("chat-file", onMessage);
     socket.on("chat-image", onMessage);
@@ -637,6 +643,19 @@ function RoomInner() {
         : undefined,
     });
   }, [usernameInput, passwordInput, roomId]);
+
+  const resolveSavedDelivery = async () => {
+    const session = sessionRef.current;
+    if (!session || !roomId) return;
+    try {
+      const check = session.operationGuard(roomId);
+      const scope = session.outboxScope();
+      await session.resolveText(); check();
+      const pending = await reconcilePublicConfirmation(scope, localStorage, check); check();
+      setPendingOperation(pending);
+      setMsgInput(publicDraft(localStorage, scope));
+    } catch { setDurableError("Could not verify saved delivery. Your work is retained."); }
+  };
 
   const sendMessage = useCallback(async () => {
     const msg = msgInput.trim();
@@ -1038,6 +1057,8 @@ function RoomInner() {
             : pendingOperation?.kind === "file"
             ? "Attachment status is unknown. Saved attachment retained; check room history. Automatic retry is disabled."
             : "Delivery is not confirmed. Saved message retained; check room history. Automatic retry is disabled.")}
+          {pendingOperation?.kind === "text" && connectionState === "ready" && !durableError &&
+            <button className="ml-3 underline" onClick={() => void resolveSavedDelivery()}>Check saved delivery</button>}
         </div>
       )}
       {/* Input bar */}
